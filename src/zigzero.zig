@@ -27,6 +27,10 @@ pub const loadbalancer = @import("loadbalancer");
 pub const redis = @import("redis");
 pub const errors = @import("errors");
 pub const middleware = @import("middleware");
+pub const svc = @import("svc");
+pub const trace = @import("trace");
+pub const metric = @import("metric");
+pub const orm = @import("orm");
 
 test "zigzero version" {
     try std.testing.expectEqual(@as(u32, 0), version.major);

@@ -1,6 +1,6 @@
 //! Configuration management for zigzero
 //!
-//! Provides unified configuration loading from YAML, JSON, and environment variables.
+//! Provides unified configuration loading from JSON and environment variables.
 //! Aligned with go-zero's config patterns.
 
 const std = @import("std");
@@ -40,12 +40,46 @@ pub const LogConfig = struct {
     max_age: u32 = 7,
     /// Whether to compress rotated logs
     compress: bool = true,
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !LogConfig {
+        var cfg = LogConfig{};
+
+        if (json.object.get("service_name")) |v| {
+            cfg.service_name = try allocator.dupe(u8, v.string);
+        }
+        if (json.object.get("level")) |v| {
+            cfg.level = try allocator.dupe(u8, v.string);
+        }
+        if (json.object.get("mode")) |v| {
+            cfg.mode = try allocator.dupe(u8, v.string);
+        }
+        if (json.object.get("path")) |v| {
+            const path = try allocator.dupe(u8, v.string);
+            cfg.path = path;
+        }
+        if (json.object.get("max_size")) |v| {
+            cfg.max_size = @intCast(v.integer);
+        }
+        if (json.object.get("max_backups")) |v| {
+            cfg.max_backups = @intCast(v.integer);
+        }
+        if (json.object.get("max_age")) |v| {
+            cfg.max_age = @intCast(v.integer);
+        }
+        if (json.object.get("compress")) |v| {
+            cfg.compress = v.bool;
+        }
+
+        return cfg;
+    }
 };
 
 /// Redis configuration
 pub const RedisConfig = struct {
     /// Redis host address
-    host: []const u8 = "localhost:6379",
+    host: []const u8 = "localhost",
+    /// Redis port
+    port: u16 = 6379,
     /// Redis password
     password: ?[]const u8 = null,
     /// Redis database number
@@ -56,12 +90,49 @@ pub const RedisConfig = struct {
     read_timeout_ms: u32 = 3000,
     /// Write timeout in milliseconds
     write_timeout_ms: u32 = 3000,
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !RedisConfig {
+        var cfg = RedisConfig{};
+
+        if (json.object.get("host")) |v| {
+            cfg.host = try allocator.dupe(u8, v.string);
+        }
+        if (json.object.get("port")) |v| {
+            cfg.port = @intCast(v.integer);
+        }
+        if (json.object.get("password")) |v| {
+            const pwd = try allocator.dupe(u8, v.string);
+            cfg.password = pwd;
+        }
+        if (json.object.get("db")) |v| {
+            cfg.db = @intCast(v.integer);
+        }
+        if (json.object.get("pool_size")) |v| {
+            cfg.pool_size = @intCast(v.integer);
+        }
+        if (json.object.get("read_timeout_ms")) |v| {
+            cfg.read_timeout_ms = @intCast(v.integer);
+        }
+        if (json.object.get("write_timeout_ms")) |v| {
+            cfg.write_timeout_ms = @intCast(v.integer);
+        }
+
+        return cfg;
+    }
 };
 
 /// MySQL configuration
 pub const MysqlConfig = struct {
-    /// MySQL data source name
-    dsn: []const u8,
+    /// MySQL host
+    host: []const u8 = "localhost",
+    /// MySQL port
+    port: u16 = 3306,
+    /// MySQL database name
+    database: []const u8 = "",
+    /// MySQL username
+    username: []const u8 = "root",
+    /// MySQL password
+    password: []const u8 = "",
     /// Maximum number of open connections
     max_open_conns: u32 = 100,
     /// Maximum number of idle connections
@@ -70,43 +141,196 @@ pub const MysqlConfig = struct {
     max_lifetime_sec: u32 = 3600,
     /// Connection max idle time in seconds
     conn_max_idle_time_sec: u32 = 900,
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !MysqlConfig {
+        var cfg = MysqlConfig{};
+
+        if (json.object.get("host")) |v| cfg.host = try allocator.dupe(u8, v.string);
+        if (json.object.get("port")) |v| cfg.port = @intCast(v.integer);
+        if (json.object.get("database")) |v| cfg.database = try allocator.dupe(u8, v.string);
+        if (json.object.get("username")) |v| cfg.username = try allocator.dupe(u8, v.string);
+        if (json.object.get("password")) |v| cfg.password = try allocator.dupe(u8, v.string);
+        if (json.object.get("max_open_conns")) |v| cfg.max_open_conns = @intCast(v.integer);
+        if (json.object.get("max_idle_conns")) |v| cfg.max_idle_conns = @intCast(v.integer);
+        if (json.object.get("max_lifetime_sec")) |v| cfg.max_lifetime_sec = @intCast(v.integer);
+        if (json.object.get("conn_max_idle_time_sec")) |v| cfg.conn_max_idle_time_sec = @intCast(v.integer);
+
+        return cfg;
+    }
 };
 
 /// Etcd configuration
 pub const EtcdConfig = struct {
-    /// Etcd endpoints
-    endpoints: []const []const u8,
+    /// Etcd endpoints (host:port)
+    endpoints: [][]const u8 = &.{},
     /// Etcd username
     username: ?[]const u8 = null,
     /// Etcd password
     password: ?[]const u8 = null,
     /// Request timeout in seconds
     timeout_sec: u32 = 5,
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !EtcdConfig {
+        var cfg = EtcdConfig{};
+
+        if (json.object.get("endpoints")) |v| {
+            const arr = v.array;
+            cfg.endpoints = try allocator.alloc([]const u8, arr.items.len);
+            for (arr.items, 0..) |item, i| {
+                cfg.endpoints[i] = try allocator.dupe(u8, item.string);
+            }
+        }
+        if (json.object.get("username")) |v| {
+            const uname = try allocator.dupe(u8, v.string);
+            cfg.username = uname;
+        }
+        if (json.object.get("password")) |v| {
+            const pwd = try allocator.dupe(u8, v.string);
+            cfg.password = pwd;
+        }
+        if (json.object.get("timeout_sec")) |v| cfg.timeout_sec = @intCast(v.integer);
+
+        return cfg;
+    }
+
+    pub fn deinit(self: *EtcdConfig, allocator: std.mem.Allocator) void {
+        for (self.endpoints) |ep| {
+            allocator.free(ep);
+        }
+        allocator.free(self.endpoints);
+        if (self.username) |u| allocator.free(u);
+        if (self.password) |p| allocator.free(p);
+    }
 };
 
-/// Load configuration from YAML file
-pub fn loadYaml(comptime T: type, path: []const u8) errors.ResultT(T) {
-    const file = std.fs.cwd().openFile(path, .{}) catch return error.ConfigError;
-    defer file.close();
+/// Config loader
+pub const Loader = struct {
+    allocator: std.mem.Allocator,
 
-    const content = file.readToEndAlloc(std.heap.page_allocator, 1024 * 1024) catch return error.ConfigError;
-    defer std.heap.page_allocator.free(content);
+    pub fn init(allocator: std.mem.Allocator) Loader {
+        return .{ .allocator = allocator };
+    }
 
-    return parseYaml(T, content);
-}
+    /// Load configuration from JSON file
+    pub fn loadJson(self: Loader, comptime T: type, path: []const u8) !T {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
 
-/// Parse YAML content into config type
-pub fn parseYaml(comptime T: type, content: []const u8) errors.ResultT(T) {
-    // Simplified YAML parsing - in production, use a proper YAML library
-    _ = T;
-    _ = content;
-    return error.ConfigError;
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(content);
+
+        return self.parseJson(T, content);
+    }
+
+    /// Parse JSON content into config type
+    pub fn parseJson(self: Loader, comptime T: type, content: []const u8) !T {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
+        defer parsed.deinit();
+
+        var config: T = undefined;
+        const json = parsed.value;
+
+        inline for (@typeInfo(T).Struct.fields) |field| {
+            if (json.object.get(field.name)) |value| {
+                @field(config, field.name) = try parseField(self.allocator, field.type, value);
+            }
+        }
+
+        return config;
+    }
+
+    fn parseField(allocator: std.mem.Allocator, comptime T: type, value: std.json.Value) !T {
+        return switch (@typeInfo(T)) {
+            .Int => @intCast(value.integer),
+            .Float => @floatCast(value.float),
+            .Bool => value.bool,
+            .Pointer => |p| switch (p.size) {
+                .Slice => if (p.child == u8) try allocator.dupe(u8, value.string) else @compileError("Unsupported slice type"),
+                else => @compileError("Unsupported pointer type"),
+            },
+            .Optional => |o| if (value == .null) null else try parseField(allocator, o.child, value),
+            .Struct => try T.fromJson(allocator, value),
+            else => @compileError("Unsupported field type"),
+        };
+    }
+
+    /// Load configuration from environment variables
+    pub fn loadEnv(self: Loader, comptime T: type, prefix: []const u8) !T {
+        var config: T = undefined;
+
+        inline for (@typeInfo(T).Struct.fields) |field| {
+            const env_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ prefix, std.ascii.upperString(&[_]u8{}, field.name) });
+            defer self.allocator.free(env_name);
+
+            if (std.process.getEnvVarOwned(self.allocator, env_name)) |value| {
+                defer self.allocator.free(value);
+                @field(config, field.name) = try parseEnvValue(field.type, value);
+            } else |_| {}
+        }
+
+        return config;
+    }
+
+    fn parseEnvValue(comptime T: type, value: []const u8) !T {
+        return switch (@typeInfo(T)) {
+            .Int => std.fmt.parseInt(T, value, 10),
+            .Float => std.fmt.parseFloat(T, value),
+            .Bool => std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"),
+            .Pointer => |p| switch (p.size) {
+                .Slice => if (p.child == u8) std.heap.page_allocator.dupe(u8, value) catch return error.ConfigError else @compileError("Unsupported slice type"),
+                else => @compileError("Unsupported pointer type"),
+            },
+            .Optional => |o| parseEnvValue(o.child, value),
+            else => @compileError("Unsupported field type"),
+        };
+    }
+};
+
+/// Load configuration from JSON file
+pub fn loadJson(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !T {
+    const loader = Loader.init(allocator);
+    return loader.loadJson(T, path);
 }
 
 /// Load configuration from environment variables
-pub fn loadEnv(comptime T: type) errors.ResultT(T) {
-    _ = T;
-    return error.ConfigError;
+pub fn loadEnv(comptime T: type, allocator: std.mem.Allocator, prefix: []const u8) !T {
+    const loader = Loader.init(allocator);
+    return loader.loadEnv(T, prefix);
+}
+
+test "config json parsing" {
+    const json_content =
+        \\{
+        \\  "name": "test-service",
+        \\  "port": 8080,
+        \\  "log": {
+        \\    "level": "debug",
+        \\    "service_name": "test"
+        \\  },
+        \\  "redis": {
+        \\    "host": "localhost",
+        \\    "port": 6379
+        \\  },
+        \\  "mysql": {
+        \\    "host": "localhost",
+        \\    "port": 3306,
+        \\    "database": "testdb"
+        \\  },
+        \\  "etcd": {
+        \\    "endpoints": ["localhost:2379"],
+        \\    "timeout_sec": 10
+        \\  }
+        \\}
+    ;
+
+    const allocator = std.testing.allocator;
+    const cfg = try Loader.init(allocator).parseJson(Config, json_content);
+
+    try std.testing.expectEqualStrings("test-service", cfg.name);
+    try std.testing.expectEqual(@as(u16, 8080), cfg.port);
+    try std.testing.expectEqualStrings("debug", cfg.log.level);
+    try std.testing.expectEqualStrings("localhost", cfg.redis.host);
+    try std.testing.expectEqual(@as(u16, 6379), cfg.redis.port);
 }
 
 test "config module" {
