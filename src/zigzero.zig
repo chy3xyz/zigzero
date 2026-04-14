@@ -105,4 +105,5 @@ comptime {
     _ = static.Server;
     _ = cron.Scheduler;
     _ = mq.Queue;
+    _ = mq.PersistentQueue;
 }
