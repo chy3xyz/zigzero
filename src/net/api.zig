@@ -55,6 +55,14 @@ pub const Route = struct {
     middleware: []const MiddlewareFn = &.{},
 };
 
+/// Field source for auto parameter binding
+pub const FieldSource = enum {
+    path,
+    query,
+    form,
+    header,
+};
+
 /// HTTP context - holds request/response data
 pub const Context = struct {
     allocator: std.mem.Allocator,
@@ -64,6 +72,7 @@ pub const Context = struct {
     query: std.StringHashMap([]const u8),
     params: std.StringHashMap([]const u8),
     headers: std.StringHashMap([]const u8),
+    form: std.StringHashMap([]const u8),
     body: ?[]const u8 = null,
     response_body: std.ArrayList(u8),
     status_code: u16 = 200,
@@ -71,7 +80,7 @@ pub const Context = struct {
     responded: bool = false,
     logger: log.Logger,
 
-    // Middleware chain fields
+    // Middleware chain fields (use fully expanded type to avoid dependency loop)
     chain_middlewares: []const *const fn (*Context, *const fn (*Context) anyerror!void) anyerror!void = &.{},
     chain_handler: *const fn (*Context) anyerror!void = undefined,
     chain_index: usize = 0,
@@ -85,6 +94,7 @@ pub const Context = struct {
             .query = std.StringHashMap([]const u8).init(allocator),
             .params = std.StringHashMap([]const u8).init(allocator),
             .headers = std.StringHashMap([]const u8).init(allocator),
+            .form = std.StringHashMap([]const u8).init(allocator),
             .response_body = std.ArrayList(u8){},
             .response_headers = std.StringHashMap([]const u8).init(allocator),
             .logger = logger,
@@ -113,6 +123,13 @@ pub const Context = struct {
         }
         self.headers.deinit();
 
+        var form_iter = self.form.iterator();
+        while (form_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.form.deinit();
+
         self.response_body.deinit(self.allocator);
 
         var resp_headers_iter = self.response_headers.iterator();
@@ -136,6 +153,11 @@ pub const Context = struct {
     /// Get header
     pub fn header(self: *const Context, key: []const u8) ?[]const u8 {
         return self.headers.get(key);
+    }
+
+    /// Get form value
+    pub fn formValue(self: *const Context, key: []const u8) ?[]const u8 {
+        return self.form.get(key);
     }
 
     /// Set response header
@@ -186,7 +208,84 @@ pub const Context = struct {
         try self.response_body.appendSlice(self.allocator, json_str);
         self.responded = true;
     }
+
+    /// Auto-bind request parameters into a struct.
+    /// `sources` maps struct field names to their HTTP source locations.
+    /// Example: `const req = try ctx.parseReq(MyReq, .{ .id = .path, .page = .query });`
+    pub fn parseReq(self: *Context, comptime T: type, sources: anytype) !T {
+        const SourcesType = @TypeOf(sources);
+        const sources_info = @typeInfo(SourcesType);
+        if (sources_info != .@"struct") @compileError("sources must be a struct literal");
+
+        var req: T = undefined;
+        const t_info = @typeInfo(T);
+        if (t_info != .@"struct") @compileError("T must be a struct");
+
+        inline for (t_info.@"struct".fields) |field| {
+            const has_source = @hasField(SourcesType, field.name);
+            if (!has_source) continue;
+
+            const source: FieldSource = @field(sources, field.name);
+            const value_str: ?[]const u8 = switch (source) {
+                .path => self.params.get(field.name),
+                .query => self.query.get(field.name),
+                .form => self.form.get(field.name),
+                .header => self.headers.get(field.name),
+            };
+
+            if (value_str) |v| {
+                @field(req, field.name) = try parseValue(field.type, v);
+            } else {
+                // If field is optional, leave as null
+                if (@typeInfo(field.type) == .optional) {
+                    @field(req, field.name) = null;
+                } else {
+                    return error.MissingParameter;
+                }
+            }
+        }
+
+        return req;
+    }
 };
+
+fn parseValue(comptime T: type, value: []const u8) !T {
+    return switch (@typeInfo(T)) {
+        .int => std.fmt.parseInt(T, value, 10),
+        .float => std.fmt.parseFloat(T, value),
+        .bool => std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"),
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => if (ptr.child == u8) value else @compileError("Unsupported slice type in parseValue"),
+            else => @compileError("Unsupported pointer type in parseValue"),
+        },
+        .optional => |opt| if (value.len == 0) null else try parseValue(opt.child, value),
+        else => @compileError("Unsupported field type in parseValue"),
+    };
+}
+
+fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHashMap([]const u8) {
+    var form = std.StringHashMap([]const u8).init(allocator);
+    errdefer {
+        var iter = form.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        form.deinit();
+    }
+
+    var iter = std.mem.splitScalar(u8, body, '&');
+    while (iter.next()) |param| {
+        if (param.len == 0) continue;
+        if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
+            const key = try allocator.dupe(u8, param[0..eq_pos]);
+            const value = try allocator.dupe(u8, param[eq_pos + 1 ..]);
+            try form.put(key, value);
+        }
+    }
+
+    return form;
+}
 
 /// HTTP request parser
 const RequestParser = struct {
@@ -221,8 +320,8 @@ const RequestParser = struct {
             path = raw_path[0..query_start];
             const query_str = raw_path[query_start + 1 ..];
 
-            var iter = std.mem.splitScalar(u8, query_str, '&');
-            while (iter.next()) |param| {
+            var qiter = std.mem.splitScalar(u8, query_str, '&');
+            while (qiter.next()) |param| {
                 if (param.len == 0) continue;
                 if (std.mem.indexOf(u8, param, "=")) |eq_pos| {
                     const key = try self.allocator.dupe(u8, param[0..eq_pos]);
@@ -317,11 +416,17 @@ const Router = struct {
     }
 
     pub fn deinit(self: *Router) void {
+        for (self.routes.items) |route| {
+            self.allocator.free(route.path);
+        }
         self.routes.deinit(self.allocator);
     }
 
     pub fn addRoute(self: *Router, route: Route) !void {
-        try self.routes.append(self.allocator, route);
+        const path_copy = try self.allocator.dupe(u8, route.path);
+        var r = route;
+        r.path = path_copy;
+        try self.routes.append(self.allocator, r);
     }
 
     pub fn match(self: *const Router, method: Method, path: []const u8) ?MatchedRoute {
@@ -422,6 +527,78 @@ const ResponseWriter = struct {
     }
 };
 
+/// Route group for organizing routes with common prefix and middleware
+pub const RouteGroup = struct {
+    prefix: []const u8,
+    middleware: []const MiddlewareFn,
+    server: *Server,
+
+    pub fn init(server: *Server, prefix: []const u8) RouteGroup {
+        return .{
+            .prefix = prefix,
+            .middleware = &.{},
+            .server = server,
+        };
+    }
+
+    pub fn withMiddleware(self: RouteGroup, mws: []const MiddlewareFn) RouteGroup {
+        var group = self;
+        group.middleware = mws;
+        return group;
+    }
+
+    fn fullPath(self: *const RouteGroup, path: []const u8) ![]u8 {
+        if (self.prefix.len == 0 or std.mem.eql(u8, path, "/")) {
+            return self.server.allocator.dupe(u8, self.prefix);
+        }
+        // Ensure no double slash
+        if (std.mem.endsWith(u8, self.prefix, "/") and std.mem.startsWith(u8, path, "/")) {
+            return std.fmt.allocPrint(self.server.allocator, "{s}{s}", .{ self.prefix, path[1..] });
+        }
+        if (!std.mem.endsWith(u8, self.prefix, "/") and !std.mem.startsWith(u8, path, "/")) {
+            return std.fmt.allocPrint(self.server.allocator, "{s}/{s}", .{ self.prefix, path });
+        }
+        return std.fmt.allocPrint(self.server.allocator, "{s}{s}", .{ self.prefix, path });
+    }
+
+    pub fn get(self: *RouteGroup, path: []const u8, handler: HandlerFn) !void {
+        try self.handle(.GET, path, handler);
+    }
+
+    pub fn post(self: *RouteGroup, path: []const u8, handler: HandlerFn) !void {
+        try self.handle(.POST, path, handler);
+    }
+
+    pub fn put(self: *RouteGroup, path: []const u8, handler: HandlerFn) !void {
+        try self.handle(.PUT, path, handler);
+    }
+
+    pub fn delete(self: *RouteGroup, path: []const u8, handler: HandlerFn) !void {
+        try self.handle(.DELETE, path, handler);
+    }
+
+    pub fn patch(self: *RouteGroup, path: []const u8, handler: HandlerFn) !void {
+        try self.handle(.PATCH, path, handler);
+    }
+
+    pub fn handle(self: *RouteGroup, method: Method, path: []const u8, handler: HandlerFn) !void {
+        const fp = try self.fullPath(path);
+        defer self.server.allocator.free(fp);
+
+        // Combine group middleware + any empty per-route middleware
+        const mws = try self.server.allocator.alloc(MiddlewareFn, self.middleware.len);
+        errdefer self.server.allocator.free(mws);
+        @memcpy(mws, self.middleware);
+
+        try self.server.addRoute(.{
+            .method = method,
+            .path = fp,
+            .handler = handler,
+            .middleware = mws,
+        });
+    }
+};
+
 /// HTTP server
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -461,6 +638,11 @@ pub const Server = struct {
     /// Add a route
     pub fn addRoute(self: *Server, route: Route) !void {
         try self.router.addRoute(route);
+    }
+
+    /// Create a route group
+    pub fn group(self: *Server, prefix: []const u8) RouteGroup {
+        return RouteGroup.init(self, prefix);
     }
 
     /// Add global middleware
@@ -568,6 +750,14 @@ pub const Server = struct {
         ctx.body = request.body;
         ctx.raw_path = request.raw_path;
 
+        // Parse form body if content-type is application/x-www-form-urlencoded
+        if (request.body) |body| {
+            const content_type = request.headers.get("Content-Type") orelse "";
+            if (std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded")) {
+                ctx.form = parseFormBody(arena_alloc, body) catch ctx.form;
+            }
+        }
+
         if (matched) |m| {
             // Copy path params
             var params_iter = m.params.iterator();
@@ -578,7 +768,7 @@ pub const Server = struct {
             }
 
             // Execute handler with middleware chain
-            self.executeWithMiddleware(&ctx, m.route.handler) catch |err| {
+            self.executeWithMiddleware(&ctx, m.route.handler, m.route.middleware) catch |err| {
                 if (!ctx.responded) {
                     ctx.sendError(500, @errorName(err)) catch {};
                 }
@@ -597,33 +787,32 @@ pub const Server = struct {
         ResponseWriter.write(writer.any(), ctx.status_code, &ctx.response_headers, ctx.response_body.items) catch {};
     }
 
-    fn executeWithMiddleware(self: *Server, ctx: *Context, final_handler: HandlerFn) !void {
-        // Build middleware chain
-        const Chain = struct {
-            server: *Server,
+    fn executeWithMiddleware(self: *Server, ctx: *Context, final_handler: HandlerFn, route_middleware: []const MiddlewareFn) !void {
+        // Build combined middleware list: global + route-specific
+        const total_mw = self.global_middleware.items.len + route_middleware.len;
+        const combined = try self.allocator.alloc(MiddlewareFn, total_mw);
+        defer self.allocator.free(combined);
 
-            fn execute(s: *Server, c: *Context) anyerror!void {
-                if (c.chain_index < c.chain_middlewares.len) {
-                    const mw = c.chain_middlewares[c.chain_index];
-                    c.chain_index += 1;
-                    try mw(c, struct {
-                        fn next(context: *Context) !void {
-                            try execute(s, context);
-                        }
-                    }.next);
-                } else {
-                    try c.chain_handler(c);
-                }
-            }
-        };
+        @memcpy(combined[0..self.global_middleware.items.len], self.global_middleware.items);
+        @memcpy(combined[self.global_middleware.items.len..], route_middleware);
 
-        ctx.chain_middlewares = self.global_middleware.items;
+        ctx.chain_middlewares = combined;
         ctx.chain_handler = final_handler;
         ctx.chain_index = 0;
 
-        try Chain.execute(self, ctx);
+        try runMiddlewareChain(ctx);
     }
 };
+
+fn runMiddlewareChain(ctx: *Context) anyerror!void {
+    if (ctx.chain_index < ctx.chain_middlewares.len) {
+        const mw = ctx.chain_middlewares[ctx.chain_index];
+        ctx.chain_index += 1;
+        try mw(ctx, runMiddlewareChain);
+    } else {
+        try ctx.chain_handler(ctx);
+    }
+}
 
 // Request/Response type wrapper
 pub fn Request(comptime T: type) type {
@@ -645,25 +834,6 @@ pub fn Json(comptime T: type) type {
         json: T,
     };
 }
-
-// Internal fields for Context
-var context_route: ?*const Route = null;
-var context_chain_middlewares: []const MiddlewareFn = &.{};
-var context_chain_handler: HandlerFn = undefined;
-var context_chain_index: usize = 0;
-
-// Store chain data in thread-local storage or use a different approach
-// For now, use a simpler approach with a wrapper
-
-const ServerHandler = struct {
-    server: *Server,
-
-    fn deinit(self: *ServerHandler, ctx: *Context) !void {
-        _ = self;
-        _ = ctx;
-        // Implementation
-    }
-};
 
 test "api server" {
     const allocator = std.testing.allocator;
@@ -708,4 +878,41 @@ test "path matching" {
 test "http methods" {
     try std.testing.expectEqual(Method.GET, Method.fromString("GET"));
     try std.testing.expectEqualStrings("POST", Method.POST.toString());
+}
+
+test "parse req binding" {
+    const allocator = std.testing.allocator;
+    const logger = log.Logger.new(.info, "test");
+    var ctx = try Context.init(allocator, .GET, "/users/42", logger);
+    defer ctx.deinit();
+
+    try ctx.params.put(try allocator.dupe(u8, "id"), try allocator.dupe(u8, "42"));
+    try ctx.query.put(try allocator.dupe(u8, "page"), try allocator.dupe(u8, "3"));
+
+    const Req = struct {
+        id: u32,
+        page: u32,
+    };
+
+    const req = try ctx.parseReq(Req, .{ .id = .path, .page = .query });
+    try std.testing.expectEqual(@as(u32, 42), req.id);
+    try std.testing.expectEqual(@as(u32, 3), req.page);
+}
+
+test "route group" {
+    const allocator = std.testing.allocator;
+    const logger = log.Logger.new(.info, "test");
+    var server = Server.init(allocator, 0, logger);
+    defer server.deinit();
+
+    var api_group = server.group("/api/v1");
+    try api_group.get("/users", struct {
+        fn handle(ctx: *Context) anyerror!void {
+            try ctx.json(200, "{\"users\":[]}");
+        }
+    }.handle);
+
+    // Route should exist at /api/v1/users
+    const matched = server.router.match(.GET, "/api/v1/users");
+    try std.testing.expect(matched != null);
 }

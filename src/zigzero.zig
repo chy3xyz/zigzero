@@ -18,6 +18,8 @@ pub const name = "zigzero";
 
 // Core
 pub const errors = @import("core/errors.zig");
+pub const fx = @import("core/fx.zig");
+pub const threading = @import("core/threading.zig");
 
 // Network
 pub const api = @import("net/api.zig");
@@ -71,6 +73,8 @@ comptime {
     _ = loadbalancer.LoadBalancer;
     _ = redis.Redis;
     _ = errors.Error;
+    _ = fx.Stream(u8);
+    _ = threading.RoutineGroup;
     _ = middleware.jwt;
     _ = svc.Context;
     _ = trace.Tracer;

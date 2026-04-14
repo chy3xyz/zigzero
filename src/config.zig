@@ -222,6 +222,24 @@ pub const Loader = struct {
         return self.parseJson(T, content);
     }
 
+    /// Load configuration from YAML file (simplified YAML subset)
+    pub fn loadYaml(self: Loader, comptime T: type, path: []const u8) !T {
+        const file = try std.fs.cwd().openFile(path, .{});
+        defer file.close();
+
+        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        defer self.allocator.free(content);
+
+        return self.parseYaml(T, content);
+    }
+
+    /// Parse YAML content into config type (simplified subset)
+    pub fn parseYaml(self: Loader, comptime T: type, content: []const u8) !T {
+        const json_str = try yamlToJson(self.allocator, content);
+        defer self.allocator.free(json_str);
+        return self.parseJson(T, json_str);
+    }
+
     /// Parse JSON content into config type
     pub fn parseJson(self: Loader, comptime T: type, content: []const u8) !T {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
@@ -289,10 +307,174 @@ pub const Loader = struct {
     }
 };
 
+/// Convert a simplified YAML subset to JSON string.
+/// Supports: key: value, nested objects, arrays with '- ', strings, numbers, bools.
+fn yamlToJson(allocator: std.mem.Allocator, yaml: []const u8) ![]u8 {
+    var line_list: std.ArrayList([]const u8) = .{};
+    defer line_list.deinit(allocator);
+
+    var lines_iter = std.mem.splitScalar(u8, yaml, '\n');
+    while (lines_iter.next()) |raw_line| {
+        const line = stripComment(raw_line);
+        if (line.len > 0) {
+            try line_list.append(allocator, line);
+        }
+    }
+
+    const yaml_lines = line_list.items;
+    var line_idx: usize = 0;
+
+    var stack: std.ArrayList(usize) = .{};
+    defer stack.deinit(allocator);
+
+    var result: std.ArrayList(u8) = .{};
+    errdefer result.deinit(allocator);
+
+    try result.appendSlice(allocator, "{");
+    try stack.append(allocator, 0);
+
+    var in_array = false;
+    var first_item = true;
+
+    while (line_idx < yaml_lines.len) {
+        const line = yaml_lines[line_idx];
+        line_idx += 1;
+
+        const indent = countIndent(line);
+        const trimmed = std.mem.trimLeft(u8, line, " ");
+
+        // Handle array items
+        if (std.mem.startsWith(u8, trimmed, "- ")) {
+            if (!in_array) {
+                in_array = true;
+                first_item = true;
+                try result.appendSlice(allocator, "[");
+            }
+            if (!first_item) try result.appendSlice(allocator, ",");
+            first_item = false;
+
+            const item = std.mem.trimLeft(u8, trimmed[2..], " ");
+            try appendYamlValue(allocator, &result, item);
+            continue;
+        }
+
+        // Close array if we were in one
+        if (in_array) {
+            try result.appendSlice(allocator, "]");
+            in_array = false;
+        }
+
+        // Parse key: value (supports both "key: value" and "key:")
+        if (std.mem.indexOf(u8, trimmed, ":")) |colon_pos| {
+            const key = std.mem.trim(u8, trimmed[0..colon_pos], " \"");
+            const value = std.mem.trimLeft(u8, trimmed[colon_pos + 1 ..], " ");
+
+            // Adjust nesting based on indentation
+            while (stack.items.len > 1 and indent <= stack.items[stack.items.len - 1]) {
+                _ = stack.pop();
+                try result.appendSlice(allocator, "}");
+            }
+
+            // Add comma if needed
+            if (result.items.len > 1 and result.items[result.items.len - 1] != '{' and result.items[result.items.len - 1] != '[') {
+                try result.appendSlice(allocator, ",");
+            }
+
+            try result.append(allocator, '"');
+            try result.appendSlice(allocator, key);
+            try result.appendSlice(allocator, "\":");
+
+            if (value.len == 0) {
+                // Peek ahead to detect if next line is an array item
+                const is_array = blk: {
+                    if (line_idx < yaml_lines.len) {
+                        const next_trimmed = std.mem.trimLeft(u8, yaml_lines[line_idx], " ");
+                        if (std.mem.startsWith(u8, next_trimmed, "- ")) break :blk true;
+                    }
+                    break :blk false;
+                };
+
+                if (is_array) {
+                    // Start array immediately; items will follow on next lines
+                    try result.appendSlice(allocator, "[");
+                    in_array = true;
+                    first_item = true;
+                    // Don't push to stack; the array is closed when a non-array line appears
+                } else {
+                    // Nested object starts
+                    try result.appendSlice(allocator, "{");
+                    try stack.append(allocator, indent);
+                }
+            } else {
+                try appendYamlValue(allocator, &result, value);
+            }
+        }
+    }
+
+    // Close remaining structures
+    if (in_array) try result.appendSlice(allocator, "]");
+    while (stack.items.len > 0) : (_ = stack.pop()) {
+        try result.appendSlice(allocator, "}");
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+fn stripComment(line: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, line, " #")) |pos| {
+        return line[0..pos];
+    }
+    if (line.len > 0 and line[0] == '#') return "";
+    return std.mem.trimRight(u8, line, "\r");
+}
+
+fn countIndent(line: []const u8) usize {
+    var count: usize = 0;
+    for (line) |c| {
+        if (c == ' ') count += 1 else break;
+    }
+    return count;
+}
+
+fn appendYamlValue(allocator: std.mem.Allocator, result: *std.ArrayList(u8), value: []const u8) !void {
+    const trimmed = std.mem.trim(u8, value, " \"");
+    if (std.mem.eql(u8, trimmed, "true")) {
+        try result.appendSlice(allocator, "true");
+    } else if (std.mem.eql(u8, trimmed, "false")) {
+        try result.appendSlice(allocator, "false");
+    } else if (std.mem.eql(u8, trimmed, "null")) {
+        try result.appendSlice(allocator, "null");
+    } else {
+        // Try to detect number
+        const is_number = blk: {
+            _ = std.fmt.parseInt(i64, trimmed, 10) catch {
+                _ = std.fmt.parseFloat(f64, trimmed) catch {
+                    break :blk false;
+                };
+            };
+            break :blk trimmed.len > 0;
+        };
+
+        if (is_number) {
+            try result.appendSlice(allocator, trimmed);
+        } else {
+            try result.append(allocator, '"');
+            try result.appendSlice(allocator, trimmed);
+            try result.append(allocator, '"');
+        }
+    }
+}
+
 /// Load configuration from JSON file
 pub fn loadJson(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !T {
     const loader = Loader.init(allocator);
     return loader.loadJson(T, path);
+}
+
+/// Load configuration from YAML file
+pub fn loadYaml(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !T {
+    const loader = Loader.init(allocator);
+    return loader.loadYaml(T, path);
 }
 
 /// Load configuration from environment variables
@@ -328,6 +510,46 @@ test "config json parsing" {
 
     const allocator = std.testing.allocator;
     const cfg = try Loader.init(allocator).parseJson(Config, json_content);
+    defer {
+        allocator.free(cfg.name);
+        allocator.free(cfg.log.level);
+        allocator.free(cfg.log.service_name);
+        allocator.free(cfg.redis.host);
+        allocator.free(cfg.mysql.host);
+        allocator.free(cfg.mysql.database);
+        for (cfg.etcd.endpoints) |ep| allocator.free(ep);
+        allocator.free(cfg.etcd.endpoints);
+    }
+
+    try std.testing.expectEqualStrings("test-service", cfg.name);
+    try std.testing.expectEqual(@as(u16, 8080), cfg.port);
+    try std.testing.expectEqualStrings("debug", cfg.log.level);
+    try std.testing.expectEqualStrings("localhost", cfg.redis.host);
+    try std.testing.expectEqual(@as(u16, 6379), cfg.redis.port);
+}
+
+test "config yaml parsing" {
+    const yaml_content =
+        \\name: test-service
+        \\port: 8080
+        \\log:
+        \\  level: debug
+        \\  service_name: test
+        \\redis:
+        \\  host: localhost
+        \\  port: 6379
+        \\mysql:
+        \\  host: localhost
+        \\  port: 3306
+        \\  database: testdb
+        \\etcd:
+        \\  endpoints:
+        \\    - localhost:2379
+        \\  timeout_sec: 10
+    ;
+
+    const allocator = std.testing.allocator;
+    const cfg = try Loader.init(allocator).parseYaml(Config, yaml_content);
     defer {
         allocator.free(cfg.name);
         allocator.free(cfg.log.level);

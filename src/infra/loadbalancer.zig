@@ -11,6 +11,7 @@ pub const Algorithm = enum {
     weighted_round_robin, // Weighted round robin
     least_connection, // Least connections
     ip_hash, // Hash by client IP
+    consistent_hash, // Consistent hashing
 };
 
 /// Service endpoint
@@ -79,6 +80,7 @@ pub const LoadBalancer = struct {
             .weighted_round_robin => self.selectWeightedRoundRobin(),
             .least_connection => self.selectLeastConnection(),
             .ip_hash => self.selectByIpHash(""),
+            .consistent_hash => self.selectConsistentHash(""),
         };
     }
 
@@ -87,6 +89,13 @@ pub const LoadBalancer = struct {
         if (self.endpoints.items.len == 0) return null;
         if (self.healthyCount() == 0) return null;
         return self.selectByIpHash(ip);
+    }
+
+    /// Select endpoint by consistent hash for a given key
+    pub fn selectForKey(self: *LoadBalancer, key: []const u8) ?*Endpoint {
+        if (self.endpoints.items.len == 0) return null;
+        if (self.healthyCount() == 0) return null;
+        return self.selectConsistentHash(key);
     }
 
     fn selectRoundRobin(self: *LoadBalancer) ?*Endpoint {
@@ -175,6 +184,35 @@ pub const LoadBalancer = struct {
         return null;
     }
 
+    fn selectConsistentHash(self: *LoadBalancer, key: []const u8) ?*Endpoint {
+        const healthy_total = self.healthyCount();
+        if (healthy_total == 0) return null;
+
+        // Simple consistent hash with virtual nodes (150 replicas per endpoint)
+        const vnodes_per_endpoint = 150;
+        const total_vnodes = healthy_total * vnodes_per_endpoint;
+
+        var hash: u32 = 0;
+        for (key) |c| {
+            hash = hash *% 31 +% @as(u32, c);
+        }
+
+        // Find the virtual node
+        var vnode: u32 = hash % @as(u32, @intCast(total_vnodes));
+        var attempts: u32 = 0;
+        while (attempts < total_vnodes) : (attempts += 1) {
+            const target_idx = vnode % @as(u32, @intCast(healthy_total));
+            var healthy_seen: u32 = 0;
+            for (self.endpoints.items) |*ep| {
+                if (!ep.is_healthy) continue;
+                if (healthy_seen == target_idx) return ep;
+                healthy_seen += 1;
+            }
+            vnode = (vnode + 1) % @as(u32, @intCast(total_vnodes));
+        }
+        return null;
+    }
+
     /// Record connection closed (for least_connection)
     pub fn recordConnectionClosed(self: *LoadBalancer, endpoint: *Endpoint) void {
         _ = self;
@@ -195,4 +233,18 @@ test "load balancer" {
     try std.testing.expect(lb.select() != null);
     try std.testing.expect(lb.select() != null);
     try std.testing.expect(lb.select() != null);
+}
+
+test "consistent hash" {
+    var lb = LoadBalancer.init(std.testing.allocator, .consistent_hash);
+    defer lb.deinit();
+
+    lb.addEndpoint("192.168.1.1:8080");
+    lb.addEndpoint("192.168.1.2:8080");
+
+    const ep1 = lb.selectForKey("user-123");
+    const ep2 = lb.selectForKey("user-123");
+    try std.testing.expect(ep1 != null);
+    try std.testing.expect(ep2 != null);
+    try std.testing.expectEqualStrings(ep1.?.address, ep2.?.address);
 }

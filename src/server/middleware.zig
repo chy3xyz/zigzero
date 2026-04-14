@@ -9,17 +9,63 @@ const limiter = @import("../infra/limiter.zig");
 
 /// JWT claims
 pub const Claims = struct {
-    user_id: []const u8,
-    username: []const u8,
-    exp: i64,
-    iat: i64,
+    sub: ?[]const u8 = null,
+    user_id: ?[]const u8 = null,
+    username: ?[]const u8 = null,
+    exp: ?i64 = null,
+    iat: ?i64 = null,
 };
+
+/// Base64-url decode (no padding)
+fn base64UrlDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var padded = try allocator.alloc(u8, std.mem.alignForward(usize, input.len + 2, 4));
+    defer allocator.free(padded);
+    @memcpy(padded[0..input.len], input);
+    var i: usize = input.len;
+    while (i < padded.len) : (i += 1) {
+        padded[i] = '=';
+    }
+    const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
+    const size = decoder.calcSizeForSlice(padded) catch return error.InvalidToken;
+    const out = try allocator.alloc(u8, size);
+    errdefer allocator.free(out);
+    try decoder.decode(out, padded);
+    return out;
+}
+
+/// Verify a JWT token using HMAC-SHA256. Returns decoded payload on success.
+fn verifyJwt(allocator: std.mem.Allocator, token: []const u8, secret: []const u8) !std.json.Parsed(std.json.Value) {
+    var parts_iter = std.mem.splitScalar(u8, token, '.');
+    const header_b64 = parts_iter.next() orelse return error.InvalidToken;
+    const payload_b64 = parts_iter.next() orelse return error.InvalidToken;
+    const sig_b64 = parts_iter.next() orelse return error.InvalidToken;
+    if (parts_iter.next() != null) return error.InvalidToken;
+
+    const signed_data = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header_b64, payload_b64 });
+    defer allocator.free(signed_data);
+
+    // Compute expected signature
+    var expected_sig: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&expected_sig, signed_data, secret);
+
+    // Decode provided signature
+    const sig_decoded = try base64UrlDecode(allocator, sig_b64);
+    defer allocator.free(sig_decoded);
+
+    if (!std.crypto.utils.timingSafeEql([32]u8, expected_sig, sig_decoded[0..32].*)) {
+        return error.InvalidToken;
+    }
+
+    const payload_json = try base64UrlDecode(allocator, payload_b64);
+    defer allocator.free(payload_json);
+
+    return std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+}
 
 /// JWT middleware for authentication
 pub fn jwt(secret: []const u8) api.MiddlewareFn {
     return struct {
         fn middleware(ctx: *api.Context, next: api.HandlerFn) anyerror!void {
-            _ = secret;
             const auth_header = ctx.header("Authorization");
             if (auth_header == null) {
                 try ctx.sendError(401, "missing authorization header");
@@ -34,6 +80,20 @@ pub fn jwt(secret: []const u8) api.MiddlewareFn {
             if (token.len == 0) {
                 try ctx.sendError(401, "missing token");
                 return;
+            }
+
+            const parsed = verifyJwt(ctx.allocator, token, secret) catch |err| {
+                _ = err;
+                try ctx.sendError(401, "invalid or expired token");
+                return;
+            };
+            defer parsed.deinit();
+
+            // Optionally attach claims to context via header for downstream use
+            if (parsed.value.object.get("sub")) |sub| {
+                if (sub == .string) {
+                    try ctx.setHeader("X-User-ID", sub.string);
+                }
             }
 
             try next(ctx);
@@ -99,14 +159,20 @@ pub fn rateLimit(bucket: *limiter.TokenBucket) api.MiddlewareFn {
 }
 
 /// Logging middleware
-pub fn logging(logger: anytype) api.MiddlewareFn {
+pub fn logging() api.MiddlewareFn {
     return struct {
         fn middleware(ctx: *api.Context, next: api.HandlerFn) anyerror!void {
-            const start = std.time.timestamp();
+            const start = std.time.milliTimestamp();
             try next(ctx);
-            const duration = std.time.timestamp() - start;
-            _ = logger;
-            _ = duration;
+            const duration = std.time.milliTimestamp() - start;
+            const msg = std.fmt.allocPrint(ctx.allocator, "{s} {s} - {d} ({d}ms)", .{
+                ctx.method.toString(),
+                ctx.raw_path,
+                ctx.status_code,
+                duration,
+            }) catch return;
+            defer ctx.allocator.free(msg);
+            ctx.logger.info(msg);
         }
     }.middleware;
 }

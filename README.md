@@ -8,18 +8,18 @@ ZigZero is a high-performance microservice framework written in Zig, inspired by
 
 ## Features
 
-- **HTTP Server** (`api`) - Full HTTP server with routing, middleware, JSON parsing
+- **HTTP Server** (`api`) - Full HTTP server with routing, middleware, JSON parsing, route groups, and struct-tag auto parameter binding
 - **RPC Framework** (`rpc`) - Binary protocol RPC over TCP with circuit breaker
 - **HTTP Client** (`http`) - HTTP client with timeout and retries
 - **WebSocket** (`websocket`) - RFC 6455 WebSocket server
 - **TLS/HTTPS** (`tls`) - TLS configuration for secure servers
 - **Static File Server** (`static`) - Static file serving with MIME types
-- **Middleware** (`middleware`) - JWT, CORS, rate limit, logging, recovery
-- **Configuration** (`config`) - JSON configuration loading
+- **Middleware** (`middleware`) - JWT (HMAC-SHA256 verified), CORS, rate limit, logging, recovery
+- **Configuration** (`config`) - JSON and YAML configuration loading
 - **Logging** (`log`) - Structured logging with levels and file rotation
 - **Circuit Breaker** (`breaker`) - Hystrix-style circuit breaker
 - **Rate Limiter** (`limiter`) - Token bucket and sliding window
-- **Load Balancer** (`loadbalancer`) - Round robin, random, weighted, least connection
+- **Load Balancer** (`loadbalancer`) - Round robin, random, weighted, least connection, IP hash, consistent hashing
 - **Redis Client** (`redis`) - RESP protocol implementation
 - **Connection Pool** (`pool`) - Generic connection pooling
 - **Health Checks** (`health`) - Health probe registry
@@ -27,14 +27,16 @@ ZigZero is a high-performance microservice framework written in Zig, inspired by
 - **Distributed Tracing** (`trace`) - OpenTelemetry-compatible tracing
 - **Metrics** (`metric`) - Prometheus-compatible metrics
 - **Retry** (`retry`) - Exponential backoff with jitter
-- **Message Queue** (`mq`) - In-memory pub/sub messaging
+- **Message Queue** (`mq**) - In-memory pub/sub messaging
 - **Cron Scheduler** (`cron`) - Scheduled task execution
 - **Lifecycle Management** (`lifecycle`) - Graceful shutdown hooks
 - **Validation** (`validate`) - Input validation utilities
-- **Local Cache** (`cache`) - In-memory LRU cache
-- **Distributed Lock** (`lock`) - Redis and local locks
-- **ORM** (`orm`) - Query builder and model traits
-- **Service Context** (`svc`) - Dependency injection context
+- **Local Cache** (`cache**) - In-memory LRU cache
+- **Distributed Lock** (`lock**) - Redis and local locks
+- **ORM** (`orm**) - Query builder and model traits
+- **Service Context** (`svc**) - Dependency injection context
+- **Stream/Parallel** (`fx**) - Map, Parallel, Stream utilities aligned with go-zero's fx
+- **Threading** (`threading**) - RoutineGroup, TaskRunner, safe goroutine spawning
 
 ## Quick Start
 
@@ -185,6 +187,8 @@ zig build test
 | `orm` | `data/orm` | Query builder | ✅ Complete |
 | `validate` | `data/validate` | Input validation | ✅ Complete |
 | `errors` | `core/errors` | Unified error types | ✅ Complete |
+| `fx` | `core/fx` | Stream / Parallel / Map utilities | ✅ Complete |
+| `threading` | `core/threading` | RoutineGroup / TaskRunner | ✅ Complete |
 
 ## Requirements
 
