@@ -8,11 +8,22 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    _ = b.addModule("zigzero", .{
+    const zigzero_mod = b.addModule("zigzero", .{
         .root_source_file = b.path("src/zigzero.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    // Link database C libraries
+    zigzero_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/libpq/include" });
+    zigzero_mod.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/libpq/lib" });
+    zigzero_mod.linkSystemLibrary("pq", .{});
+
+    zigzero_mod.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/mariadb-connector-c/include/mariadb" });
+    zigzero_mod.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/mariadb-connector-c/lib" });
+    zigzero_mod.linkSystemLibrary("mysqlclient", .{});
+
+    zigzero_mod.linkSystemLibrary("sqlite3", .{});
 
     // zigzeroctl code generation tool
     const ctl_module = b.createModule(.{
@@ -32,7 +43,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    api_server_module.addImport("zigzero", b.modules.get("zigzero").?);
+    api_server_module.addImport("zigzero", zigzero_mod);
     const api_server = b.addExecutable(.{
         .name = "api-server",
         .root_module = api_server_module,
@@ -46,6 +57,17 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    test_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/libpq/include" });
+    test_module.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/libpq/lib" });
+    test_module.linkSystemLibrary("pq", .{});
+
+    test_module.addSystemIncludePath(.{ .cwd_relative = "/usr/local/opt/mariadb-connector-c/include/mariadb" });
+    test_module.addLibraryPath(.{ .cwd_relative = "/usr/local/opt/mariadb-connector-c/lib" });
+    test_module.linkSystemLibrary("mysqlclient", .{});
+
+    test_module.linkSystemLibrary("sqlite3", .{});
+
     const tests = b.addTest(.{
         .root_module = test_module,
     });
