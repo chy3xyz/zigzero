@@ -4,7 +4,7 @@
 //! Aligned with go-zero's config patterns.
 
 const std = @import("std");
-const errors = @import("errors");
+const errors = @import("errors.zig");
 
 /// Main configuration structure
 pub const Config = struct {
@@ -230,7 +230,7 @@ pub const Loader = struct {
         var config: T = undefined;
         const json = parsed.value;
 
-        inline for (@typeInfo(T).Struct.fields) |field| {
+        inline for (@typeInfo(T).@"struct".fields) |field| {
             if (json.object.get(field.name)) |value| {
                 @field(config, field.name) = try parseField(self.allocator, field.type, value);
             }
@@ -241,15 +241,15 @@ pub const Loader = struct {
 
     fn parseField(allocator: std.mem.Allocator, comptime T: type, value: std.json.Value) !T {
         return switch (@typeInfo(T)) {
-            .Int => @intCast(value.integer),
-            .Float => @floatCast(value.float),
-            .Bool => value.bool,
-            .Pointer => |p| switch (p.size) {
-                .Slice => if (p.child == u8) try allocator.dupe(u8, value.string) else @compileError("Unsupported slice type"),
+            .int => @intCast(value.integer),
+            .float => @floatCast(value.float),
+            .bool => value.bool,
+            .pointer => |p| switch (p.size) {
+                .slice => if (p.child == u8) try allocator.dupe(u8, value.string) else @compileError("Unsupported slice type"),
                 else => @compileError("Unsupported pointer type"),
             },
-            .Optional => |o| if (value == .null) null else try parseField(allocator, o.child, value),
-            .Struct => try T.fromJson(allocator, value),
+            .optional => |o| if (value == .null) null else try parseField(allocator, o.child, value),
+            .@"struct" => try T.fromJson(allocator, value),
             else => @compileError("Unsupported field type"),
         };
     }
@@ -258,7 +258,7 @@ pub const Loader = struct {
     pub fn loadEnv(self: Loader, comptime T: type, prefix: []const u8) !T {
         var config: T = undefined;
 
-        inline for (@typeInfo(T).Struct.fields) |field| {
+        inline for (@typeInfo(T).@"struct".fields) |field| {
             const env_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ prefix, std.ascii.upperString(&[_]u8{}, field.name) });
             defer self.allocator.free(env_name);
 
@@ -273,14 +273,14 @@ pub const Loader = struct {
 
     fn parseEnvValue(comptime T: type, value: []const u8) !T {
         return switch (@typeInfo(T)) {
-            .Int => std.fmt.parseInt(T, value, 10),
-            .Float => std.fmt.parseFloat(T, value),
-            .Bool => std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"),
-            .Pointer => |p| switch (p.size) {
-                .Slice => if (p.child == u8) std.heap.page_allocator.dupe(u8, value) catch return error.ConfigError else @compileError("Unsupported slice type"),
+            .int => std.fmt.parseInt(T, value, 10),
+            .float => std.fmt.parseFloat(T, value),
+            .bool => std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"),
+            .pointer => |p| switch (p.size) {
+                .slice => if (p.child == u8) std.heap.page_allocator.dupe(u8, value) catch return error.ConfigError else @compileError("Unsupported slice type"),
                 else => @compileError("Unsupported pointer type"),
             },
-            .Optional => |o| parseEnvValue(o.child, value),
+            .optional => |o| parseEnvValue(o.child, value),
             else => @compileError("Unsupported field type"),
         };
     }
@@ -325,6 +325,16 @@ test "config json parsing" {
 
     const allocator = std.testing.allocator;
     const cfg = try Loader.init(allocator).parseJson(Config, json_content);
+    defer {
+        allocator.free(cfg.name);
+        allocator.free(cfg.log.level);
+        allocator.free(cfg.log.service_name);
+        allocator.free(cfg.redis.host);
+        allocator.free(cfg.mysql.host);
+        allocator.free(cfg.mysql.database);
+        for (cfg.etcd.endpoints) |ep| allocator.free(ep);
+        allocator.free(cfg.etcd.endpoints);
+    }
 
     try std.testing.expectEqualStrings("test-service", cfg.name);
     try std.testing.expectEqual(@as(u16, 8080), cfg.port);

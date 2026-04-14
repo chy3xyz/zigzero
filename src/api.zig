@@ -4,8 +4,8 @@
 //! Aligned with go-zero's rest package.
 
 const std = @import("std");
-const errors = @import("errors");
-const log = @import("log");
+const errors = @import("errors.zig");
+const log = @import("log.zig");
 
 /// HTTP method
 pub const Method = enum {
@@ -80,7 +80,7 @@ pub const Context = struct {
             .query = std.StringHashMap([]const u8).init(allocator),
             .params = std.StringHashMap([]const u8).init(allocator),
             .headers = std.StringHashMap([]const u8).init(allocator),
-            .response_body = std.ArrayList(u8).init(allocator),
+            .response_body = std.ArrayList(u8){},
             .response_headers = std.StringHashMap([]const u8).init(allocator),
             .logger = logger,
         };
@@ -108,7 +108,7 @@ pub const Context = struct {
         }
         self.headers.deinit();
 
-        self.response_body.deinit();
+        self.response_body.deinit(self.allocator);
 
         var resp_headers_iter = self.response_headers.iterator();
         while (resp_headers_iter.next()) |entry| {
@@ -144,7 +144,7 @@ pub const Context = struct {
     pub fn json(self: *Context, status: u16, data: []const u8) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "application/json");
-        try self.response_body.appendSlice(data);
+        try self.response_body.appendSlice(self.allocator, data);
         self.responded = true;
     }
 
@@ -152,7 +152,7 @@ pub const Context = struct {
     pub fn text(self: *Context, status: u16, data: []const u8) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "text/plain");
-        try self.response_body.appendSlice(data);
+        try self.response_body.appendSlice(self.allocator, data);
         self.responded = true;
     }
 
@@ -162,7 +162,7 @@ pub const Context = struct {
         try self.setHeader("Content-Type", "application/json");
         const err_json = try std.fmt.allocPrint(self.allocator, "{{\"error\":\"{s}\"}}", .{message});
         defer self.allocator.free(err_json);
-        try self.response_body.appendSlice(err_json);
+        try self.response_body.appendSlice(self.allocator, err_json);
         self.responded = true;
     }
 
@@ -178,7 +178,7 @@ pub const Context = struct {
         try self.setHeader("Content-Type", "application/json");
         const json_str = try std.json.stringifyAlloc(self.allocator, value, .{});
         defer self.allocator.free(json_str);
-        try self.response_body.appendSlice(json_str);
+        try self.response_body.appendSlice(self.allocator, json_str);
         self.responded = true;
     }
 };
@@ -306,16 +306,16 @@ const Router = struct {
     pub fn init(allocator: std.mem.Allocator) Router {
         return .{
             .allocator = allocator,
-            .routes = std.ArrayList(Route).init(allocator),
+            .routes = std.ArrayList(Route){},
         };
     }
 
     pub fn deinit(self: *Router) void {
-        self.routes.deinit();
+        self.routes.deinit(self.allocator);
     }
 
     pub fn addRoute(self: *Router, route: Route) !void {
-        try self.routes.append(route);
+        try self.routes.append(self.allocator, route);
     }
 
     pub fn match(self: *const Router, method: Method, path: []const u8) ?MatchedRoute {
@@ -432,7 +432,7 @@ pub const Server = struct {
             .allocator = allocator,
             .port = port,
             .router = Router.init(allocator),
-            .global_middleware = std.ArrayList(MiddlewareFn).init(allocator),
+            .global_middleware = std.ArrayList(MiddlewareFn){},
             .name = "zigzero-api",
             .running = std.atomic.Value(bool).init(false),
             .server_socket = null,
@@ -442,7 +442,7 @@ pub const Server = struct {
 
     pub fn deinit(self: *Server) void {
         self.router.deinit();
-        self.global_middleware.deinit();
+        self.global_middleware.deinit(self.allocator);
         if (self.server_socket) |*ss| {
             ss.deinit();
         }
@@ -455,7 +455,7 @@ pub const Server = struct {
 
     /// Add global middleware
     pub fn addMiddleware(self: *Server, mw: MiddlewareFn) !void {
-        try self.global_middleware.append(mw);
+        try self.global_middleware.append(self.allocator, mw);
     }
 
     /// Start the server

@@ -3,7 +3,7 @@
 //! Provides Prometheus-compatible metrics.
 
 const std = @import("std");
-const log = @import("log");
+const log = @import("log.zig");
 
 /// Counter metric
 pub const Counter = struct {
@@ -246,6 +246,7 @@ pub const Registry = struct {
     pub fn deinit(self: *Registry) void {
         var counters_iter = self.counters.iterator();
         while (counters_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }
@@ -253,6 +254,7 @@ pub const Registry = struct {
 
         var gauges_iter = self.gauges.iterator();
         while (gauges_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }
@@ -260,6 +262,7 @@ pub const Registry = struct {
 
         var hist_iter = self.histograms.iterator();
         while (hist_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }

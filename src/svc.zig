@@ -4,10 +4,10 @@
 //! Aligned with go-zero's svc.ServiceContext.
 
 const std = @import("std");
-const config = @import("config");
-const log = @import("log");
-const redis = @import("redis");
-const rpc = @import("rpc");
+const config = @import("config.zig");
+const log = @import("log.zig");
+const redis = @import("redis.zig");
+const rpc = @import("rpc.zig");
 
 /// Service context holding all dependencies
 pub const Context = struct {

@@ -3,7 +3,7 @@
 //! Provides token bucket and sliding window rate limiting aligned with go-zero's limit.
 
 const std = @import("std");
-const errors = @import("errors");
+const errors = @import("errors.zig");
 
 /// Rate limiter type
 pub const Type = enum {
@@ -27,7 +27,7 @@ pub const TokenBucket = struct {
     rate: f64, // Tokens per second
     burst: u32, // Maximum tokens
     tokens: f64, // Current tokens
-    last_update: i64, // Last update timestamp in nanoseconds
+    last_update: i128, // Last update timestamp in nanoseconds
 
     /// Create a new token bucket
     pub fn new(rate: f64, burst: u32) TokenBucket {
@@ -109,7 +109,7 @@ pub fn getLimiter(name: []const u8, config: Config) *TokenBucket {
         return limiter;
     }
 
-    var limiter = TokenBucket.new(config.rate, config.burst);
+    const limiter = TokenBucket.new(config.rate, config.burst);
     global_limiters.put(gpa, name, limiter) catch return &global_limiters.get(gpa, name).?;
     return &global_limiters.get(gpa, name).?;
 }

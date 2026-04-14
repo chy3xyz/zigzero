@@ -3,15 +3,15 @@
 //! Provides structured logging with levels, rotation, and async support.
 
 const std = @import("std");
-const config = @import("config");
-const errors = @import("errors");
+const config = @import("config.zig");
+const errors = @import("errors.zig");
 
 /// Log level enum
 pub const Level = enum(u8) {
     debug = 0,
     info = 1,
     warn = 2,
-    error = 3,
+    err = 3,
     fatal = 4,
 
     pub fn fromString(s: []const u8) Level {
@@ -23,7 +23,7 @@ pub const Level = enum(u8) {
             .debug => "DEBUG",
             .info => "INFO",
             .warn => "WARN",
-            .error => "ERROR",
+            .err => "ERROR",
             .fatal => "FATAL",
         };
     }
@@ -33,14 +33,12 @@ pub const Level = enum(u8) {
 pub const Logger = struct {
     level: Level,
     service_name: []const u8,
-    writer: std.io.AnyWriter,
 
     /// Create a new logger with console output
     pub fn new(level: Level, service_name: []const u8) Logger {
         return Logger{
             .level = level,
             .service_name = service_name,
-            .writer = std.io.getStdOut().writer().any(),
         };
     }
 
@@ -67,20 +65,18 @@ pub const Logger = struct {
 
     /// Log a message at error level
     pub fn err(self: *const Logger, msg: []const u8) void {
-        if (@intFromEnum(self.level) <= @intFromEnum(Level.error)) {
-            self.log(.error, msg);
+        if (@intFromEnum(self.level) <= @intFromEnum(Level.err)) {
+            self.log(.err, msg);
         }
     }
 
     /// Internal log function
     fn log(self: *const Logger, level: Level, msg: []const u8) void {
         const timestamp = std.time.timestamp();
-        const formatted = std.fmt.allocPrint(std.heap.page_allocator, 
-            "[{d}] [{s}] [{s}] {s}\n", .{
-            timestamp, self.service_name, level.toString(), msg
-        }) catch return;
+        const formatted = std.fmt.allocPrint(std.heap.page_allocator, "[{d}] [{s}] [{s}] {s}\n", .{ timestamp, self.service_name, level.toString(), msg }) catch return;
         defer std.heap.page_allocator.free(formatted);
-        self.writer.writeAll(formatted) catch return;
+        const stdout = std.fs.File.stdout();
+        _ = stdout.write(formatted) catch return;
     }
 };
 

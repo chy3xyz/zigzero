@@ -3,7 +3,7 @@
 //! Implements the circuit breaker pattern aligned with go-zero's breaker.
 
 const std = @import("std");
-const errors = @import("errors");
+const errors = @import("errors.zig");
 
 /// Circuit breaker state
 pub const State = enum {

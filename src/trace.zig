@@ -3,7 +3,7 @@
 //! Provides OpenTelemetry-compatible distributed tracing.
 
 const std = @import("std");
-const log = @import("log");
+const log = @import("log.zig");
 
 /// Trace ID
 pub const TraceId = [16]u8;
@@ -26,12 +26,12 @@ pub const Span = struct {
     pub const Status = enum {
         unset,
         ok,
-        error,
+        err,
     };
 
     pub fn init(allocator: std.mem.Allocator, name: []const u8, trace_id: TraceId, parent_id: ?SpanId) !Span {
         const span_id = generateSpanId();
-        
+
         return Span{
             .trace_id = trace_id,
             .span_id = span_id,
@@ -45,7 +45,7 @@ pub const Span = struct {
 
     pub fn deinit(self: *Span) void {
         self.allocator.free(self.name);
-        
+
         var iter = self.attributes.iterator();
         while (iter.next()) |entry| {
             self.allocator.free(entry.key_ptr.*);
@@ -73,8 +73,8 @@ pub const Span = struct {
 
     /// Get duration in milliseconds
     pub fn getDurationMs(self: *const Span) i64 {
-        const end = self.end_time orelse std.time.milliTimestamp();
-        return end - self.start_time;
+        const end_time = self.end_time orelse std.time.milliTimestamp();
+        return end_time - self.start_time;
     }
 
     /// Format trace ID as hex string
@@ -99,18 +99,18 @@ pub const Tracer = struct {
         return Tracer{
             .allocator = allocator,
             .service_name = try allocator.dupe(u8, service_name),
-            .spans = std.ArrayList(*Span).init(allocator),
+            .spans = .{},
         };
     }
 
     pub fn deinit(self: *Tracer) void {
         self.allocator.free(self.service_name);
-        
+
         for (self.spans.items) |span| {
             span.deinit();
             self.allocator.destroy(span);
         }
-        self.spans.deinit();
+        self.spans.deinit(self.allocator);
     }
 
     /// Start a new trace
@@ -123,10 +123,10 @@ pub const Tracer = struct {
     pub fn startSpan(self: *Tracer, operation_name: []const u8, trace_id: TraceId, parent_id: ?SpanId) !*Span {
         const span = try self.allocator.create(Span);
         span.* = try Span.init(self.allocator, operation_name, trace_id, parent_id);
-        
-        try self.spans.append(span);
+
+        try self.spans.append(self.allocator, span);
         self.current_span = span;
-        
+
         return span;
     }
 
@@ -138,13 +138,13 @@ pub const Tracer = struct {
     /// Export spans as JSON
     pub fn exportJson(self: *const Tracer, writer: anytype) !void {
         try writer.writeAll("[");
-        
+
         for (self.spans.items, 0..) |span, i| {
             if (i > 0) try writer.writeAll(",");
-            
+
             var trace_buf: [33]u8 = undefined;
             var span_buf: [17]u8 = undefined;
-            
+
             try writer.writeAll("{");
             try writer.print("\"trace_id\":\"{s}\",", .{span.formatTraceId(&trace_buf)});
             try writer.print("\"span_id\":\"{s}\",", .{span.formatSpanId(&span_buf)});
@@ -153,7 +153,7 @@ pub const Tracer = struct {
             try writer.print("\"duration_ms\":{d}", .{span.getDurationMs()});
             try writer.writeAll("}");
         }
-        
+
         try writer.writeAll("]");
     }
 };
@@ -188,14 +188,14 @@ pub fn parseSpanId(hex: []const u8) !SpanId {
 
 test "tracing" {
     const allocator = std.testing.allocator;
-    
+
     var tracer = try Tracer.init(allocator, "test-service");
     defer tracer.deinit();
-    
+
     const span = try tracer.startTrace("test-operation");
     try span.setAttribute("key", "value");
     span.end();
-    
+
     try std.testing.expectEqualStrings("test-operation", span.name);
     try std.testing.expectEqualStrings("value", span.attributes.get("key").?);
 }
@@ -203,7 +203,7 @@ test "tracing" {
 test "trace id generation" {
     const trace_id = generateTraceId();
     const span_id = generateSpanId();
-    
+
     try std.testing.expectEqual(@as(usize, 16), trace_id.len);
     try std.testing.expectEqual(@as(usize, 8), span_id.len);
 }

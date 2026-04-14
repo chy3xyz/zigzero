@@ -3,7 +3,7 @@
 //! Provides database access layer aligned with go-zero's model pattern.
 
 const std = @import("std");
-const errors = @import("errors");
+const errors = @import("errors.zig");
 
 /// Database connection configuration
 pub const Config = struct {
@@ -43,7 +43,6 @@ pub const Pool = struct {
 
     /// Release connection back to pool
     pub fn release(self: *Pool, conn: *Connection) void {
-        _ = self;
         self.allocator.destroy(conn);
     }
 };
@@ -110,7 +109,7 @@ fn getTableName(comptime T: type) []const u8 {
 /// Get primary key field
 fn getPrimaryKey(comptime T: type) []const u8 {
     // Check for 'id' field by convention
-    inline for (@typeInfo(T).Struct.fields) |field| {
+    inline for (@typeInfo(T).@"struct".fields) |field| {
         if (std.mem.eql(u8, field.name, "id")) {
             return "id";
         }
@@ -121,7 +120,7 @@ fn getPrimaryKey(comptime T: type) []const u8 {
 /// Get all field names
 fn getFields(comptime T: type) []const []const u8 {
     comptime var fields: []const []const u8 = &[_][]const u8{};
-    inline for (@typeInfo(T).Struct.fields) |field| {
+    inline for (@typeInfo(T).@"struct".fields) |field| {
         fields = fields ++ .{field.name};
     }
     return fields;
@@ -141,12 +140,12 @@ pub const Query = struct {
         return .{
             .allocator = allocator,
             .table = table,
-            .where_clauses = std.ArrayList([]const u8).init(allocator),
+            .where_clauses = .{},
         };
     }
 
     pub fn deinit(self: *Query) void {
-        self.where_clauses.deinit();
+        self.where_clauses.deinit(self.allocator);
     }
 
     pub fn select(self: *Query, fields: []const u8) *Query {
@@ -155,7 +154,7 @@ pub const Query = struct {
     }
 
     pub fn where(self: *Query, clause: []const u8) !*Query {
-        try self.where_clauses.append(clause);
+        try self.where_clauses.append(self.allocator, clause);
         return self;
     }
 
@@ -175,29 +174,29 @@ pub const Query = struct {
     }
 
     pub fn build(self: *const Query) ![]const u8 {
-        var buf = std.ArrayList(u8).init(self.allocator);
-        defer buf.deinit();
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
 
-        try buf.writer().print("SELECT {s} FROM {s}", .{ self.select_fields, self.table });
+        try buf.writer(self.allocator).print("SELECT {s} FROM {s}", .{ self.select_fields, self.table });
 
         if (self.where_clauses.items.len > 0) {
-            try buf.writer().writeAll(" WHERE ");
+            try buf.writer(self.allocator).writeAll(" WHERE ");
             for (self.where_clauses.items, 0..) |clause, i| {
-                if (i > 0) try buf.writer().writeAll(" AND ");
-                try buf.writer().writeAll(clause);
+                if (i > 0) try buf.writer(self.allocator).writeAll(" AND ");
+                try buf.writer(self.allocator).writeAll(clause);
             }
         }
 
         if (self.order_by) |order_field| {
-            try buf.writer().print(" ORDER BY {s}", .{order_field});
+            try buf.writer(self.allocator).print(" ORDER BY {s}", .{order_field});
         }
 
         if (self.limit_val) |n| {
-            try buf.writer().print(" LIMIT {d}", .{n});
+            try buf.writer(self.allocator).print(" LIMIT {d}", .{n});
         }
 
         if (self.offset_val) |n| {
-            try buf.writer().print(" OFFSET {d}", .{n});
+            try buf.writer(self.allocator).print(" OFFSET {d}", .{n});
         }
 
         return try self.allocator.dupe(u8, buf.items);
@@ -241,9 +240,9 @@ test "orm query builder" {
     var query = Query.init(allocator, "users");
     defer query.deinit();
 
-    try query.where("id = 1");
-    try query.where("status = 'active'");
-    query.limit(10);
+    _ = try query.where("id = 1");
+    _ = try query.where("status = 'active'");
+    _ = query.limit(10);
 
     const sql = try query.build();
     defer allocator.free(sql);
