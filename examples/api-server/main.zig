@@ -65,7 +65,7 @@ pub fn main() !void {
 
     // Add global middleware
     try server.addMiddleware(middleware.requestId());
-    try server.addMiddleware(try middleware.cors(allocator, .{}));
+    try server.addMiddleware(try middleware.cors(allocator, .{ .max_age = 86400 }));
     try server.addMiddleware(middleware.logging());
     try server.addMiddleware(middleware.observability(&registry));
     try server.addMiddleware(middleware.loadShedding(&shedder));
@@ -116,6 +116,19 @@ pub fn main() !void {
                 }
             }
         }.handle,
+    });
+
+    // Slow endpoint with per-route timeout
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/slow",
+        .handler = struct {
+            fn handle(ctx: *api.Context) !void {
+                std.Thread.sleep(200 * std.time.ns_per_ms);
+                try ctx.jsonStruct(200, .{ .status = "completed" });
+            }
+        }.handle,
+        .middleware = &.{middleware.requestTimeout(100)},
     });
 
     // Protected endpoint with JWT

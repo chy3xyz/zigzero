@@ -206,6 +206,8 @@ pub const CorsOptions = struct {
     allow_origins: []const u8 = "*",
     allow_methods: []const u8 = "GET,POST,PUT,DELETE,PATCH,OPTIONS",
     allow_headers: []const u8 = "Content-Type,Authorization,X-Request-ID",
+    allow_credentials: bool = false,
+    max_age: ?u32 = null,
 };
 
 /// CORS middleware
@@ -219,6 +221,14 @@ pub fn cors(allocator: std.mem.Allocator, options: CorsOptions) !api.Middleware 
                 try ctx.setHeader("Access-Control-Allow-Origin", o.allow_origins);
                 try ctx.setHeader("Access-Control-Allow-Methods", o.allow_methods);
                 try ctx.setHeader("Access-Control-Allow-Headers", o.allow_headers);
+                if (o.allow_credentials) {
+                    try ctx.setHeader("Access-Control-Allow-Credentials", "true");
+                }
+                if (o.max_age) |age| {
+                    const age_str = try std.fmt.allocPrint(ctx.allocator, "{d}", .{age});
+                    defer ctx.allocator.free(age_str);
+                    try ctx.setHeader("Access-Control-Max-Age", age_str);
+                }
 
                 if (ctx.method == .OPTIONS) {
                     ctx.status_code = 204;
@@ -469,6 +479,26 @@ pub fn loadShedding(shedder: *load.AdaptiveShedder) api.Middleware {
             }
         }.middleware,
         .user_data = shedder,
+    };
+}
+
+/// Request timeout middleware
+/// Aborts the request with 408 if handler execution exceeds timeout_ms.
+pub fn requestTimeout(timeout_ms: u32) api.Middleware {
+    return .{
+        .func = struct {
+            fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
+                const timeout = @as(u32, @intCast(@intFromPtr(data.?) & 0xFFFFFFFF));
+                const start = std.time.milliTimestamp();
+                try next(ctx);
+                const elapsed = std.time.milliTimestamp() - start;
+                if (@as(i64, @intCast(timeout)) < elapsed) {
+                    ctx.status_code = 408;
+                    ctx.responded = true;
+                }
+            }
+        }.middleware,
+        .user_data = @ptrFromInt(@as(usize, timeout_ms)),
     };
 }
 
