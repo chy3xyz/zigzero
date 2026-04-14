@@ -21,6 +21,8 @@ pub const errors = @import("core/errors.zig");
 pub const fx = @import("core/fx.zig");
 pub const threading = @import("core/threading.zig");
 pub const mapreduce = @import("core/mapreduce.zig");
+pub const hash = @import("core/hash.zig");
+pub const codec = @import("core/codec.zig");
 
 // Network
 pub const api = @import("net/api.zig");
@@ -78,6 +80,8 @@ comptime {
     _ = fx.Stream(u8);
     _ = threading.RoutineGroup;
     _ = mapreduce.MapReduce(u8, u8);
+    _ = hash.ConsistentHash;
+    _ = codec.Base64;
     _ = middleware.jwt;
     _ = svc.Context;
     _ = trace.Tracer;

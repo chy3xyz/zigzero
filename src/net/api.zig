@@ -196,14 +196,16 @@ pub const Context = struct {
     /// Parse JSON body into type T
     pub fn bindJson(self: *const Context, comptime T: type) !T {
         if (self.body == null) return error.NoBody;
-        return std.json.parseFromSlice(T, self.allocator, self.body.?, .{}) catch return error.InvalidJson;
+        var parsed = std.json.parseFromSlice(T, self.allocator, self.body.?, .{}) catch return error.InvalidJson;
+        defer parsed.deinit();
+        return parsed.value;
     }
 
     /// Send JSON from struct
     pub fn jsonStruct(self: *Context, status: u16, value: anytype) !void {
         self.status_code = status;
         try self.setHeader("Content-Type", "application/json");
-        const json_str = try std.json.stringifyAlloc(self.allocator, value, .{});
+        const json_str = try std.fmt.allocPrint(self.allocator, "{f}", .{std.json.fmt(value, .{})});
         defer self.allocator.free(json_str);
         try self.response_body.appendSlice(self.allocator, json_str);
         self.responded = true;
