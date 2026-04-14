@@ -53,6 +53,7 @@ pub const Route = struct {
     path: []const u8,
     handler: HandlerFn,
     middleware: []const MiddlewareFn = &.{},
+    user_data: ?*anyopaque = null,
 };
 
 /// Field source for auto parameter binding
@@ -79,9 +80,11 @@ pub const Context = struct {
     response_headers: std.StringHashMap([]const u8),
     responded: bool = false,
     logger: log.Logger,
+    user_data: ?*anyopaque = null,
 
     // Middleware chain fields (use fully expanded type to avoid dependency loop)
     chain_middlewares: []const *const fn (*Context, *const fn (*Context) anyerror!void) anyerror!void = &.{},
+
     chain_handler: *const fn (*Context) anyerror!void = undefined,
     chain_index: usize = 0,
 
@@ -840,6 +843,8 @@ pub const Server = struct {
                 const value = arena_alloc.dupe(u8, entry.value_ptr.*) catch continue;
                 ctx.params.put(key, value) catch {};
             }
+
+            ctx.user_data = m.route.user_data;
 
             // Execute handler with middleware chain
             self.executeWithMiddleware(&ctx, m.route.handler, m.route.middleware) catch |err| {

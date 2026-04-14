@@ -9,6 +9,7 @@ ZigZero is a high-performance microservice framework written in Zig, inspired by
 ## Features
 
 - **HTTP Server** (`api`) - Full HTTP server with trie-based routing, middleware, JSON parsing, route groups, and struct-tag auto parameter binding
+- **API Gateway** (`gateway`) - Reverse proxy to upstream services with load balancing
 - **RPC Framework** (`rpc`) - Binary protocol RPC over TCP with circuit breaker
 - **HTTP Client** (`http`) - HTTP client with timeout and retries
 - **WebSocket** (`websocket`) - RFC 6455 WebSocket server
@@ -102,7 +103,8 @@ src/
 │   ├── http.zig            # HTTP client
 │   ├── rpc.zig             # RPC framework
 │   ├── websocket.zig       # WebSocket support
-│   └── tls.zig             # TLS/HTTPS
+│   ├── tls.zig             # TLS/HTTPS
+│   └── gateway.zig         # API Gateway reverse proxy
 ├── server/
 │   ├── static.zig          # Static file serving
 │   └── middleware.zig      # JWT, CORS, rate limit, recovery
@@ -170,6 +172,7 @@ zig build test
 | Module | Path | Description | Status |
 |--------|------|-------------|--------|
 | `api` | `net/api` | HTTP server, routing, middleware | ✅ Complete |
+| `gateway` | `net/gateway` | API Gateway reverse proxy | ✅ Complete |
 | `rpc` | `net/rpc` | RPC framework over TCP | ✅ Complete |
 | `http` | `net/http` | HTTP client | ✅ Complete |
 | `websocket` | `net/websocket` | WebSocket server (RFC 6455) | ✅ Complete |

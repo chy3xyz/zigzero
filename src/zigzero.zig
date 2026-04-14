@@ -31,6 +31,7 @@ pub const http = @import("net/http.zig");
 pub const rpc = @import("net/rpc.zig");
 pub const websocket = @import("net/websocket.zig");
 pub const tls = @import("net/tls.zig");
+pub const gateway = @import("net/gateway.zig");
 
 // Server
 pub const static = @import("server/static.zig");
@@ -96,6 +97,7 @@ comptime {
     _ = tls.Config;
     _ = retry.Policy;
     _ = sqlx.Client;
+    _ = gateway.Gateway;
     _ = websocket.Conn;
     _ = static.Server;
     _ = cron.Scheduler;
