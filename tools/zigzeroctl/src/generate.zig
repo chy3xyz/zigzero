@@ -74,6 +74,94 @@ pub fn generateApiFromDsl(allocator: std.mem.Allocator, def: dsl.ApiDef, output_
     try out_dir.writeFile(.{ .sub_path = "routes.zig", .data = routes_buf.items });
 }
 
+/// Generate OpenAPI 3.0 JSON from DSL definition
+pub fn generateOpenApi(allocator: std.mem.Allocator, def: dsl.ApiDef, output_dir: []const u8) !void {
+    const cwd = std.fs.cwd();
+    var out_dir = try cwd.makeOpenPath(output_dir, .{});
+    defer out_dir.close();
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeAll("{\n");
+    try w.print("  \"openapi\": \"3.0.0\",\n", .{});
+    try w.print("  \"info\": {{\n    \"title\": \"{s}\",\n    \"version\": \"1.0.0\"\n  }},\n", .{def.name});
+    try w.writeAll("  \"paths\": {\n");
+
+    for (def.routes, 0..) |route, i| {
+        const method_lower = std.ascii.lowerString(try allocator.alloc(u8, route.method.len), route.method);
+        defer allocator.free(method_lower);
+        try w.print("    \"{s}\": {{\n", .{route.path});
+        try w.print("      \"{s}\": {{\n", .{method_lower});
+        try w.print("        \"operationId\": \"{s}\",\n", .{route.handler});
+        try w.writeAll("        \"responses\": {\n");
+        try w.writeAll("          \"200\": {\n");
+        try w.writeAll("            \"description\": \"OK\",\n");
+        try w.writeAll("            \"content\": {\n");
+        try w.writeAll("              \"application/json\": {\n");
+        try w.writeAll("                \"schema\": {\n");
+        if (route.resp_type) |resp| {
+            try w.print("                  \"$ref\": \"#/components/schemas/{s}\"\n", .{resp});
+        } else {
+            try w.writeAll("                  \"type\": \"object\"\n");
+        }
+        try w.writeAll("                }\n");
+        try w.writeAll("              }\n");
+        try w.writeAll("            }\n");
+        try w.writeAll("          }\n");
+        try w.writeAll("        }\n");
+        if (route.req_type) |_| {
+            try w.writeAll(
+                \\"        \"requestBody\": {\\n"
+                \\"          \"content\": {\\n"
+                \\"            \"application/json\": {\\n"
+                \\"              \"schema\": {\\n"
+            );
+            try w.print("                \"$ref\": \"#/components/schemas/{s}\"\\n", .{route.req_type.?});
+            try w.writeAll(
+                \\"              }\\n"
+                \\"            }\\n"
+                \\"          }\\n"
+                \\"        },\\n"
+            );
+        }
+        try w.writeAll("      }\n");
+        try w.writeAll("    }");
+        if (i < def.routes.len - 1) try w.writeAll(",");
+        try w.writeAll("\n");
+    }
+
+    try w.writeAll("  },\n");
+    try w.writeAll("  \"components\": {\n");
+    try w.writeAll("    \"schemas\": {\n");
+    for (def.types, 0..) |t, i| {
+        try w.print("      \"{s}\": {{\n", .{t.name});
+        try w.writeAll("        \"type\": \"object\",\n");
+        try w.writeAll("        \"properties\": {\n");
+        for (t.fields, 0..) |f, j| {
+            const json_type = switch (f.field_type) {
+                .string => "string",
+                .int => "integer",
+                .bool => "boolean",
+                .float => "number",
+            };
+            try w.print("          \"{s}\": {{ \"type\": \"{s}\" }}", .{ f.name, json_type });
+            if (j < t.fields.len - 1) try w.writeAll(",");
+            try w.writeAll("\n");
+        }
+        try w.writeAll("        }\n");
+        try w.writeAll("      }");
+        if (i < def.types.len - 1) try w.writeAll(",");
+        try w.writeAll("\n");
+    }
+    try w.writeAll("    }\n");
+    try w.writeAll("  }\n");
+    try w.writeAll("}\n");
+
+    try out_dir.writeFile(.{ .sub_path = "openapi.json", .data = buf.items });
+}
+
 /// Generate a new project scaffold
 pub fn newProject(allocator: std.mem.Allocator, project_name: []const u8, output_dir: []const u8) !void {
     const cwd = std.fs.cwd();
@@ -320,6 +408,46 @@ fn camelCase(allocator: std.mem.Allocator, s: []const u8) ![]u8 {
         }
     }
     return result.toOwnedSlice(allocator);
+}
+
+test "generate openapi from dsl" {
+    const allocator = std.testing.allocator;
+    const def = dsl.ApiDef{
+        .name = "test-api",
+        .types = &[_]dsl.TypeDef{
+            .{
+                .name = "Req",
+                .fields = &[_]dsl.StructField{
+                    .{ .name = "id", .field_type = .int },
+                },
+            },
+        },
+        .routes = &[_]dsl.RouteDef{
+            .{
+                .method = "get",
+                .path = "/users/:id",
+                .req_type = null,
+                .resp_type = null,
+                .handler = "getUser",
+            },
+            .{
+                .method = "post",
+                .path = "/users",
+                .req_type = "Req",
+                .resp_type = null,
+                .handler = "createUser",
+            },
+        },
+    };
+
+    try generateOpenApi(allocator, def, ".test-openapi");
+    defer std.fs.cwd().deleteTree(".test-openapi") catch {};
+
+    const content = try std.fs.cwd().readFileAlloc(allocator, ".test-openapi/openapi.json", 1024 * 1024);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"/users/:id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"getUser\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"Req\"") != null);
 }
 
 test "parse api spec" {

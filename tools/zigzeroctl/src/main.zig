@@ -7,11 +7,13 @@ const usage =
     \\n    \\Usage:
     \\  zigzeroctl new <project-name>      Create a new zigzero service project
     \\  zigzeroctl api <spec.(json|api)>   Generate API routes and handlers from spec
+    \\  zigzeroctl openapi <spec.api>      Generate OpenAPI 3.0 JSON from .api DSL
     \\  zigzeroctl model <ddl.sql>         Generate ORM models from SQL DDL
     \\n    \\Examples:
     \\  zigzeroctl new my-service
     \\  zigzeroctl api api-spec.json -o ./gen
     \\  zigzeroctl api api-spec.api -o ./gen
+    \\  zigzeroctl openapi api-spec.api -o ./gen/docs
     \\  zigzeroctl model schema.sql -o ./gen/models
     \\
 ;
@@ -69,6 +71,22 @@ pub fn main() !void {
             try generate.generateApi(allocator, spec, output_dir);
         }
         std.debug.print("Generated API code in {s}/\n", .{output_dir});
+    } else if (std.mem.eql(u8, cmd, "openapi")) {
+        if (args.len < 3) {
+            std.debug.print("Usage: zigzeroctl openapi <spec.api> [-o <output-dir>]\n", .{});
+            return;
+        }
+        const spec_file = args[2];
+        const output_dir = parseOutputDir(args) orelse "gen/docs";
+
+        const content = try std.fs.cwd().readFileAlloc(allocator, spec_file, 1024 * 1024);
+        defer allocator.free(content);
+
+        var def = try dsl.parse(allocator, content);
+        defer def.deinit(allocator);
+
+        try generate.generateOpenApi(allocator, def, output_dir);
+        std.debug.print("Generated OpenAPI spec in {s}/\n", .{output_dir});
     } else if (std.mem.eql(u8, cmd, "model")) {
         if (args.len < 3) {
             std.debug.print("Usage: zigzeroctl model <ddl.sql> [-o <output-dir>]\n", .{});

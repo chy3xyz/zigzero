@@ -218,3 +218,38 @@ test "parse dsl" {
     try std.testing.expectEqualStrings("LoginResp", def.routes[1].resp_type.?);
     try std.testing.expectEqualStrings("login", def.routes[1].handler);
 }
+
+test "parse dsl from file bytes" {
+    const allocator = std.testing.allocator;
+    const source =
+        "name user-api\n" ++
+        "\n" ++
+        "type LoginReq {\n" ++
+        "    username string\n" ++
+        "    password string\n" ++
+        "}\n" ++
+        "\n" ++
+        "type LoginResp {\n" ++
+        "    token string\n" ++
+        "}\n" ++
+        "\n" ++
+        "type GetUserReq {\n" ++
+        "    id int\n" ++
+        "}\n" ++
+        "\n" ++
+        "type GetUserResp {\n" ++
+        "    id int\n" ++
+        "    username string\n" ++
+        "    email string\n" ++
+        "}\n" ++
+        "\n" ++
+        "get /users/:id getUser\n" ++
+        "post /users/login LoginReq LoginResp login\n";
+
+    var def = try parse(allocator, source);
+    defer def.deinit(allocator);
+
+    try std.testing.expectEqualStrings("user-api", def.name);
+    try std.testing.expectEqual(@as(usize, 4), def.types.len);
+    try std.testing.expectEqual(@as(usize, 2), def.routes.len);
+}
