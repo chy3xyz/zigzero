@@ -6,6 +6,8 @@ const std = @import("std");
 const api = @import("../net/api.zig");
 const errors = @import("../core/errors.zig");
 const limiter = @import("../infra/limiter.zig");
+const trace = @import("../infra/trace.zig");
+const metric = @import("../infra/metric.zig");
 
 /// JWT claims
 pub const Claims = struct {
@@ -185,6 +187,48 @@ pub fn recovery() api.MiddlewareFn {
                 ctx.sendError(500, "internal server error") catch {};
             }
             try next(ctx);
+        }
+    }.middleware;
+}
+
+/// Observability middleware - auto trace + metrics collection
+pub fn observability(registry: *metric.Registry) api.MiddlewareFn {
+    return struct {
+        fn middleware(ctx: *api.Context, next: api.HandlerFn) anyerror!void {
+            const start = std.time.milliTimestamp();
+
+            // Auto trace span
+            var tracer = trace.Tracer.init(ctx.allocator, ctx.logger.service_name) catch null;
+            defer if (tracer) |*t| t.deinit();
+
+            var span: ?*trace.Span = null;
+            if (tracer) |*t| {
+                span = t.startTrace("http-request") catch null;
+                if (span) |s| {
+                    s.setAttribute("http.method", ctx.method.toString()) catch {};
+                    s.setAttribute("http.path", ctx.path) catch {};
+                }
+            }
+
+            try next(ctx);
+
+            const duration = std.time.milliTimestamp() - start;
+
+            // Record metrics
+            const requests = registry.counter("http_requests_total", "Total HTTP requests") catch null;
+            if (requests) |r| r.inc();
+
+            const request_duration = registry.histogram("http_request_duration_ms", "HTTP request duration in milliseconds", &.{ 10, 50, 100, 250, 500, 1000, 2500, 5000, 10000 }) catch null;
+            if (request_duration) |h| h.observe(@floatFromInt(duration)) catch {};
+
+            // Finalize trace
+            if (span) |s| {
+                s.setStatus(if (ctx.status_code >= 500) .err else .ok);
+                s.end();
+                var trace_buf: [64]u8 = undefined;
+                const trace_id = s.formatTraceId(&trace_buf);
+                ctx.setHeader("X-Trace-ID", trace_id) catch {};
+            }
         }
     }.middleware;
 }

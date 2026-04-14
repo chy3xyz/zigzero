@@ -36,6 +36,23 @@ pub const Mode = enum {
     both,
 };
 
+/// Log encoding format
+pub const Encoding = enum {
+    plain,
+    json,
+};
+
+/// Structured JSON log entry
+pub const Entry = struct {
+    timestamp: i64,
+    level: []const u8,
+    service: []const u8,
+    message: []const u8,
+    trace_id: ?[]const u8 = null,
+    span_id: ?[]const u8 = null,
+    fields: ?std.StringHashMap([]const u8) = null,
+};
+
 /// File logger with rotation
 pub const FileLogger = struct {
     allocator: std.mem.Allocator,
@@ -107,6 +124,7 @@ pub const Logger = struct {
     level: Level,
     service_name: []const u8,
     mode: Mode,
+    encoding: Encoding,
     file_logger: ?FileLogger,
 
     /// Create a new logger with console output
@@ -115,8 +133,16 @@ pub const Logger = struct {
             .level = level,
             .service_name = service_name,
             .mode = .console,
+            .encoding = .plain,
             .file_logger = null,
         };
+    }
+
+    /// Create a logger with JSON encoding
+    pub fn withJson(self: Logger) Logger {
+        var logger = self;
+        logger.encoding = .json;
+        return logger;
     }
 
     /// Create a logger with file output
@@ -165,7 +191,10 @@ pub const Logger = struct {
     /// Internal log function
     fn log(self: *const Logger, level: Level, msg: []const u8) void {
         const timestamp = std.time.timestamp();
-        const formatted = std.fmt.allocPrint(std.heap.page_allocator, "[{d}] [{s}] [{s}] {s}\n", .{ timestamp, self.service_name, level.toString(), msg }) catch return;
+        const formatted = if (self.encoding == .json)
+            formatJson(std.heap.page_allocator, timestamp, self.service_name, level, msg) catch return
+        else
+            std.fmt.allocPrint(std.heap.page_allocator, "[{d}] [{s}] [{s}] {s}\n", .{ timestamp, self.service_name, level.toString(), msg }) catch return;
         defer std.heap.page_allocator.free(formatted);
 
         if (self.mode == .console or self.mode == .both) {
@@ -180,6 +209,15 @@ pub const Logger = struct {
         }
     }
 };
+
+fn formatJson(allocator: std.mem.Allocator, timestamp: i64, service: []const u8, level: Level, msg: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{{\"timestamp\":{d},\"level\":\"{s}\",\"service\":\"{s}\",\"message\":\"{s}\"}}\n", .{
+        timestamp,
+        level.toString(),
+        service,
+        msg,
+    });
+}
 
 /// Global default logger
 var default_logger: Logger = Logger.new(.info, "zigzero");

@@ -20,6 +20,7 @@ pub const name = "zigzero";
 pub const errors = @import("core/errors.zig");
 pub const fx = @import("core/fx.zig");
 pub const threading = @import("core/threading.zig");
+pub const mapreduce = @import("core/mapreduce.zig");
 
 // Network
 pub const api = @import("net/api.zig");
@@ -46,6 +47,7 @@ pub const lock = @import("infra/lock.zig");
 pub const trace = @import("infra/trace.zig");
 pub const metric = @import("infra/metric.zig");
 pub const retry = @import("infra/retry.zig");
+pub const sqlx = @import("infra/sqlx.zig");
 pub const loadbalancer = @import("infra/loadbalancer.zig");
 pub const breaker = @import("infra/breaker.zig");
 pub const limiter = @import("infra/limiter.zig");
@@ -75,6 +77,7 @@ comptime {
     _ = errors.Error;
     _ = fx.Stream(u8);
     _ = threading.RoutineGroup;
+    _ = mapreduce.MapReduce(u8, u8);
     _ = middleware.jwt;
     _ = svc.Context;
     _ = trace.Tracer;
@@ -86,6 +89,7 @@ comptime {
     _ = lifecycle.Manager;
     _ = tls.Config;
     _ = retry.Policy;
+    _ = sqlx.Client;
     _ = websocket.Conn;
     _ = static.Server;
     _ = cron.Scheduler;

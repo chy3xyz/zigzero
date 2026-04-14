@@ -93,12 +93,14 @@ pub fn Pool(comptime T: type) type {
             // Try to get an idle connection
             while (self.idle_conns.items.len > 0) {
                 const node = self.idle_conns.pop();
-                if (self.validateFn(node.conn)) {
-                    self.mutex.unlock();
-                    return node.conn;
+                if (node) |n| {
+                    if (self.validateFn(n.conn)) {
+                        self.mutex.unlock();
+                        return n.conn;
+                    }
+                    self.destroyFn(n.conn);
+                    _ = self.active_count.fetchSub(1, .monotonic);
                 }
-                self.destroyFn(node.conn);
-                _ = self.active_count.fetchSub(1, .monotonic);
             }
 
             // Check if we can create a new connection
@@ -119,7 +121,7 @@ pub fn Pool(comptime T: type) type {
             if (self.idle_conns.items.len > 0) {
                 const node = self.idle_conns.pop();
                 self.mutex.unlock();
-                return node.conn;
+                if (node) |n| return n.conn;
             }
 
             self.mutex.unlock();
@@ -171,13 +173,21 @@ pub const Config = struct {
 };
 
 test "connection pool" {
+    const CreateCtx = struct {
+        var count: *u32 = undefined;
+    };
+    const DestroyCtx = struct {
+        var count: *u32 = undefined;
+    };
+
     var create_count: u32 = 0;
     var destroy_count: u32 = 0;
+    CreateCtx.count = &create_count;
+    DestroyCtx.count = &destroy_count;
 
     const createFn = struct {
-        var count: *u32 = undefined;
         fn create() errors.ResultT(*u32) {
-            count.* += 1;
+            CreateCtx.count.* += 1;
             const ptr = std.heap.page_allocator.create(u32) catch return error.ServerError;
             ptr.* = 42;
             return ptr;
@@ -185,9 +195,8 @@ test "connection pool" {
     }.create;
 
     const destroyFn = struct {
-        var count: *u32 = undefined;
         fn destroy(ptr: *u32) void {
-            count.* += 1;
+            DestroyCtx.count.* += 1;
             std.heap.page_allocator.destroy(ptr);
         }
     }.destroy;
@@ -198,9 +207,6 @@ test "connection pool" {
             return true;
         }
     }.validate;
-
-    createFn.count = &create_count;
-    destroyFn.count = &destroy_count;
 
     var pool = try Pool(u32).init(
         std.testing.allocator,

@@ -27,16 +27,18 @@ ZigZero is a high-performance microservice framework written in Zig, inspired by
 - **Distributed Tracing** (`trace`) - OpenTelemetry-compatible tracing
 - **Metrics** (`metric`) - Prometheus-compatible metrics
 - **Retry** (`retry`) - Exponential backoff with jitter
-- **Message Queue** (`mq**) - In-memory pub/sub messaging
+- **Message Queue** (`mq`) - In-memory pub/sub messaging
 - **Cron Scheduler** (`cron`) - Scheduled task execution
 - **Lifecycle Management** (`lifecycle`) - Graceful shutdown hooks
 - **Validation** (`validate`) - Input validation utilities
-- **Local Cache** (`cache**) - In-memory LRU cache
-- **Distributed Lock** (`lock**) - Redis and local locks
-- **ORM** (`orm**) - Query builder and model traits
-- **Service Context** (`svc**) - Dependency injection context
-- **Stream/Parallel** (`fx**) - Map, Parallel, Stream utilities aligned with go-zero's fx
-- **Threading** (`threading**) - RoutineGroup, TaskRunner, safe goroutine spawning
+- **Local Cache** (`cache`) - In-memory LRU cache
+- **Distributed Lock** (`lock`) - Redis and local locks
+- **ORM** (`orm`) - Query builder and model traits
+- **Service Context** (`svc`) - Dependency injection context
+- **Stream/Parallel** (`fx`) - Map, Parallel, Stream utilities aligned with go-zero's fx
+- **MapReduce** (`mapreduce`) - Concurrent map/reduce pipelines aligned with go-zero's mr
+- **Threading** (`threading`) - RoutineGroup, TaskRunner, safe goroutine spawning
+- **SQL Client** (`sqlx`) - Unified SQL client abstraction with query builder
 
 ## Quick Start
 
@@ -189,6 +191,8 @@ zig build test
 | `errors` | `core/errors` | Unified error types | ✅ Complete |
 | `fx` | `core/fx` | Stream / Parallel / Map utilities | ✅ Complete |
 | `threading` | `core/threading` | RoutineGroup / TaskRunner | ✅ Complete |
+| `mapreduce` | `core/mapreduce` | Map / Reduce / MapReduce pipelines | ✅ Complete |
+| `sqlx` | `infra/sqlx` | Unified SQL client abstraction | ✅ Complete |
 
 ## Requirements
 
