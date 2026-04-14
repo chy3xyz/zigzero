@@ -196,7 +196,7 @@ const RequestParser = struct {
         return .{ .allocator = allocator };
     }
 
-    pub fn parse(self: *RequestParser, reader: std.io.AnyReader) !ParsedRequest {
+    pub fn parse(self: *RequestParser, reader: std.io.AnyReader, max_body_size: usize) !ParsedRequest {
         var buffer: [8192]u8 = undefined;
 
         // Read request line
@@ -251,6 +251,7 @@ const RequestParser = struct {
         var body: ?[]const u8 = null;
         if (headers.get("Content-Length")) |len_str| {
             const content_len = std.fmt.parseInt(usize, len_str, 10) catch 0;
+            if (content_len > max_body_size) return error.BodyTooLarge;
             if (content_len > 0) {
                 const body_buf = try self.allocator.alloc(u8, content_len);
                 const bytes_read = try reader.readAll(body_buf);
@@ -431,6 +432,8 @@ pub const Server = struct {
     running: std.atomic.Value(bool),
     server_socket: ?std.net.Server = null,
     logger: log.Logger,
+    max_body_size: usize,
+    request_timeout_ms: u32,
 
     pub fn init(allocator: std.mem.Allocator, port: u16, logger: log.Logger) Server {
         return .{
@@ -442,6 +445,8 @@ pub const Server = struct {
             .running = std.atomic.Value(bool).init(false),
             .server_socket = null,
             .logger = logger,
+            .max_body_size = 8 * 1024 * 1024, // 8MB default
+            .request_timeout_ms = 30000, // 30s default
         };
     }
 
@@ -523,10 +528,14 @@ pub const Server = struct {
         const reader = conn.stream.reader();
         const writer = conn.stream.writer();
 
+        const start_time = std.time.milliTimestamp();
+
         var parser = RequestParser.init(arena_alloc);
-        var request = parser.parse(reader.any()) catch |err| {
+        var request = parser.parse(reader.any(), self.max_body_size) catch |err| {
             self.logger.err(try std.fmt.allocPrint(arena_alloc, "Parse error: {any}", .{err}));
-            _ = writer.write("HTTP/1.1 400 Bad Request\r\n\r\n") catch {};
+            const status: u16 = if (err == error.BodyTooLarge) 413 else 400;
+            const msg = if (err == error.BodyTooLarge) "Payload Too Large" else "Bad Request";
+            _ = writer.print("HTTP/1.1 {d} {s}\r\n\r\n", .{ status, msg }) catch {};
             return;
         };
         defer request.deinit(arena_alloc);
@@ -576,6 +585,12 @@ pub const Server = struct {
             };
         } else {
             ctx.sendError(404, "Not Found") catch {};
+        }
+
+        // Check request timeout
+        const elapsed = std.time.milliTimestamp() - start_time;
+        if (elapsed > self.request_timeout_ms) {
+            self.logger.warn(try std.fmt.allocPrint(arena_alloc, "Request timeout: {s} {s} took {d}ms", .{ request.method.toString(), request.path, elapsed }));
         }
 
         // Send response

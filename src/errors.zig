@@ -90,6 +90,31 @@ pub fn toCode(err: Error) Code {
     };
 }
 
+/// Standardized JSON error response aligned with go-zero
+pub const ErrorResponse = struct {
+    code: i32,
+    message: []const u8,
+    details: ?[]const u8 = null,
+};
+
+/// Build a JSON error response string. Caller owns returned memory.
+pub fn toJson(allocator: std.mem.Allocator, err: ErrorResponse) ![]u8 {
+    if (err.details) |details| {
+        return std.fmt.allocPrint(allocator, "{{\"code\":{d},\"message\":\"{s}\",\"details\":\"{s}\"}}", .{ err.code, err.message, details });
+    } else {
+        return std.fmt.allocPrint(allocator, "{{\"code\":{d},\"message\":\"{s}\"}}", .{ err.code, err.message });
+    }
+}
+
+/// Convenience: create JSON from Error + message
+pub fn fromError(allocator: std.mem.Allocator, err: Error, message: []const u8) ![]u8 {
+    const resp = ErrorResponse{
+        .code = @intFromEnum(toCode(err)),
+        .message = message,
+    };
+    return toJson(allocator, resp);
+}
+
 test "error to code" {
     try std.testing.expectEqual(Code.ServerError, toCode(Error.ServerError));
     try std.testing.expectEqual(Code.NotFound, toCode(Error.NotFound));

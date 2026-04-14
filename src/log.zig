@@ -29,17 +29,109 @@ pub const Level = enum(u8) {
     }
 };
 
+/// Log output mode
+pub const Mode = enum {
+    console,
+    file,
+    both,
+};
+
+/// File logger with rotation
+pub const FileLogger = struct {
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    max_size: u64,
+    max_backups: u32,
+    current_size: u64,
+    file: ?std.fs.File,
+
+    pub fn init(allocator: std.mem.Allocator, path: []const u8, max_size: u64, max_backups: u32) !FileLogger {
+        const file = std.fs.cwd().createFile(path, .{ .truncate = false, .read = true }) catch null;
+        const current_size = if (file) |f| f.getEndPos() catch 0 else 0;
+
+        return .{
+            .allocator = allocator,
+            .path = try allocator.dupe(u8, path),
+            .max_size = max_size,
+            .max_backups = max_backups,
+            .current_size = current_size,
+            .file = file,
+        };
+    }
+
+    pub fn deinit(self: *FileLogger) void {
+        if (self.file) |f| f.close();
+        self.allocator.free(self.path);
+    }
+
+    pub fn write(self: *FileLogger, msg: []const u8) !void {
+        if (self.file == null or self.current_size + msg.len > self.max_size) {
+            try self.rotate();
+        }
+
+        if (self.file) |f| {
+            _ = try f.write(msg);
+            self.current_size += msg.len;
+            try f.sync();
+        }
+    }
+
+    fn rotate(self: *FileLogger) !void {
+        if (self.file) |f| {
+            f.close();
+            self.file = null;
+        }
+
+        // Rotate backups
+        var i: u32 = self.max_backups;
+        while (i > 0) : (i -= 1) {
+            const old_path = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ self.path, i - 1 });
+            defer self.allocator.free(old_path);
+            const new_path = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ self.path, i });
+            defer self.allocator.free(new_path);
+
+            std.fs.cwd().rename(old_path, new_path) catch {};
+        }
+
+        const backup_path = try std.fmt.allocPrint(self.allocator, "{s}.1", .{self.path});
+        defer self.allocator.free(backup_path);
+        std.fs.cwd().rename(self.path, backup_path) catch {};
+
+        self.file = try std.fs.cwd().createFile(self.path, .{});
+        self.current_size = 0;
+    }
+};
+
 /// Logger instance
 pub const Logger = struct {
     level: Level,
     service_name: []const u8,
+    mode: Mode,
+    file_logger: ?FileLogger,
 
     /// Create a new logger with console output
     pub fn new(level: Level, service_name: []const u8) Logger {
         return Logger{
             .level = level,
             .service_name = service_name,
+            .mode = .console,
+            .file_logger = null,
         };
+    }
+
+    /// Create a logger with file output
+    pub fn withFile(self: Logger, allocator: std.mem.Allocator, path: []const u8, max_size: u64, max_backups: u32) !Logger {
+        var logger = self;
+        logger.mode = .both;
+        logger.file_logger = try FileLogger.init(allocator, path, max_size, max_backups);
+        return logger;
+    }
+
+    pub fn deinit(self: *Logger) void {
+        if (self.file_logger) |*fl| {
+            fl.deinit();
+            self.file_logger = null;
+        }
     }
 
     /// Log a message at debug level
@@ -75,8 +167,17 @@ pub const Logger = struct {
         const timestamp = std.time.timestamp();
         const formatted = std.fmt.allocPrint(std.heap.page_allocator, "[{d}] [{s}] [{s}] {s}\n", .{ timestamp, self.service_name, level.toString(), msg }) catch return;
         defer std.heap.page_allocator.free(formatted);
-        const stdout = std.fs.File.stdout();
-        _ = stdout.write(formatted) catch return;
+
+        if (self.mode == .console or self.mode == .both) {
+            const stdout = std.fs.File.stdout();
+            _ = stdout.write(formatted) catch return;
+        }
+
+        if (self.file_logger) |*fl| {
+            if (self.mode == .file or self.mode == .both) {
+                fl.write(formatted) catch return;
+            }
+        }
     }
 };
 

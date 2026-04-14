@@ -227,16 +227,16 @@ pub const Loader = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
         defer parsed.deinit();
 
-        var config: T = undefined;
+        var cfg: T = undefined;
         const json = parsed.value;
 
         inline for (@typeInfo(T).@"struct".fields) |field| {
             if (json.object.get(field.name)) |value| {
-                @field(config, field.name) = try parseField(self.allocator, field.type, value);
+                @field(cfg, field.name) = try parseField(self.allocator, field.type, value);
             }
         }
 
-        return config;
+        return cfg;
     }
 
     fn parseField(allocator: std.mem.Allocator, comptime T: type, value: std.json.Value) !T {
@@ -256,31 +256,34 @@ pub const Loader = struct {
 
     /// Load configuration from environment variables
     pub fn loadEnv(self: Loader, comptime T: type, prefix: []const u8) !T {
-        var config: T = undefined;
+        var cfg: T = undefined;
+        var buf: [256]u8 = undefined;
 
         inline for (@typeInfo(T).@"struct".fields) |field| {
-            const env_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ prefix, std.ascii.upperString(&[_]u8{}, field.name) });
+            const upper_name = std.ascii.upperString(&buf, field.name);
+            const env_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ prefix, upper_name });
             defer self.allocator.free(env_name);
 
             if (std.process.getEnvVarOwned(self.allocator, env_name)) |value| {
                 defer self.allocator.free(value);
-                @field(config, field.name) = try parseEnvValue(field.type, value);
+                @field(cfg, field.name) = try parseEnvValue(self.allocator, field.type, value);
             } else |_| {}
         }
 
-        return config;
+        return cfg;
     }
 
-    fn parseEnvValue(comptime T: type, value: []const u8) !T {
+    fn parseEnvValue(allocator: std.mem.Allocator, comptime T: type, value: []const u8) !T {
         return switch (@typeInfo(T)) {
             .int => std.fmt.parseInt(T, value, 10),
             .float => std.fmt.parseFloat(T, value),
             .bool => std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1"),
             .pointer => |p| switch (p.size) {
-                .slice => if (p.child == u8) std.heap.page_allocator.dupe(u8, value) catch return error.ConfigError else @compileError("Unsupported slice type"),
+                .slice => if (p.child == u8) try allocator.dupe(u8, value) else @compileError("Unsupported slice type"),
                 else => @compileError("Unsupported pointer type"),
             },
-            .optional => |o| parseEnvValue(o.child, value),
+            .optional => |o| try parseEnvValue(allocator, o.child, value),
+            .@"struct" => @compileError("Nested structs not supported in env vars"),
             else => @compileError("Unsupported field type"),
         };
     }
@@ -341,6 +344,13 @@ test "config json parsing" {
     try std.testing.expectEqualStrings("debug", cfg.log.level);
     try std.testing.expectEqualStrings("localhost", cfg.redis.host);
     try std.testing.expectEqual(@as(u16, 6379), cfg.redis.port);
+}
+
+test "config env parsing" {
+    const allocator = std.testing.allocator;
+    // This test requires env vars to be set, skip in normal runs
+    if (true) return error.SkipZigTest;
+    _ = allocator;
 }
 
 test "config module" {

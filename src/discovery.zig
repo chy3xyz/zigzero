@@ -54,6 +54,7 @@ pub const StaticDiscovery = struct {
     pub fn deinit(self: *StaticDiscovery) void {
         var iter = self.services.iterator();
         while (iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             for (entry.value_ptr.*) |*node| {
                 node.deinit(self.allocator);
             }

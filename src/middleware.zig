@@ -5,6 +5,7 @@
 const std = @import("std");
 const api = @import("api.zig");
 const errors = @import("errors.zig");
+const limiter = @import("limiter.zig");
 
 /// JWT claims
 pub const Claims = struct {
@@ -85,10 +86,13 @@ pub fn cors(options: CorsOptions) api.MiddlewareFn {
 }
 
 /// Rate limiting middleware
-pub fn rateLimit(limiter: *anyopaque) api.MiddlewareFn {
+pub fn rateLimit(bucket: *limiter.TokenBucket) api.MiddlewareFn {
     return struct {
         fn middleware(ctx: *api.Context, next: api.HandlerFn) anyerror!void {
-            _ = limiter;
+            if (!bucket.allow()) {
+                try ctx.sendError(429, "rate limit exceeded");
+                return;
+            }
             try next(ctx);
         }
     }.middleware;

@@ -38,6 +38,13 @@ pub const validate = @import("validate.zig");
 pub const cache = @import("cache.zig");
 pub const discovery = @import("discovery.zig");
 pub const lock = @import("lock.zig");
+pub const lifecycle = @import("lifecycle.zig");
+pub const tls = @import("tls.zig");
+pub const retry = @import("retry.zig");
+pub const websocket = @import("websocket.zig");
+pub const static = @import("static.zig");
+pub const cron = @import("cron.zig");
+pub const mq = @import("mq.zig");
 
 test "zigzero version" {
     try std.testing.expectEqual(@as(u32, 0), version.major);
@@ -59,4 +66,14 @@ comptime {
     _ = trace.Tracer;
     _ = metric.Registry;
     _ = orm.Pool;
+    _ = health.Registry;
+    _ = discovery.StaticDiscovery;
+    _ = lock.Lock;
+    _ = lifecycle.Manager;
+    _ = tls.Config;
+    _ = retry.Policy;
+    _ = websocket.Conn;
+    _ = static.Server;
+    _ = cron.Scheduler;
+    _ = mq.Queue;
 }
