@@ -1,15 +1,17 @@
 const std = @import("std");
 const generate = @import("generate.zig");
+const dsl = @import("dsl.zig");
 
 const usage =
     \\zigzeroctl - Code generation tool for zigzero
     \\n    \\Usage:
     \\  zigzeroctl new <project-name>      Create a new zigzero service project
-    \\  zigzeroctl api <spec.json>         Generate API routes and handlers from JSON spec
+    \\  zigzeroctl api <spec.(json|api)>   Generate API routes and handlers from spec
     \\  zigzeroctl model <ddl.sql>         Generate ORM models from SQL DDL
     \\n    \\Examples:
     \\  zigzeroctl new my-service
     \\  zigzeroctl api api-spec.json -o ./gen
+    \\  zigzeroctl api api-spec.api -o ./gen
     \\  zigzeroctl model schema.sql -o ./gen/models
     \\
 ;
@@ -40,7 +42,7 @@ pub fn main() !void {
         std.debug.print("Created project '{s}' in {s}/\n", .{ project_name, output_dir });
     } else if (std.mem.eql(u8, cmd, "api")) {
         if (args.len < 3) {
-            std.debug.print("Usage: zigzeroctl api <spec.json> [-o <output-dir>]\n", .{});
+            std.debug.print("Usage: zigzeroctl api <spec.(json|api)> [-o <output-dir>]\n", .{});
             return;
         }
         const spec_file = args[2];
@@ -49,18 +51,23 @@ pub fn main() !void {
         const content = try std.fs.cwd().readFileAlloc(allocator, spec_file, 1024 * 1024);
         defer allocator.free(content);
 
-        const spec = try generate.parseApiSpec(allocator, content);
-        defer {
-            allocator.free(spec.name);
-            for (spec.routes) |route| {
-                allocator.free(route.method);
-                allocator.free(route.path);
-                allocator.free(route.handler);
+        if (std.mem.endsWith(u8, spec_file, ".api")) {
+            var def = try dsl.parse(allocator, content);
+            defer def.deinit(allocator);
+            try generate.generateApiFromDsl(allocator, def, output_dir);
+        } else {
+            const spec = try generate.parseApiSpec(allocator, content);
+            defer {
+                allocator.free(spec.name);
+                for (spec.routes) |route| {
+                    allocator.free(route.method);
+                    allocator.free(route.path);
+                    allocator.free(route.handler);
+                }
+                allocator.free(spec.routes);
             }
-            allocator.free(spec.routes);
+            try generate.generateApi(allocator, spec, output_dir);
         }
-
-        try generate.generateApi(allocator, spec, output_dir);
         std.debug.print("Generated API code in {s}/\n", .{output_dir});
     } else if (std.mem.eql(u8, cmd, "model")) {
         if (args.len < 3) {

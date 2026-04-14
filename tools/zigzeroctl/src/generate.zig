@@ -1,5 +1,78 @@
 const std = @import("std");
 const template = @import("template.zig");
+const dsl = @import("dsl.zig");
+
+/// Generate API from DSL definition
+pub fn generateApiFromDsl(allocator: std.mem.Allocator, def: dsl.ApiDef, output_dir: []const u8) !void {
+    const cwd = std.fs.cwd();
+    var out_dir = try cwd.makeOpenPath(output_dir, .{});
+    defer out_dir.close();
+
+    // Generate types.zig
+    var types_buf: std.ArrayList(u8) = .{};
+    defer types_buf.deinit(allocator);
+    const tw = types_buf.writer(allocator);
+
+    try tw.writeAll("const std = @import(\"std\");\n\n");
+    for (def.types) |t| {
+        try tw.print("pub const {s} = struct {{\n", .{t.name});
+        for (t.fields) |f| {
+            try tw.print("    {s}: {s},\n", .{ f.name, f.field_type.toZigType() });
+        }
+        try tw.writeAll("};\n\n");
+    }
+    try out_dir.writeFile(.{ .sub_path = "types.zig", .data = types_buf.items });
+
+    // Generate handlers.zig
+    var handlers_buf: std.ArrayList(u8) = .{};
+    defer handlers_buf.deinit(allocator);
+    const hw = handlers_buf.writer(allocator);
+
+    try hw.writeAll("const std = @import(\"std\");\n");
+    try hw.writeAll("const zigzero = @import(\"zigzero\");\n");
+    try hw.writeAll("const api = zigzero.api;\n");
+    if (def.types.len > 0) {
+        try hw.writeAll("const types = @import(\"types.zig\");\n");
+    }
+    try hw.writeAll("\n");
+
+    for (def.routes) |route| {
+        try hw.print("pub fn {s}Handler(ctx: *api.Context) !void {{\n", .{route.handler});
+        if (route.req_type) |req| {
+            try hw.print("    const req = try ctx.bindJson(types.{s});\n", .{req});
+        }
+        if (route.resp_type) |resp| {
+            try hw.print("    var resp: types.{s} = undefined;\n", .{resp});
+            try hw.writeAll("    _ = resp;\n");
+            try hw.writeAll("    // TODO: implement handler logic\n");
+            try hw.writeAll("    try ctx.jsonStruct(200, resp);\n");
+        } else {
+            try hw.writeAll("    try ctx.json(200, \"{\\\"message\\\":\\\"ok\\\"}\");\n");
+        }
+        try hw.writeAll("}\n\n");
+    }
+    try out_dir.writeFile(.{ .sub_path = "handlers.zig", .data = handlers_buf.items });
+
+    // Generate routes.zig
+    var routes_buf: std.ArrayList(u8) = .{};
+    defer routes_buf.deinit(allocator);
+    const rw = routes_buf.writer(allocator);
+
+    try rw.writeAll("const std = @import(\"std\");\n");
+    try rw.writeAll("const zigzero = @import(\"zigzero\");\n");
+    try rw.writeAll("const api = zigzero.api;\n");
+    try rw.writeAll("const handlers = @import(\"handlers.zig\");\n\n");
+    try rw.writeAll("pub fn registerRoutes(server: *api.Server) !void {\n");
+
+    for (def.routes) |route| {
+        const method = std.ascii.lowerString(try allocator.alloc(u8, route.method.len), route.method);
+        defer allocator.free(method);
+        try rw.print("    try server.{s}(\"{s}\", handlers.{s}Handler);\n", .{ method, route.path, route.handler });
+    }
+
+    try rw.writeAll("}\n");
+    try out_dir.writeFile(.{ .sub_path = "routes.zig", .data = routes_buf.items });
+}
 
 /// Generate a new project scaffold
 pub fn newProject(allocator: std.mem.Allocator, project_name: []const u8, output_dir: []const u8) !void {

@@ -1,0 +1,23 @@
+name user-api
+
+type LoginReq {
+    username string
+    password string
+}
+
+type LoginResp {
+    token string
+}
+
+type GetUserReq {
+    id int
+}
+
+type GetUserResp {
+    id int
+    username string
+    email string
+}
+
+get /users/:id getUser
+post /users/login LoginReq LoginResp login

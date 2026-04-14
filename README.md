@@ -162,14 +162,40 @@ zig build
 # Scaffold a new service project
 ./zig-out/bin/zigzeroctl new my-service
 
-# Generate API routes and handlers from a JSON spec
+# Generate API routes and handlers from a .api DSL spec
+./zig-out/bin/zigzeroctl api api-spec.api -o gen/api
+
+# Generate API routes and handlers from a JSON spec (legacy)
 ./zig-out/bin/zigzeroctl api api-spec.json -o gen/api
 
 # Generate ORM models from SQL DDL
 ./zig-out/bin/zigzeroctl model schema.sql -o gen/models
 ```
 
-### API Spec Format
+### API DSL Format (.api)
+
+```
+name user-api
+
+type LoginReq {
+    username string
+    password string
+}
+
+type LoginResp {
+    token string
+}
+
+get /users/:id getUser
+post /users/login LoginReq LoginResp login
+```
+
+Supported field types: `string`, `int`, `bool`, `float`.
+Route formats:
+- `method path handler` — simple route
+- `method path reqType respType handler` — route with request/response types
+
+### JSON API Spec Format (legacy)
 
 ```json
 {
@@ -216,11 +242,12 @@ zig build
 | `redis` | `infra/redis` | Redis client (RESP) | ✅ Complete |
 | `pool` | `infra/pool` | Connection pooling | ✅ Complete |
 | `cache` | `infra/cache` | In-memory LRU cache | ✅ Complete |
-| `mq` | `infra/mq` | In-memory message queue | ✅ Complete |
+| `mq` | `infra/mq` | In-memory + persistent message queue | ✅ Complete |
 | `cron` | `infra/cron` | Scheduled task execution | ✅ Complete |
 | `lifecycle` | `infra/lifecycle` | Graceful shutdown hooks | ✅ Complete |
 | `health` | `infra/health` | Health probe registry | ✅ Complete |
-| `discovery` | `infra/discovery` | Static service discovery | ✅ Complete |
+| `discovery` | `infra/discovery` | Static + etcd service discovery | ✅ Complete |
+| `etcd` | `infra/etcd` | etcd v3 HTTP client | ✅ Complete |
 | `lock` | `infra/lock` | Redis and local locks | ✅ Complete |
 | `trace` | `infra/trace` | Distributed tracing | ✅ Complete |
 | `metric` | `infra/metric` | Prometheus metrics | ✅ Complete |
