@@ -116,32 +116,41 @@ pub fn main() !void {
         .middleware = &.{try middleware.jwt(allocator, "my-secret-key")},
     });
 
-    // User endpoint with comptime struct validation
+    // Login endpoint that generates JWT tokens
+    try server.addRoute(.{
+        .method = .POST,
+        .path = "/login",
+        .handler = struct {
+            fn handle(ctx: *api.Context) !void {
+                const token = try middleware.generateToken(ctx.allocator, .{
+                    .sub = "user123",
+                    .username = "alice",
+                    .exp = std.time.timestamp() + 3600,
+                }, "my-secret-key");
+                defer ctx.allocator.free(token);
+                try ctx.jsonStruct(200, .{ .token = token });
+            }
+        }.handle,
+    });
+
+    // User endpoint with validation middleware
+    const CreateUserReq = struct {
+        name: []const u8,
+        email: []const u8,
+        age: u32,
+    };
+    const create_user_rules = .{
+        .name = zigzero.validate.FieldRules{ .required = true, .min_len = 2, .max_len = 50 },
+        .email = zigzero.validate.FieldRules{ .required = true, .email = true },
+        .age = zigzero.validate.FieldRules{ .min = 0, .max = 150 },
+    };
+
     try server.addRoute(.{
         .method = .POST,
         .path = "/users",
         .handler = struct {
             fn handle(ctx: *api.Context) !void {
-                const Req = struct {
-                    name: []const u8,
-                    email: []const u8,
-                    age: u32,
-                };
-
-                const req = ctx.bindJsonAndValidate(Req, .{
-                    .name = zigzero.validate.FieldRules{ .required = true, .min_len = 2, .max_len = 50 },
-                    .email = zigzero.validate.FieldRules{ .required = true, .email = true },
-                    .age = zigzero.validate.FieldRules{ .min = 0, .max = 150 },
-                }) catch |err| {
-                    if (err == error.ValidationError) {
-                        const msg = ctx.validation_error_message orelse "validation failed";
-                        try ctx.sendError(400, msg);
-                        return;
-                    }
-                    try ctx.sendError(400, "invalid request");
-                    return;
-                };
-
+                const req = try ctx.bindJson(CreateUserReq);
                 try ctx.jsonStruct(201, .{
                     .id = 1,
                     .name = req.name,
@@ -150,6 +159,7 @@ pub fn main() !void {
                 });
             }
         }.handle,
+        .middleware = &.{middleware.validateBody(CreateUserReq, create_user_rules)},
     });
 
     // WebSocket chat endpoint with room broadcasting

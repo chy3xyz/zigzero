@@ -20,21 +20,30 @@ pub const Claims = struct {
     iat: ?i64 = null,
 };
 
-/// Base64-url decode (no padding)
+/// Base64-url decode using URL-safe alphabet (handles padding)
 fn base64UrlDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var padded = try allocator.alloc(u8, std.mem.alignForward(usize, input.len + 2, 4));
+    const pad_len = (4 - (input.len % 4)) % 4;
+    var padded = try allocator.alloc(u8, input.len + pad_len);
     defer allocator.free(padded);
     @memcpy(padded[0..input.len], input);
-    var i: usize = input.len;
-    while (i < padded.len) : (i += 1) {
-        padded[i] = '=';
-    }
-    const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, '=');
-    const size = decoder.calcSizeForSlice(padded) catch return error.InvalidToken;
+    for (padded[input.len..]) |*b| b.* = '=';
+    const decoder = std.base64.url_safe.Decoder;
+    const size = try decoder.calcSizeForSlice(padded);
     const out = try allocator.alloc(u8, size);
     errdefer allocator.free(out);
     try decoder.decode(out, padded);
     return out;
+}
+
+/// Base64-url encode using URL-safe alphabet (no padding)
+fn base64UrlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const size = std.base64.url_safe.Encoder.calcSize(input.len);
+    const out = try allocator.alloc(u8, size);
+    const encoded = std.base64.url_safe.Encoder.encode(out, input);
+    // Strip padding
+    var len = encoded.len;
+    while (len > 0 and out[len - 1] == '=') len -= 1;
+    return try allocator.realloc(out, len);
 }
 
 /// Verify a JWT token using HMAC-SHA256. Returns decoded payload on success.
@@ -64,6 +73,65 @@ fn verifyJwt(allocator: std.mem.Allocator, token: []const u8, secret: []const u8
     defer allocator.free(payload_json);
 
     return std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+}
+
+/// Sign a JWT token using HMAC-SHA256. Caller owns returned memory.
+fn signJwt(allocator: std.mem.Allocator, claims: Claims, secret: []const u8) ![]u8 {
+    const header = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    const header_b64 = try base64UrlEncode(allocator, header);
+    defer allocator.free(header_b64);
+
+    var payload_buf: std.ArrayList(u8) = .{};
+    defer payload_buf.deinit(allocator);
+    const w = payload_buf.writer(allocator);
+
+    try w.writeAll("{");
+    var first = true;
+    if (claims.sub) |sub| {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("\"sub\":\"{s}\"", .{sub});
+    }
+    if (claims.user_id) |uid| {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("\"user_id\":\"{s}\"", .{uid});
+    }
+    if (claims.username) |un| {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("\"username\":\"{s}\"", .{un});
+    }
+    if (claims.exp) |exp| {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("\"exp\":{d}", .{exp});
+    }
+    if (claims.iat) |iat| {
+        if (!first) try w.writeAll(",");
+        first = false;
+        try w.print("\"iat\":{d}", .{iat});
+    }
+    try w.writeAll("}");
+
+    const payload_b64 = try base64UrlEncode(allocator, payload_buf.items);
+    defer allocator.free(payload_b64);
+
+    const signed_data = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header_b64, payload_b64 });
+    defer allocator.free(signed_data);
+
+    var sig: [32]u8 = undefined;
+    std.crypto.auth.hmac.sha2.HmacSha256.create(&sig, signed_data, secret);
+
+    const sig_b64 = try base64UrlEncode(allocator, &sig);
+    defer allocator.free(sig_b64);
+
+    return std.fmt.allocPrint(allocator, "{s}.{s}.{s}", .{ header_b64, payload_b64, sig_b64 });
+}
+
+/// Generate a JWT token from claims. Caller owns returned memory.
+pub fn generateToken(allocator: std.mem.Allocator, claims: Claims, secret: []const u8) ![]u8 {
+    return signJwt(allocator, claims, secret);
 }
 
 const JwtState = struct {
@@ -296,6 +364,27 @@ pub fn loadShedding(shedder: *load.AdaptiveShedder) api.Middleware {
     };
 }
 
+/// Request validation middleware for JSON bodies.
+/// Validates the request body against comptime struct rules.
+pub fn validateBody(comptime T: type, comptime rules: anytype) api.Middleware {
+    return .{
+        .func = struct {
+            fn middleware(ctx: *api.Context, next: api.HandlerFn, _: ?*anyopaque) anyerror!void {
+                _ = ctx.bindJsonAndValidate(T, rules) catch |err| {
+                    if (err == error.ValidationError) {
+                        const msg = ctx.validation_error_message orelse "validation failed";
+                        try ctx.sendError(400, msg);
+                        return;
+                    }
+                    try ctx.sendError(400, "invalid request");
+                    return;
+                };
+                try next(ctx);
+            }
+        }.middleware,
+    };
+}
+
 /// Health check handler (expects registry in ctx.user_data)
 pub fn healthHandler(ctx: *api.Context) !void {
     const registry = @as(*health.Registry, @ptrCast(@alignCast(ctx.user_data.?)));
@@ -337,6 +426,26 @@ pub fn healthHandler(ctx: *api.Context) !void {
 
     const code: u16 = if (overall == .unhealthy) 503 else 200;
     try ctx.json(code, buf.items);
+}
+
+test "jwt generate and verify" {
+    const allocator = std.testing.allocator;
+    const secret = "my-secret";
+    const claims = Claims{
+        .sub = "user123",
+        .username = "alice",
+    };
+
+    const token = try generateToken(allocator, claims, secret);
+    defer allocator.free(token);
+
+    try std.testing.expect(token.len > 0);
+
+    const parsed = try verifyJwt(allocator, token, secret);
+    defer parsed.deinit();
+
+    try std.testing.expectEqualStrings("user123", parsed.value.object.get("sub").?.string);
+    try std.testing.expectEqualStrings("alice", parsed.value.object.get("username").?.string);
 }
 
 test "middleware" {
