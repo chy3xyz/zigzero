@@ -24,7 +24,7 @@ ZigZero is a high-performance microservice framework written in Zig, inspired by
 - **Load Balancer** (`loadbalancer`) - Round robin, random, weighted, least connection, IP hash, consistent hashing
 - **Redis Client** (`redis`) - RESP protocol implementation with cluster support
 - **Connection Pool** (`pool`) - Generic connection pooling
-- **Health Checks** (`health`) - Health probe registry
+- **Health Checks** (`health`) - Health probe registry with HTTP handler
 - **Service Discovery** (`discovery`) - Static service discovery
 - **Distributed Tracing** (`trace`) - OpenTelemetry-compatible tracing with W3C TraceContext propagation
 - **Metrics** (`metric`) - Prometheus-compatible metrics with `/metrics` handler

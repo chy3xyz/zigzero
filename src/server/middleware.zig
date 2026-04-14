@@ -9,6 +9,7 @@ const limiter = @import("../infra/limiter.zig");
 const trace = @import("../infra/trace.zig");
 const metric = @import("../infra/metric.zig");
 const load = @import("../core/load.zig");
+const health = @import("../infra/health.zig");
 
 /// JWT claims
 pub const Claims = struct {
@@ -263,6 +264,52 @@ pub fn loadShedding(shedder: *load.AdaptiveShedder) api.MiddlewareFn {
             promise.pass();
         }
     }.middleware;
+}
+
+/// Health check handler
+pub fn healthHandler(registry: *health.Registry) api.HandlerFn {
+    return struct {
+        fn handle(ctx: *api.Context) !void {
+            var results = try registry.checkAll();
+            defer results.deinit();
+
+            var buf = std.ArrayList(u8){};
+            defer buf.deinit(ctx.allocator);
+            const w = buf.writer(ctx.allocator);
+
+            try w.writeAll("{\"status\":\"");
+            const overall = try registry.overall();
+            const status_str = switch (overall) {
+                .healthy => "healthy",
+                .degraded => "degraded",
+                .unhealthy => "unhealthy",
+            };
+            try w.writeAll(status_str);
+            try w.writeAll("\",\"checks\":{");
+
+            var first = true;
+            var iter = results.iterator();
+            while (iter.next()) |entry| {
+                if (!first) try w.writeAll(",");
+                first = false;
+                const r = entry.value_ptr.*;
+                const check_status = switch (r.status) {
+                    .healthy => "healthy",
+                    .degraded => "degraded",
+                    .unhealthy => "unhealthy",
+                };
+                if (r.message) |msg| {
+                    try w.print("\"{s}\":{{\"status\":\"{s}\",\"message\":\"{s}\"}}", .{ r.name, check_status, msg });
+                } else {
+                    try w.print("\"{s}\":{{\"status\":\"{s}\"}}", .{ r.name, check_status });
+                }
+            }
+            try w.writeAll("}}");
+
+            const code: u16 = if (overall == .unhealthy) 503 else 200;
+            try ctx.json(code, buf.items);
+        }
+    }.handle;
 }
 
 test "middleware" {
