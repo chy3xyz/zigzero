@@ -30,6 +30,9 @@ pub const Error = error{
     /// Service unavailable (maps to go-zero's ServiceUnavailable)
     ServiceUnavailable,
 
+    /// Service overloaded (maps to go-zero's ErrServiceOverloaded)
+    ServiceOverloaded,
+
     /// Database error
     DatabaseError,
 
@@ -81,6 +84,7 @@ pub fn toCode(err: Error) Code {
         Error.RateLimitExceeded => .RateLimit,
         Error.CircuitBreakerOpen => .ServiceUnavailable,
         Error.ServiceUnavailable => .ServiceUnavailable,
+        Error.ServiceOverloaded => .ServiceUnavailable,
         Error.DatabaseError => .ServerError,
         Error.RedisError => .ServerError,
         Error.ConfigError => .BadRequest,

@@ -23,6 +23,7 @@ pub const threading = @import("core/threading.zig");
 pub const mapreduce = @import("core/mapreduce.zig");
 pub const hash = @import("core/hash.zig");
 pub const codec = @import("core/codec.zig");
+pub const load = @import("core/load.zig");
 
 // Network
 pub const api = @import("net/api.zig");
@@ -82,6 +83,7 @@ comptime {
     _ = mapreduce.MapReduce(u8, u8);
     _ = hash.ConsistentHash;
     _ = codec.Base64;
+    _ = load.AdaptiveShedder;
     _ = middleware.jwt;
     _ = svc.Context;
     _ = trace.Tracer;

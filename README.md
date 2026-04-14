@@ -19,6 +19,7 @@ ZigZero is a high-performance microservice framework written in Zig, inspired by
 - **Logging** (`log`) - Structured logging with levels and file rotation
 - **Circuit Breaker** (`breaker`) - Hystrix-style circuit breaker
 - **Rate Limiter** (`limiter`) - Token bucket and sliding window
+- **Load Shedder** (`load`) - Adaptive load shedding aligned with go-zero core/load
 - **Load Balancer** (`loadbalancer`) - Round robin, random, weighted, least connection, IP hash, consistent hashing
 - **Redis Client** (`redis`) - RESP protocol implementation
 - **Connection Pool** (`pool`) - Generic connection pooling
@@ -89,7 +90,13 @@ Modules are organized following Zig best practices:
 ```
 src/
 ├── core/
-│   └── errors.zig          # Unified error types
+│   ├── errors.zig          # Unified error types
+│   ├── fx.zig              # Stream / Parallel / Map utilities
+│   ├── threading.zig       # RoutineGroup / TaskRunner
+│   ├── mapreduce.zig       # Map / Reduce / MapReduce pipelines
+│   ├── hash.zig            # Consistent hash / murmur3 / fnv1a
+│   ├── codec.zig           # JSON / Binary / Base64 / Hex codecs
+│   └── load.zig            # Adaptive load shedding
 ├── net/
 │   ├── api.zig             # HTTP server
 │   ├── http.zig            # HTTP client
@@ -115,7 +122,8 @@ src/
 │   ├── retry.zig           # Exponential backoff retry
 │   ├── loadbalancer.zig    # Load balancing
 │   ├── breaker.zig         # Circuit breaker
-│   └── limiter.zig         # Rate limiting
+│   ├── limiter.zig         # Rate limiting
+│   └── sqlx.zig            # Unified SQL client abstraction
 ├── data/
 │   ├── orm.zig             # Query builder
 │   └── validate.zig        # Input validation
@@ -192,6 +200,7 @@ zig build test
 | `fx` | `core/fx` | Stream / Parallel / Map utilities | ✅ Complete |
 | `threading` | `core/threading` | RoutineGroup / TaskRunner | ✅ Complete |
 | `mapreduce` | `core/mapreduce` | Map / Reduce / MapReduce pipelines | ✅ Complete |
+| `load` | `core/load` | Adaptive load shedding | ✅ Complete |
 | `sqlx` | `infra/sqlx` | Unified SQL client abstraction | ✅ Complete |
 
 ## Requirements
