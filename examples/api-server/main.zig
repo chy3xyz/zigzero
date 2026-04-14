@@ -40,6 +40,10 @@ pub fn main() !void {
     var ip_limiter = limiter.IpLimiter.init(allocator, 10.0, 5);
     defer ip_limiter.deinit();
 
+    // Create response cache
+    var response_cache = middleware.ResponseCache.init(allocator, 100, 5000);
+    defer response_cache.deinit();
+
     // Create WebSocket hub
     var hub = websocket.Hub.init(allocator);
     defer hub.deinit();
@@ -64,6 +68,8 @@ pub fn main() !void {
     try server.addMiddleware(middleware.observability(&registry));
     try server.addMiddleware(middleware.loadShedding(&shedder));
     try server.addMiddleware(middleware.rateLimitByIp(&ip_limiter));
+    try server.addMiddleware(middleware.cacheResponses(&response_cache));
+    try server.addMiddleware(try middleware.maxBodySize(allocator, 1024 * 1024));
 
     // Health check endpoint
     try server.addRoute(.{

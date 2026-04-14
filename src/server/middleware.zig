@@ -10,6 +10,7 @@ const trace = @import("../infra/trace.zig");
 const metric = @import("../infra/metric.zig");
 const load = @import("../core/load.zig");
 const health = @import("../infra/health.zig");
+const cache_mod = @import("../infra/cache.zig");
 
 /// JWT claims
 pub const Claims = struct {
@@ -301,6 +302,95 @@ pub fn recovery() api.Middleware {
                 try next(ctx);
             }
         }.middleware,
+    };
+}
+
+/// Request size limit middleware
+pub fn maxBodySize(allocator: std.mem.Allocator, max_size: usize) !api.Middleware {
+    const limit = try allocator.create(usize);
+    limit.* = max_size;
+    return .{
+        .func = struct {
+            fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
+                const l = @as(*usize, @ptrCast(@alignCast(data.?))).*;
+                if (ctx.body) |body| {
+                    if (body.len > l) {
+                        try ctx.sendError(413, "payload too large");
+                        return;
+                    }
+                }
+                try next(ctx);
+            }
+        }.middleware,
+        .user_data = limit,
+    };
+}
+
+/// Response cache entry
+const CacheEntry = struct {
+    body: []const u8,
+    content_type: ?[]const u8,
+};
+
+/// In-memory response cache for GET requests
+pub const ResponseCache = struct {
+    allocator: std.mem.Allocator,
+    cache: cache_mod.Cache(u64, CacheEntry),
+    ttl_ms: i64,
+
+    pub fn init(allocator: std.mem.Allocator, max_size: usize, ttl_ms: i64) ResponseCache {
+        return .{
+            .allocator = allocator,
+            .cache = cache_mod.Cache(u64, CacheEntry).init(allocator, max_size),
+            .ttl_ms = ttl_ms,
+        };
+    }
+
+    pub fn deinit(self: *ResponseCache) void {
+        self.cache.deinit();
+    }
+
+    fn hashKey(path: []const u8, query: []const u8) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(path);
+        hasher.update(query);
+        return hasher.final();
+    }
+};
+
+/// Response caching middleware for GET requests
+pub fn cacheResponses(cache: *ResponseCache) api.Middleware {
+    return .{
+        .func = struct {
+            fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
+                const c = @as(*ResponseCache, @ptrCast(@alignCast(data.?)));
+                if (ctx.method == .GET) {
+                    const key = ResponseCache.hashKey(ctx.path, ctx.raw_path);
+                    if (c.cache.get(key)) |entry| {
+                        if (entry.content_type) |ct| {
+                            try ctx.setHeader("Content-Type", ct);
+                        }
+                        try ctx.response_body.appendSlice(ctx.allocator, entry.body);
+                        ctx.responded = true;
+                        return;
+                    }
+                }
+
+                try next(ctx);
+
+                if (ctx.method == .GET and ctx.status_code == 200 and ctx.responded) {
+                    const key = ResponseCache.hashKey(ctx.path, ctx.raw_path);
+                    const body_copy = c.allocator.dupe(u8, ctx.response_body.items) catch return;
+                    const ct = ctx.response_headers.get("Content-Type");
+                    const entry = CacheEntry{
+                        .body = body_copy,
+                        .content_type = if (ct) |t| c.allocator.dupe(u8, t) catch null else null,
+                    };
+                    c.cache.set(key, entry, c.ttl_ms) catch {};
+                }
+            }
+        }.middleware,
+        .user_data = cache,
     };
 }
 

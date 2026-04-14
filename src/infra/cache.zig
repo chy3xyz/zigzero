@@ -40,7 +40,7 @@ pub fn Cache(comptime K: type, comptime V: type) type {
 
             if (entry.expires_at) |expires| {
                 if (std.time.milliTimestamp() > expires) {
-                    self.map.remove(key);
+                    _ = self.map.remove(key);
                     return null;
                 }
             }
@@ -59,7 +59,7 @@ pub fn Cache(comptime K: type, comptime V: type) type {
             if (self.map.count() >= self.max_size and !self.map.contains(key)) {
                 var iter = self.map.keyIterator();
                 if (iter.next()) |first_key| {
-                    self.map.remove(first_key.*);
+                    _ = self.map.remove(first_key.*);
                 }
             }
 
