@@ -61,7 +61,28 @@ pub const Server = struct {
 
                 const content_type = guessMimeType(resolved);
                 try ctx.setHeader("Content-Type", content_type);
-                try ctx.json(200, content);
+
+                // Generate ETag based on file metadata
+                const file_stat = file.stat() catch {
+                    try ctx.sendError(500, "server error");
+                    return;
+                };
+                var etag_buf: [64]u8 = undefined;
+                const etag = try std.fmt.bufPrint(&etag_buf, "\"{x}-{x}\"", .{ file_stat.mtime, file_stat.size });
+                try ctx.setHeader("ETag", etag);
+                try ctx.setHeader("Cache-Control", "public, max-age=3600");
+
+                // Check If-None-Match for 304 response
+                if (ctx.header("If-None-Match")) |client_etag| {
+                    if (std.mem.eql(u8, client_etag, etag)) {
+                        ctx.status_code = 304;
+                        ctx.responded = true;
+                        return;
+                    }
+                }
+
+                try ctx.response_body.appendSlice(ctx.allocator, content);
+                ctx.responded = true;
             }
         }.handle;
     }
