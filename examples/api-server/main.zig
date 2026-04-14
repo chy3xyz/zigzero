@@ -9,6 +9,8 @@ const load = zigzero.load;
 const websocket = zigzero.websocket;
 const discovery = zigzero.discovery;
 const limiter = zigzero.limiter;
+const breaker = zigzero.breaker;
+const http = zigzero.http;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -209,6 +211,29 @@ pub fn main() !void {
             }
         }.handle,
         .user_data = &hub,
+    });
+
+    // HTTP client with circuit breaker demo endpoint
+    var cb = breaker.CircuitBreaker.new();
+    var http_client = http.Client.init(allocator, .{ .timeout_ms = 3000 });
+    http_client.withBreaker(&cb);
+
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/proxy",
+        .handler = struct {
+            fn handle(ctx: *api.Context) !void {
+                const client = @as(*http.Client, @ptrCast(@alignCast(ctx.user_data.?)));
+                var resp = client.get("http://httpbin.org/get") catch |err| {
+                    try ctx.sendError(503, @errorName(err));
+                    return;
+                };
+                defer resp.deinit();
+                try ctx.setHeader("Content-Type", "application/json");
+                try ctx.json(200, resp.body);
+            }
+        }.handle,
+        .user_data = &http_client,
     });
 
     // Service discovery endpoint

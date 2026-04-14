@@ -5,6 +5,7 @@
 const std = @import("std");
 const errors = @import("../core/errors.zig");
 const trace = @import("../infra/trace.zig");
+const breaker = @import("../infra/breaker.zig");
 
 pub const Method = enum {
     GET,
@@ -58,6 +59,7 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
     trace_context: ?trace.TraceContext = null,
+    circuit_breaker: ?*breaker.CircuitBreaker = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) Client {
         return .{
@@ -68,6 +70,10 @@ pub const Client = struct {
 
     pub fn withTraceContext(self: *Client, ctx: ?trace.TraceContext) void {
         self.trace_context = ctx;
+    }
+
+    pub fn withBreaker(self: *Client, cb: *breaker.CircuitBreaker) void {
+        self.circuit_breaker = cb;
     }
 
     /// Send HTTP GET request
@@ -82,6 +88,27 @@ pub const Client = struct {
 
     /// Send HTTP request
     pub fn request(self: *Client, method: Method, url: []const u8, body: ?[]const u8, custom_headers: ?std.StringHashMap([]const u8)) !Response {
+        if (self.circuit_breaker) |cb| {
+            if (!cb.allow()) return errors.Error.CircuitBreakerOpen;
+        }
+
+        const resp = self.doRequest(method, url, body, custom_headers) catch |err| {
+            if (self.circuit_breaker) |cb| cb.recordFailure();
+            return err;
+        };
+
+        if (self.circuit_breaker) |cb| {
+            if (resp.status_code >= 500) {
+                cb.recordFailure();
+            } else {
+                cb.recordSuccess();
+            }
+        }
+
+        return resp;
+    }
+
+    fn doRequest(self: *Client, method: Method, url: []const u8, body: ?[]const u8, custom_headers: ?std.StringHashMap([]const u8)) !Response {
         const full_url = if (self.config.base_url) |base|
             try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ base, url })
         else
