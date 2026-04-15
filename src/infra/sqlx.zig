@@ -1166,6 +1166,14 @@ pub const Config = struct {
     max_wait_ms: u32 = 5000,
 };
 
+/// SQL option function type aligned with go-zero's SqlOption
+pub const SqlOption = *const fn (*Client) void;
+
+/// Default acceptable error filter: NotFound is acceptable
+pub fn defaultAcceptable(err: anyerror) bool {
+    return err == error.NotFound;
+}
+
 /// SQLx client - unified SQL client
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -1173,6 +1181,7 @@ pub const Client = struct {
     conn: ?Conn = null,
     pool: ?ConnPool = null,
     cb: ?breaker.CircuitBreaker = null,
+    acceptable: ?*const fn (anyerror) bool = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Client {
         return .{
@@ -1181,7 +1190,21 @@ pub const Client = struct {
             .conn = null,
             .pool = null,
             .cb = null,
+            .acceptable = null,
         };
+    }
+
+    pub fn withOptions(self: *Client, opts: []const SqlOption) void {
+        for (opts) |opt| {
+            opt(self);
+        }
+    }
+
+    fn isAcceptable(self: *Client, err: anyerror) bool {
+        if (self.acceptable) |f| {
+            return f(err);
+        }
+        return defaultAcceptable(err);
     }
 
     pub fn deinit(self: *Client) void {
@@ -1243,12 +1266,20 @@ pub const Client = struct {
         const conn = try self.newConn();
         errdefer conn.close();
         var stmt = self.newStmt(conn, sql_str) catch |err| {
-            self.cb.?.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
         stmt.conn = conn;
         self.cb.?.recordSuccess();
         return stmt;
+    }
+
+    pub fn withAcceptable(f: *const fn (anyerror) bool) SqlOption {
+        return struct {
+            fn apply(client: *Client) void {
+                client.acceptable = f;
+            }
+        }.apply;
     }
 
     fn newStmt(self: *Client, conn: Conn, sql_str: []const u8) !Stmt {
@@ -1298,7 +1329,7 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
         const result = self.doQuery(sql_str, args) catch |err| {
-            self.cb.?.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
         self.cb.?.recordSuccess();
@@ -1320,7 +1351,7 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
         const result = self.doExec(sql_str, args) catch |err| {
-            self.cb.?.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
         self.cb.?.recordSuccess();
@@ -1342,7 +1373,7 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
         self.doPing() catch |err| {
-            self.cb.?.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
         self.cb.?.recordSuccess();
@@ -1356,14 +1387,14 @@ pub const Client = struct {
             const conn = try p.acquire();
             errdefer p.release(conn);
             conn.begin() catch |err| {
-                self.cb.?.recordFailure();
+                if (!self.isAcceptable(err)) self.cb.?.recordFailure();
                 return err;
             };
             return Transaction{ .conn = conn, .pool = p };
         }
         if (self.conn == null) try self.connect();
         self.conn.?.begin() catch |err| {
-            self.cb.?.recordFailure();
+            if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
         return Transaction{ .conn = self.conn.? };
@@ -1809,6 +1840,13 @@ pub const Builder = struct {
     pub fn delete(self: *const Builder) ![]u8 {
         return std.fmt.allocPrint(self.allocator, "DELETE FROM {s}", .{self.table});
     }
+
+    pub fn count(self: *const Builder, where_clause: ?[]const u8) ![]u8 {
+        if (where_clause) |w| {
+            return std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s} WHERE {s}", .{ self.table, w });
+        }
+        return std.fmt.allocPrint(self.allocator, "SELECT COUNT(*) FROM {s}", .{self.table});
+    }
 };
 
 // ==================== Tests ====================
@@ -1854,6 +1892,34 @@ test "cached conn queryRow and exec" {
     const user3 = try cached.queryRow(User, "user:1", "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
     defer freeScanned(allocator, User, user3);
     try std.testing.expectEqualStrings("Bob", user3.name);
+}
+
+test "sqlite acceptable error does not trip breaker" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    // queryRow on empty table should return NotFound
+    const User = struct { id: i64, name: []const u8 };
+    const err = client.queryRow(User, "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 999 }}) catch |e| e;
+    try std.testing.expectEqual(errors.Error.NotFound, err);
+
+    // NotFound is acceptable, so breaker should still allow requests
+    try client.ping();
+}
+
+test "sqlite builder count" {
+    const allocator = std.testing.allocator;
+    const b = Builder.init(allocator, "users");
+    const count_sql = try b.count("id > ?1");
+    defer allocator.free(count_sql);
+    try std.testing.expectEqualStrings("SELECT COUNT(*) FROM users WHERE id > ?1", count_sql);
+
+    const count_all = try b.count(null);
+    defer allocator.free(count_all);
+    try std.testing.expectEqualStrings("SELECT COUNT(*) FROM users", count_all);
 }
 
 test "sqlite in-memory query and exec" {
