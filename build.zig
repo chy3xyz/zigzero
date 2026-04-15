@@ -152,9 +152,9 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(api_server);
 
-    // chy3 — Creator Metaverse Platform example
+    // chy3 — Creator Metaverse Platform example (multi-file layout)
     const chy3_module = b.createModule(.{
-        .root_source_file = b.path("examples/chy3/chy3.zig"),
+        .root_source_file = b.path("examples/chy3/src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
