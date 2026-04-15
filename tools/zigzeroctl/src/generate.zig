@@ -365,7 +365,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
     try w.writeAll("        var b = sqlx.Builder.init(client.allocator, table_name);\n");
     try w.writeAll("        const sql = try b.insert(&.{ ");
-    for (columns, 0) |col, i| {
+    for (columns, 0..) |col, i| {
         if (i > 0) try w.writeAll(", ");
         try w.print("\"{s}\"", .{col.name});
     }
@@ -373,7 +373,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.writeAll("        defer client.allocator.free(sql);\n");
     try w.writeAll("        var args: [");
     try w.print("{d}]sqlx.Value = undefined;\n", .{columns.len});
-    for (columns, 0) |col, i| {
+    for (columns, 0..) |col, i| {
         try w.print("        args[{d}] = valueFromField(data.{s});\n", .{ i, col.name });
     }
     try w.writeAll("        return client.exec(sql, &args);\n");
@@ -384,7 +384,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
     try w.writeAll("        var b = sqlx.Builder.init(client.allocator, table_name);\n");
     try w.writeAll("        const sql = try b.insert(&.{ ");
-    for (columns, 0) |col, i| {
+    for (columns, 0..) |col, i| {
         if (i > 0) try w.writeAll(", ");
         try w.print("\"{s}\"", .{col.name});
     }
@@ -392,7 +392,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.writeAll("        defer client.allocator.free(sql);\n");
     try w.writeAll("        var args: [");
     try w.print("{d}]sqlx.Value = undefined;\n", .{columns.len});
-    for (columns, 0) |col, i| {
+    for (columns, 0..) |col, i| {
         try w.print("        args[{d}] = valueFromField(data.{s});\n", .{ i, col.name });
     }
     try w.writeAll("        return client.execCtx(ctx, sql, &args);\n");
@@ -419,7 +419,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
     try w.writeAll("        var b = sqlx.Builder.init(client.allocator, table_name);\n");
     try w.writeAll("        const set_sql = try b.update(&.{ ");
-    for (columns, 0) |col, i| {
+    for (columns, 0..) |col, i| {
         if (i > 0) try w.writeAll(", ");
         try w.print("\"{s}\"", .{col.name});
     }
@@ -429,7 +429,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.writeAll("        defer client.allocator.free(sql);\n");
     try w.writeAll("        var args: [");
     try w.print("{d}]sqlx.Value = undefined;\n", .{columns.len + 1});
-    for (columns, 0) |col, i| {
+    for (columns, 0..) |col, i| {
         try w.print("        args[{d}] = valueFromField(data.{s});\n", .{ i, col.name });
     }
     try w.print("        args[{d}] = valueFromField(data.{s});\n", .{ columns.len, primary_key });
@@ -441,7 +441,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
     try w.writeAll("        var b = sqlx.Builder.init(client.allocator, table_name);\n");
     try w.writeAll("        const set_sql = try b.update(&.{ ");
-    for (columns, 0) |col, i| {
+    for (columns, 0..) |col, i| {
         if (i > 0) try w.writeAll(", ");
         try w.print("\"{s}\"", .{col.name});
     }
@@ -451,7 +451,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.writeAll("        defer client.allocator.free(sql);\n");
     try w.writeAll("        var args: [");
     try w.print("{d}]sqlx.Value = undefined;\n", .{columns.len + 1});
-    for (columns, 0) |col, i| {
+    for (columns, 0..) |col, i| {
         try w.print("        args[{d}] = valueFromField(data.{s});\n", .{ i, col.name });
     }
     try w.print("        args[{d}] = valueFromField(data.{s});\n", .{ columns.len, primary_key });
