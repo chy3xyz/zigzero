@@ -338,6 +338,8 @@ try db.withTransaction(struct {
 // 参数化查询支持：?, $1, @name
 ```
 
+See [SQLx Guide](../guides/sqlx.md) for full documentation including transactions, struct scanning, query builder, CachedConn, circuit breaker integration, and metrics.
+
 ### `redis.zig` — Redis Client
 
 ```zig

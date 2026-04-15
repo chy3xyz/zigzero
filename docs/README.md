@@ -16,6 +16,7 @@ Welcome to the ZigZero documentation! This is your complete guide to building pr
 - [Metrics & Observability](guides/metrics.md) — Prometheus metrics integration
 - [Rate Limiting](guides/rate-limiting.md) — Token bucket, sliding window, IP-based limits
 - [Circuit Breaker](guides/circuit-breaker.md) — Resilience patterns for external calls
+- [SQLx](guides/sqlx.md) — Unified SQL client for SQLite/PostgreSQL/MySQL with connection pooling, caching, and query builder
 - [Configuration](guides/configuration.md) — YAML/JSON config loading and env overrides
 - [Authentication](guides/authentication.md) — JWT middleware and token generation
 
