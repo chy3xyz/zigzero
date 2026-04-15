@@ -1457,6 +1457,36 @@ pub const Client = struct {
         for (items) |item| freeScanned(self.allocator, T, item);
         self.allocator.free(items);
     }
+
+    pub fn findOne(self: *Client, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        defer self.allocator.free(sql);
+        return self.queryRow(T, sql, args);
+    }
+
+    pub fn findOnePartial(self: *Client, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        defer self.allocator.free(sql);
+        return self.queryRowPartial(T, sql, args);
+    }
+
+    pub fn findAll(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        const sql = if (where_clause) |w|
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+        else
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+        defer self.allocator.free(sql);
+        return self.queryRows(T, sql, args);
+    }
+
+    pub fn findAllPartial(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        const sql = if (where_clause) |w|
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+        else
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+        defer self.allocator.free(sql);
+        return self.queryRowsPartial(T, sql, args);
+    }
 };
 
 /// SQL transaction
@@ -1669,6 +1699,36 @@ pub const CachedConn = struct {
         return self.client.exec(sql_str, args);
     }
 
+    pub fn findOne(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        defer self.allocator.free(sql);
+        return self.queryRow(T, cache_key, sql, args);
+    }
+
+    pub fn findOneNoCache(self: *CachedConn, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
+        defer self.allocator.free(sql);
+        return self.queryRowNoCache(T, sql, args);
+    }
+
+    pub fn findAll(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        const sql = if (where_clause) |w|
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+        else
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+        defer self.allocator.free(sql);
+        return self.queryRows(T, cache_key, sql, args);
+    }
+
+    pub fn findAllNoCache(self: *CachedConn, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        const sql = if (where_clause) |w|
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
+        else
+            try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
+        defer self.allocator.free(sql);
+        return self.queryRowsNoCache(T, sql, args);
+    }
+
     fn getCache(self: *CachedConn, key: []const u8) ?[]const u8 {
         if (self.local_cache) |lc| {
             return lc.get(key);
@@ -1695,7 +1755,7 @@ pub const CachedConn = struct {
             return;
         }
         if (self.redis) |r| {
-            _ = r;
+            _ = r.del(&.{key}) catch {};
         }
     }
 };
@@ -1920,6 +1980,60 @@ test "sqlite builder count" {
     const count_all = try b.count(null);
     defer allocator.free(count_all);
     try std.testing.expectEqualStrings("SELECT COUNT(*) FROM users", count_all);
+}
+
+test "client findOne and findAll" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Alice" }});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Bob" }});
+
+    const User = struct {
+        id: i64,
+        name: []const u8,
+    };
+
+    const user = try client.findOne(User, "users", "name = ?1", &.{.{ .string = "Alice" }});
+    defer freeScanned(allocator, User, user);
+    try std.testing.expectEqual(@as(i64, 1), user.id);
+
+    const users = try client.findAll(User, "users", null, &.{});
+    defer client.deinitQueryRows(User, users);
+    try std.testing.expectEqual(@as(usize, 2), users.len);
+}
+
+test "cached conn findOne" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Alice" }});
+
+    const User = struct {
+        id: i64,
+        name: []const u8,
+    };
+
+    var cache = StringCache.init(allocator);
+    defer cache.deinit();
+
+    var cached = CachedConn{
+        .allocator = allocator,
+        .client = &client,
+        .local_cache = &cache,
+        .ttl_sec = 60,
+    };
+
+    const user1 = try cached.findOne(User, "user:1", "users", "name = ?1", &.{.{ .string = "Alice" }});
+    defer freeScanned(allocator, User, user1);
+
+    const user2 = try cached.findOne(User, "user:1", "users", "name = ?1", &.{.{ .string = "WRONG" }});
+    defer freeScanned(allocator, User, user2);
+    try std.testing.expectEqualStrings("Alice", user2.name);
 }
 
 test "sqlite in-memory query and exec" {
