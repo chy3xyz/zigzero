@@ -32,7 +32,11 @@ pub const Row = struct {
     }
 
     pub fn scan(self: Row, allocator: std.mem.Allocator, comptime T: type) !T {
-        return scanStruct(allocator, T, self);
+        return scanStruct(allocator, T, self, false);
+    }
+
+    pub fn scanPartial(self: Row, allocator: std.mem.Allocator, comptime T: type) !T {
+        return scanStruct(allocator, T, self, true);
     }
 };
 
@@ -120,7 +124,7 @@ pub const Conn = struct {
 
 // ==================== Struct Scanning ====================
 
-fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row) !T {
+fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial: bool) !T {
     const info = @typeInfo(T);
     if (info != .@"struct") @compileError("scanStruct only supports structs, got " ++ @typeName(T));
 
@@ -137,8 +141,15 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row) !T {
                 @field(result, field.name) = try valueToType(allocator, ChildType, val.?);
             }
         } else {
-            if (val == null or val.? == .null) return error.NotFound;
-            @field(result, field.name) = try valueToType(allocator, FieldType, val.?);
+            if (val == null or val.? == .null) {
+                if (partial) {
+                    @field(result, field.name) = std.mem.zeroes(FieldType);
+                } else {
+                    return error.NotFound;
+                }
+            } else {
+                @field(result, field.name) = try valueToType(allocator, FieldType, val.?);
+            }
         }
     }
     return result;
@@ -1376,6 +1387,13 @@ pub const Client = struct {
         return try rows.rows[0].scan(self.allocator, T);
     }
 
+    pub fn queryRowPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        var rows = try self.query(sql_str, args);
+        defer rows.deinit();
+        if (rows.rows.len == 0) return error.NotFound;
+        return try rows.rows[0].scanPartial(self.allocator, T);
+    }
+
     pub fn queryRows(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
@@ -1386,6 +1404,20 @@ pub const Client = struct {
         }
         for (rows.rows, 0..) |row, i| {
             result[i] = try row.scan(self.allocator, T);
+        }
+        return result;
+    }
+
+    pub fn queryRowsPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+        var rows = try self.query(sql_str, args);
+        defer rows.deinit();
+        const result = try self.allocator.alloc(T, rows.rows.len);
+        errdefer {
+            for (result) |item| freeScanned(self.allocator, T, item);
+            self.allocator.free(result);
+        }
+        for (rows.rows, 0..) |row, i| {
+            result[i] = try row.scanPartial(self.allocator, T);
         }
         return result;
     }
@@ -1518,6 +1550,26 @@ pub const CachedConn = struct {
         return self.client.queryRow(T, sql_str, args);
     }
 
+    pub fn queryRowPartial(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !T {
+        if (self.getCache(cache_key)) |cached| {
+            defer self.allocator.free(cached);
+            var parsed = std.json.parseFromSlice(T, self.allocator, cached, .{}) catch return error.DatabaseError;
+            defer parsed.deinit();
+            return try deepCopyStruct(self.allocator, T, parsed.value);
+        }
+        const result = try self.client.queryRowPartial(T, sql_str, args);
+        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
+            return result;
+        };
+        defer self.allocator.free(json);
+        self.setCache(cache_key, json, self.ttl_sec) catch {};
+        return result;
+    }
+
+    pub fn queryRowPartialNoCache(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        return self.client.queryRowPartial(T, sql_str, args);
+    }
+
     pub fn queryRows(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
@@ -1546,12 +1598,44 @@ pub const CachedConn = struct {
         return self.client.queryRows(T, sql_str, args);
     }
 
+    pub fn queryRowsPartial(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
+        if (self.getCache(cache_key)) |cached| {
+            defer self.allocator.free(cached);
+            var parsed = std.json.parseFromSlice([]T, self.allocator, cached, .{}) catch return error.DatabaseError;
+            defer parsed.deinit();
+            const result = try self.allocator.alloc(T, parsed.value.len);
+            errdefer {
+                for (result) |item| freeScanned(self.allocator, T, item);
+                self.allocator.free(result);
+            }
+            for (parsed.value, 0..) |item, i| {
+                result[i] = try deepCopyStruct(self.allocator, T, item);
+            }
+            return result;
+        }
+        const result = try self.client.queryRowsPartial(T, sql_str, args);
+        const json = std.json.Stringify.valueAlloc(self.allocator, result, .{}) catch {
+            return result;
+        };
+        defer self.allocator.free(json);
+        self.setCache(cache_key, json, self.ttl_sec) catch {};
+        return result;
+    }
+
+    pub fn queryRowsPartialNoCache(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+        return self.client.queryRowsPartial(T, sql_str, args);
+    }
+
     pub fn exec(self: *CachedConn, cache_keys: []const []const u8, sql_str: []const u8, args: []const Value) !ExecResult {
         const result = try self.client.exec(sql_str, args);
         for (cache_keys) |key| {
             self.delCache(key) catch {};
         }
         return result;
+    }
+
+    pub fn execNoCache(self: *CachedConn, sql_str: []const u8, args: []const Value) !ExecResult {
+        return self.client.exec(sql_str, args);
     }
 
     fn getCache(self: *CachedConn, key: []const u8) ?[]const u8 {
@@ -1856,6 +1940,28 @@ test "sqlite transaction rollback" {
     var rows = try client.query("SELECT name FROM users WHERE name = ?1", &.{.{ .string = "Charlie" }});
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
+}
+
+test "sqlite queryRowPartial struct scan" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name, email) VALUES (?1, ?2)", &.{ .{ .string = "Alice" }, .{ .string = "alice@example.com" } });
+
+    const PartialUser = struct {
+        id: i64,
+        name: []const u8,
+        bio: []const u8, // missing in DB, should be zeroed
+    };
+
+    const user = try client.queryRowPartial(PartialUser, "SELECT id, name FROM users WHERE name = ?1", &.{.{ .string = "Alice" }});
+    defer freeScanned(allocator, PartialUser, user);
+    try std.testing.expectEqual(@as(i64, 1), user.id);
+    try std.testing.expectEqualStrings("Alice", user.name);
+    try std.testing.expectEqual(@as(usize, 0), user.bio.len);
 }
 
 test "sqlite queryRow and queryRows struct scan" {
