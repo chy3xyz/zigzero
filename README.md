@@ -4,7 +4,7 @@
 
 ## Overview
 
-ZigZero is a high-performance microservice framework written in Zig, inspired by go-zero. It provides comprehensive capabilities for building production-ready microservices with zero external dependencies.
+ZigZero is a high-performance microservice framework written in Zig, inspired by go-zero. It provides comprehensive capabilities for building production-ready microservices. Most modules rely only on the Zig standard library; the `sqlx` module requires system C libraries for database connectivity (SQLite, PostgreSQL, MySQL).
 
 ## Features
 
@@ -75,7 +75,20 @@ pub fn main() !void {
 
 ## Installation
 
-Add to your `build.zig`:
+Add to your `build.zig.zon`:
+
+```zig
+.{
+    .dependencies = .{
+        .zigzero = .{
+            .url = "https://github.com/knot3bot/zigzero/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "<zig will print the expected hash after first fetch>",
+        },
+    },
+}
+```
+
+Then in your `build.zig`:
 
 ```zig
 const zigzero = b.dependency("zigzero", .{
@@ -83,6 +96,36 @@ const zigzero = b.dependency("zigzero", .{
     .optimize = optimize,
 });
 exe.root_module.addImport("zigzero", zigzero.module("zigzero"));
+```
+
+### System Dependencies for `sqlx`
+
+If you use the `sqlx` module, the following C libraries must be installed on your system:
+
+- **SQLite 3** (`libsqlite3`)
+- **PostgreSQL client** (`libpq`)
+- **MySQL / MariaDB client** (`libmysqlclient`)
+
+On **macOS** (Homebrew):
+```bash
+brew install libpq mariadb-connector-c sqlite3
+```
+
+On **Ubuntu / Debian**:
+```bash
+sudo apt-get install libsqlite3-dev libpq-dev libmysqlclient-dev
+```
+
+On **Fedora / RHEL**:
+```bash
+sudo dnf install sqlite-devel postgresql-devel mysql-devel
+```
+
+You can override auto-detected paths via environment variables:
+```bash
+PQ_INCLUDE=/custom/pq/include PQ_LIB=/custom/pq/lib \
+MYSQL_INCLUDE=/custom/mysql/include MYSQL_LIB=/custom/mysql/lib \
+zig build
 ```
 
 ## Project Structure
@@ -268,7 +311,10 @@ Route formats:
 ## Requirements
 
 - Zig 0.15.2+
-- No external dependencies (uses std library only)
+- For `sqlx` database support:
+  - SQLite 3 development libraries
+  - PostgreSQL client development libraries (`libpq`)
+  - MySQL / MariaDB client development libraries (`libmysqlclient`)
 
 ## License
 
