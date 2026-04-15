@@ -2048,8 +2048,16 @@ pub const Builder = struct {
         return self.allocator.dupe(u8, fbs.getWritten());
     }
 
-    pub fn update(self: *const Builder) ![]u8 {
-        return std.fmt.allocPrint(self.allocator, "UPDATE {s} SET ", .{self.table});
+    pub fn update(self: *const Builder, columns: []const []const u8) ![]u8 {
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
+        try std.fmt.format(w, "UPDATE {s} SET ", .{self.table});
+        for (columns, 0..) |col, i| {
+            if (i > 0) try w.writeAll(", ");
+            try std.fmt.format(w, "{s} = ?{d}", .{ col, i + 1 });
+        }
+        return self.allocator.dupe(u8, buf.items);
     }
 
     pub fn delete(self: *const Builder) ![]u8 {
