@@ -1092,6 +1092,9 @@ const ConnPool = struct {
     client: *Client,
     max_open: u32,
     max_idle: u32,
+    max_wait_ms: u32,
+    max_reconnect_attempts: u32 = 3,
+    reconnect_delay_ms: u32 = 100,
     active: std.atomic.Value(u32),
     idle: std.ArrayList(Conn),
     mutex: std.Thread.Mutex,
@@ -1104,6 +1107,7 @@ const ConnPool = struct {
             .client = client,
             .max_open = max_open,
             .max_idle = max_idle,
+            .max_wait_ms = client.config.max_wait_ms,
             .active = std.atomic.Value(u32).init(0),
             .idle = .{},
             .mutex = .{},
@@ -1123,36 +1127,80 @@ const ConnPool = struct {
         self.idle.deinit(self.allocator);
     }
 
-    pub fn acquire(self: *ConnPool) !Conn {
-        if (self.closed.load(.monotonic)) return error.DatabaseError;
+    /// Reconnect and add a new idle connection to the pool
+    fn reconnect(self: *ConnPool) !void {
+        const conn = self.client.newConn() catch return;
         self.mutex.lock();
-        while (self.idle.items.len > 0) {
-            const conn = self.idle.pop().?;
-            self.mutex.unlock();
+        defer self.mutex.unlock();
+        self.idle.append(self.allocator, conn) catch {
+            conn.close();
+        };
+    }
+
+    /// Attempt to get a healthy connection with reconnect logic
+    fn getHealthyConn(self: *ConnPool) !Conn {
+        var attempts: u32 = 0;
+        while (attempts < self.max_reconnect_attempts) : (attempts += 1) {
+            const conn = self.client.newConn() catch {
+                if (attempts < self.max_reconnect_attempts - 1) {
+                    std.Thread.sleep(std.time.ns_per_ms * self.reconnect_delay_ms);
+                    self.reconnect() catch {};
+                }
+                continue;
+            };
+            // health check: ping before returning
             conn.ping() catch {
                 conn.close();
-                _ = self.active.fetchSub(1, .monotonic);
-                self.mutex.lock();
+                if (attempts < self.max_reconnect_attempts - 1) {
+                    std.Thread.sleep(std.time.ns_per_ms * self.reconnect_delay_ms);
+                    self.reconnect() catch {};
+                }
                 continue;
             };
             return conn;
         }
-        const current_active = self.active.load(.monotonic);
-        if (current_active < self.max_open) {
-            self.mutex.unlock();
-            const conn = try self.client.newConn();
-            _ = self.active.fetchAdd(1, .monotonic);
-            return conn;
-        }
-        const wait_until = std.time.milliTimestamp() + @as(i64, @intCast(self.client.config.max_wait_ms));
-        while (self.idle.items.len == 0 and std.time.milliTimestamp() < wait_until) {
-            self.cond.timedWait(&self.mutex, @intCast(wait_until - std.time.milliTimestamp())) catch break;
-        }
+        return error.ConnectionFailed;
+    }
+
+    pub fn acquire(self: *ConnPool) !Conn {
+        if (self.closed.load(.monotonic)) return error.ConnectionFailed;
+
+        self.mutex.lock();
+
+        // Try to get from idle pool
         if (self.idle.items.len > 0) {
             const conn = self.idle.pop().?;
             self.mutex.unlock();
             return conn;
         }
+
+        // Create new connection if under limit
+        const current_active = self.active.load(.monotonic);
+        if (current_active < self.max_open) {
+            self.mutex.unlock();
+            const conn = self.client.newConn() catch return error.ConnectionFailed;
+            _ = self.active.fetchAdd(1, .monotonic);
+            return conn;
+        }
+
+        // Wait for a connection to become available
+        const wait_until = std.time.milliTimestamp() + @as(i64, @intCast(self.max_wait_ms));
+        while (self.idle.items.len == 0 and std.time.milliTimestamp() < wait_until) {
+            self.cond.timedWait(&self.mutex, @intCast(wait_until - std.time.milliTimestamp())) catch break;
+        }
+
+        if (self.idle.items.len > 0) {
+            const conn = self.idle.pop().?;
+            self.mutex.unlock();
+            // final health check before returning
+            conn.ping() catch {
+                conn.close();
+                _ = self.active.fetchSub(1, .monotonic);
+                return error.PoolUnhealthy;
+            };
+            return conn;
+        }
+
         self.mutex.unlock();
         return error.Timeout;
     }
@@ -1164,17 +1212,17 @@ const ConnPool = struct {
             return;
         }
         self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Return to idle pool if not full, otherwise close
         if (self.idle.items.len < self.max_idle) {
             self.idle.append(self.allocator, conn) catch {
-                self.mutex.unlock();
                 conn.close();
                 _ = self.active.fetchSub(1, .monotonic);
                 return;
             };
-            self.mutex.unlock();
             self.cond.signal();
         } else {
-            self.mutex.unlock();
             conn.close();
             _ = self.active.fetchSub(1, .monotonic);
         }
@@ -1226,6 +1274,41 @@ pub const SqlContext = struct {
     }
 };
 
+/// Metrics callback type: called after each query/exec with timing info
+pub const MetricsCallback = *const fn (duration_ns: u64, query: []const u8, ok: bool, err_msg: ?[]const u8) void;
+
+/// Tracer interface: minimal OpenTelemetry-compatible span
+pub const Tracer = struct {
+    start_span: *const fn (name: []const u8) Span,
+    end_span: *const fn (span: *Span) void,
+};
+
+pub const Span = struct {
+    name: []const u8,
+    start_ns: i128,
+    end_ns: ?i128 = null,
+    attributes: std.StringHashMap([]const u8),
+
+    pub fn init(name: []const u8) Span {
+        return .{
+            .name = name,
+            .start_ns = std.time.nanoTimestamp(),
+            .end_ns = null,
+            .attributes = std.StringHashMap([]const u8).init(std.heap.page_allocator),
+        };
+    }
+
+    pub fn setAttribute(self: *Span, key: []const u8, value: []const u8) void {
+        self.attributes.put(key, value) catch {};
+    }
+
+    pub fn end(self: *Span) void {
+        if (self.end_ns == null) {
+            self.end_ns = std.time.nanoTimestamp();
+        }
+    }
+};
+
 /// SQLx client - unified SQL client
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -1234,6 +1317,10 @@ pub const Client = struct {
     pool: ?ConnPool = null,
     cb: ?breaker.CircuitBreaker = null,
     acceptable: ?*const fn (anyerror) bool = null,
+    /// Optional metrics callback (zero-cost when null)
+    metrics_callback: ?MetricsCallback = null,
+    /// Optional tracer for OpenTelemetry-compatible spans (zero-cost when null)
+    tracer: ?*const Tracer = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Client {
         return .{
@@ -1243,6 +1330,8 @@ pub const Client = struct {
             .pool = null,
             .cb = null,
             .acceptable = null,
+            .metrics_callback = null,
+            .tracer = null,
         };
     }
 
@@ -1250,6 +1339,14 @@ pub const Client = struct {
         for (opts) |opt| {
             opt(self);
         }
+    }
+
+    pub fn withMetrics(self: *Client, cb: MetricsCallback) void {
+        self.metrics_callback = cb;
+    }
+
+    pub fn withTracer(self: *Client, t: *const Tracer) void {
+        self.tracer = t;
     }
 
     fn isAcceptable(self: *Client, err: anyerror) bool {
@@ -1363,10 +1460,16 @@ pub const Client = struct {
     pub fn query(self: *Client, sql_str: []const u8, args: []const Value) !Rows {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
+
+        const t0 = std.time.nanoTimestamp();
         const result = self.doQuery(sql_str, args) catch |err| {
+            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+            if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
+        const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+        if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
         return result;
     }
@@ -1390,10 +1493,16 @@ pub const Client = struct {
     pub fn exec(self: *Client, sql_str: []const u8, args: []const Value) !ExecResult {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
+
+        const t0 = std.time.nanoTimestamp();
         const result = self.doExec(sql_str, args) catch |err| {
+            const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+            if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
+        const elapsed: u64 = @intCast(std.time.nanoTimestamp() - t0);
+        if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
         return result;
     }
@@ -1431,21 +1540,26 @@ pub const Client = struct {
 
     pub fn beginTx(self: *Client) !Transaction {
         self.ensureBreaker();
-        if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
+        if (!self.cb.?.allow()) return errors.Error.CircuitBreakerOpen;
         self.ensurePool();
         if (self.pool) |*p| {
-            const conn = try p.acquire();
+            const conn = p.acquire() catch |err| {
+                if (err == error.ConnectionFailed) return errors.Error.DatabaseError;
+                if (err == error.Timeout) return errors.Error.Timeout;
+                if (err == error.PoolUnhealthy) return errors.Error.PoolUnhealthy;
+                return errors.Error.DatabaseError;
+            };
             errdefer p.release(conn);
             conn.begin() catch |err| {
                 if (!self.isAcceptable(err)) self.cb.?.recordFailure();
-                return err;
+                return errors.Error.DatabaseError;
             };
             return Transaction{ .conn = conn, .pool = p };
         }
         if (self.conn == null) try self.connect();
-        self.conn.?.begin() catch |err| {
-            if (!self.isAcceptable(err)) self.cb.?.recordFailure();
-            return err;
+        self.conn.?.begin() catch {
+            if (!self.isAcceptable(errors.DatabaseError.ConnectionFailed)) self.cb.?.recordFailure();
+            return errors.Error.DatabaseError;
         };
         return Transaction{ .conn = self.conn.? };
     }

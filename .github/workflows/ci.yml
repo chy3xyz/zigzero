@@ -7,11 +7,49 @@ on:
     branches: [main]
 
 jobs:
-  build-and-test:
+  test:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+        db: [sqlite]
+        include:
+          - os: ubuntu-latest
+            db: postgres
+          - os: ubuntu-latest
+            db: mysql
     runs-on: ${{ matrix.os }}
+    services:
+      postgres:
+        if: matrix.db == 'postgres'
+        image: postgres:15
+        env:
+          POSTGRES_USER: zigzero
+          POSTGRES_PASSWORD: zigzero
+          POSTGRES_DB: zigzero_test
+        ports:
+          - "5432:5432"
+        options: >-
+          --health-cmd "pg_isready -U zigzero"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      mysql:
+        if: matrix.db == 'mysql'
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: zigzero_test
+          MYSQL_USER: zigzero
+          MYSQL_PASSWORD: zigzero
+        ports:
+          - "3306:3306"
+        options: >-
+          --health-cmd="mysqladmin ping"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
     steps:
       - uses: actions/checkout@v4
 
@@ -30,6 +68,28 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install libpq mariadb-connector-c sqlite3
+
+      - name: Setup PostgreSQL environment
+        if: matrix.db == 'postgres'
+        run: |
+          echo "DB=postgres" >> $GITHUB_ENV
+          echo "PQ_HOST=localhost" >> $GITHUB_ENV
+          echo "PQ_PORT=5432" >> $GITHUB_ENV
+          echo "PGHOST=localhost" >> $GITHUB_ENV
+          echo "PGPORT=5432" >> $GITHUB_ENV
+          echo "PGUSER=zigzero" >> $GITHUB_ENV
+          echo "PGPASSWORD=zigzero" >> $GITHUB_ENV
+          echo "PGDATABASE=zigzero_test" >> $GITHUB_ENV
+
+      - name: Setup MySQL environment
+        if: matrix.db == 'mysql'
+        run: |
+          echo "DB=mysql" >> $GITHUB_ENV
+          echo "MYSQL_HOST=127.0.0.1" >> $GITHUB_ENV
+          echo "MYSQL_PORT=3306" >> $GITHUB_ENV
+          echo "MYSQL_USER=zigzero" >> $GITHUB_ENV
+          echo "MYSQL_PASSWORD=zigzero" >> $GITHUB_ENV
+          echo "MYSQL_DATABASE=zigzero_test" >> $GITHUB_ENV
 
       - name: Build
         run: zig build
