@@ -509,6 +509,33 @@ pub const PostgresConn = struct {
 
 // ==================== MySQL Implementation ====================
 
+fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Value) ![]u8 {
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+    var arg_idx: usize = 0;
+    for (sql) |c| {
+        if (c == '?') {
+            if (arg_idx >= args.len) return error.DatabaseError;
+            const arg = args[arg_idx];
+            arg_idx += 1;
+            switch (arg) {
+                .null => try buf.appendSlice(allocator, "NULL"),
+                .int => |v| try std.fmt.format(buf.writer(allocator), "{d}", .{v}),
+                .float => |v| try std.fmt.format(buf.writer(allocator), "{d}", .{v}),
+                .string => |v| {
+                    try buf.append(allocator, '\'');
+                    try buf.appendSlice(allocator, v);
+                    try buf.append(allocator, '\'');
+                },
+                .bool => |v| try buf.appendSlice(allocator, if (v) "1" else "0"),
+            }
+        } else {
+            try buf.append(allocator, c);
+        }
+    }
+    return allocator.dupe(u8, buf.items);
+}
+
 pub const MySqlConn = struct {
     mysql: ?*libmysql_c.MYSQL,
     allocator: std.mem.Allocator,
@@ -610,33 +637,6 @@ pub const MySqlConn = struct {
         };
     }
 
-    fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Value) ![]u8 {
-        var buf: std.ArrayList(u8) = .{};
-        defer buf.deinit(allocator);
-        var arg_idx: usize = 0;
-        for (sql) |c| {
-            if (c == '?') {
-                if (arg_idx >= args.len) return error.DatabaseError;
-                const arg = args[arg_idx];
-                arg_idx += 1;
-                switch (arg) {
-                    .null => try buf.appendSlice(allocator, "NULL"),
-                    .int => |v| try std.fmt.format(buf.writer(allocator), "{d}", .{v}),
-                    .float => |v| try std.fmt.format(buf.writer(allocator), "{d}", .{v}),
-                    .string => |v| {
-                        try buf.append(allocator, '\'');
-                        try buf.appendSlice(allocator, v);
-                        try buf.append(allocator, '\'');
-                    },
-                    .bool => |v| try buf.appendSlice(allocator, if (v) "1" else "0"),
-                }
-            } else {
-                try buf.append(allocator, c);
-            }
-        }
-        return allocator.dupe(u8, buf.items);
-    }
-
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
         if (self.mysql) |mysql| {
@@ -688,6 +688,455 @@ pub const MySqlConn = struct {
     }
 };
 
+// ==================== Prepared Statements ====================
+
+pub const Stmt = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    conn: ?Conn = null,
+
+    pub const VTable = struct {
+        query: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows),
+        exec: *const fn (ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult),
+        close: *const fn (ptr: *anyopaque) void,
+    };
+
+    pub fn query(self: Stmt, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
+        return self.vtable.query(self.ptr, allocator, args);
+    }
+
+    pub fn exec(self: Stmt, args: []const Value) errors.ResultT(ExecResult) {
+        return self.vtable.exec(self.ptr, args);
+    }
+
+    pub fn close(self: Stmt) void {
+        self.vtable.close(self.ptr);
+        if (self.conn) |c| c.close();
+    }
+};
+
+pub const SQLiteStmt = struct {
+    db: ?*sqlite3_c.sqlite3,
+    stmt: ?*sqlite3_c.sqlite3_stmt,
+    allocator: std.mem.Allocator,
+
+    pub fn prepare(db: ?*sqlite3_c.sqlite3, allocator: std.mem.Allocator, sql: []const u8) !SQLiteStmt {
+        var stmt: ?*sqlite3_c.sqlite3_stmt = null;
+        const rc = sqlite3_c.sqlite3_prepare_v2(db, @ptrCast(sql.ptr), @intCast(sql.len), &stmt, null);
+        if (rc != sqlite3_c.SQLITE_OK or stmt == null) return error.DatabaseError;
+        return .{ .db = db, .stmt = stmt, .allocator = allocator };
+    }
+
+    fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
+        const self = @as(*SQLiteStmt, @ptrCast(@alignCast(ptr)));
+        _ = sqlite3_c.sqlite3_reset(self.stmt);
+        try bindSQLite(self.stmt.?, args);
+
+        const col_count = sqlite3_c.sqlite3_column_count(self.stmt);
+        var rows_list: std.ArrayList(Row) = .{};
+        var success = false;
+        defer {
+            if (!success) {
+                for (rows_list.items) |row| {
+                    for (row.columns) |col| allocator.free(col);
+                    allocator.free(row.columns);
+                    for (row.values) |v| {
+                        if (v) |val| {
+                            switch (val) {
+                                .string => |s| allocator.free(s),
+                                else => {},
+                            }
+                        }
+                    }
+                    allocator.free(row.values);
+                }
+            }
+            rows_list.deinit(allocator);
+        }
+
+        while (sqlite3_c.sqlite3_step(self.stmt) == sqlite3_c.SQLITE_ROW) {
+            const columns = allocator.alloc([]const u8, @intCast(col_count)) catch return error.DatabaseError;
+            const values = allocator.alloc(?Value, @intCast(col_count)) catch return error.DatabaseError;
+            for (0..@intCast(col_count)) |i| {
+                const raw_name = sqlite3_c.sqlite3_column_name(self.stmt, @intCast(i));
+                const name_len = std.mem.len(raw_name);
+                const name = raw_name[0..name_len];
+                columns[i] = allocator.dupe(u8, name) catch return error.DatabaseError;
+                values[i] = readSQLiteValue(allocator, self.stmt, @intCast(i));
+            }
+            rows_list.append(allocator, .{ .columns = columns, .values = values }) catch return error.DatabaseError;
+        }
+
+        const rows_slice = allocator.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        @memcpy(rows_slice, rows_list.items);
+        success = true;
+        return Rows{ .allocator = allocator, .rows = rows_slice };
+    }
+
+    fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
+        const self = @as(*SQLiteStmt, @ptrCast(@alignCast(ptr)));
+        _ = sqlite3_c.sqlite3_reset(self.stmt);
+        try bindSQLite(self.stmt.?, args);
+        const step_rc = sqlite3_c.sqlite3_step(self.stmt);
+        if (step_rc != sqlite3_c.SQLITE_DONE and step_rc != sqlite3_c.SQLITE_ROW) return error.DatabaseError;
+        return ExecResult{
+            .last_insert_id = sqlite3_c.sqlite3_last_insert_rowid(self.db),
+            .rows_affected = @intCast(sqlite3_c.sqlite3_changes(self.db)),
+        };
+    }
+
+    fn closeFn(ptr: *anyopaque) void {
+        const self = @as(*SQLiteStmt, @ptrCast(@alignCast(ptr)));
+        if (self.stmt) |s| {
+            _ = sqlite3_c.sqlite3_finalize(s);
+            self.stmt = null;
+        }
+        self.allocator.destroy(self);
+    }
+
+    pub fn toStmt(self: *SQLiteStmt) Stmt {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .query = queryFn,
+                .exec = execFn,
+                .close = closeFn,
+            },
+        };
+    }
+};
+
+pub const PostgresStmt = struct {
+    conn: ?*libpq_c.PGconn,
+    name: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn prepare(conn: ?*libpq_c.PGconn, allocator: std.mem.Allocator, sql: []const u8) !PostgresStmt {
+        var name_buf: [32]u8 = undefined;
+        const stmt_name = try std.fmt.bufPrint(&name_buf, "stmt_{x}", .{@intFromPtr(sql.ptr)});
+        const name_copy = try allocator.dupe(u8, stmt_name);
+        const res = libpq_c.PQprepare(conn, @ptrCast(name_copy.ptr), @ptrCast(sql.ptr), 0, null);
+        if (res == null) return error.DatabaseError;
+        defer libpq_c.PQclear(res);
+        if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
+        return .{ .conn = conn, .name = name_copy, .allocator = allocator };
+    }
+
+    fn execParamsPrepared(self: *PostgresStmt, args: []const Value) ?*libpq_c.PGresult {
+        if (self.conn == null) return null;
+        const paramValues = self.allocator.alloc(?[*]const u8, args.len) catch return null;
+        for (args, 0..) |arg, i| {
+            paramValues[i] = switch (arg) {
+                .null => null,
+                .int => |v| blk: {
+                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch {
+                        self.allocator.free(paramValues);
+                        return null;
+                    };
+                    break :blk @ptrCast(s.ptr);
+                },
+                .float => |v| blk: {
+                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch {
+                        self.allocator.free(paramValues);
+                        return null;
+                    };
+                    break :blk @ptrCast(s.ptr);
+                },
+                .string => |v| @ptrCast(v.ptr),
+                .bool => |v| if (v) @ptrCast("t") else @ptrCast("f"),
+            };
+        }
+        const res = libpq_c.PQexecPrepared(self.conn, @ptrCast(self.name.ptr), @intCast(args.len), @ptrCast(paramValues.ptr), null, null, 0);
+        self.allocator.free(paramValues);
+        return res;
+    }
+
+    fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
+        const self = @as(*PostgresStmt, @ptrCast(@alignCast(ptr)));
+        const res = execParamsPrepared(self, args) orelse return error.DatabaseError;
+        defer libpq_c.PQclear(res);
+        if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_TUPLES_OK) return error.DatabaseError;
+
+        const n_rows = libpq_c.PQntuples(res);
+        const n_cols = libpq_c.PQnfields(res);
+        var rows_list: std.ArrayList(Row) = .{};
+        var success = false;
+        defer {
+            if (!success) {
+                for (rows_list.items) |row| {
+                    for (row.columns) |col| allocator.free(col);
+                    allocator.free(row.columns);
+                    for (row.values) |v| {
+                        if (v) |val| {
+                            switch (val) {
+                                .string => |s| allocator.free(s),
+                                else => {},
+                            }
+                        }
+                    }
+                    allocator.free(row.values);
+                }
+            }
+            rows_list.deinit(allocator);
+        }
+        for (0..@intCast(n_rows)) |r| {
+            const columns = allocator.alloc([]const u8, @intCast(n_cols)) catch return error.DatabaseError;
+            const values = allocator.alloc(?Value, @intCast(n_cols)) catch return error.DatabaseError;
+            for (0..@intCast(n_cols)) |c| {
+                const name = std.mem.span(libpq_c.PQfname(res, @intCast(c)));
+                columns[c] = allocator.dupe(u8, name) catch return error.DatabaseError;
+                if (libpq_c.PQgetisnull(res, @intCast(r), @intCast(c)) == 1) {
+                    values[c] = null;
+                } else {
+                    const val = std.mem.span(libpq_c.PQgetvalue(res, @intCast(r), @intCast(c)));
+                    values[c] = .{ .string = allocator.dupe(u8, val) catch return error.DatabaseError };
+                }
+            }
+            rows_list.append(allocator, .{ .columns = columns, .values = values }) catch return error.DatabaseError;
+        }
+        const rows_slice = allocator.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        @memcpy(rows_slice, rows_list.items);
+        success = true;
+        return Rows{ .allocator = allocator, .rows = rows_slice };
+    }
+
+    fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
+        const self = @as(*PostgresStmt, @ptrCast(@alignCast(ptr)));
+        const res = execParamsPrepared(self, args) orelse return error.DatabaseError;
+        defer libpq_c.PQclear(res);
+        const status = libpq_c.PQresultStatus(res);
+        if (status != libpq_c.ExecStatusType.PGRES_COMMAND_OK and status != libpq_c.ExecStatusType.PGRES_TUPLES_OK) return error.DatabaseError;
+        const cmd = std.mem.span(libpq_c.PQcmdTuples(res));
+        const affected = std.fmt.parseInt(u64, cmd, 10) catch 0;
+        return ExecResult{ .rows_affected = affected };
+    }
+
+    fn closeFn(ptr: *anyopaque) void {
+        const self = @as(*PostgresStmt, @ptrCast(@alignCast(ptr)));
+        const dealloc_sql = std.fmt.allocPrint(self.allocator, "DEALLOCATE {s}", .{self.name}) catch {
+            self.allocator.free(self.name);
+            self.allocator.destroy(self);
+            return;
+        };
+        const res = libpq_c.PQexec(self.conn, @ptrCast(dealloc_sql.ptr));
+        if (res) |r| libpq_c.PQclear(r);
+        self.allocator.free(dealloc_sql);
+        self.allocator.free(self.name);
+        self.allocator.destroy(self);
+    }
+
+    pub fn toStmt(self: *PostgresStmt) Stmt {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .query = queryFn,
+                .exec = execFn,
+                .close = closeFn,
+            },
+        };
+    }
+};
+
+pub const MySqlStmt = struct {
+    mysql: ?*libmysql_c.MYSQL,
+    sql: []const u8,
+    allocator: std.mem.Allocator,
+
+    pub fn prepare(mysql: ?*libmysql_c.MYSQL, allocator: std.mem.Allocator, sql: []const u8) !MySqlStmt {
+        const sql_copy = try allocator.dupe(u8, sql);
+        return .{ .mysql = mysql, .sql = sql_copy, .allocator = allocator };
+    }
+
+    fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
+        const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
+        const query = formatQuery(self.allocator, self.sql, args) catch return error.DatabaseError;
+        defer self.allocator.free(query);
+        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
+        const res = libmysql_c.mysql_store_result(self.mysql) orelse return error.DatabaseError;
+        defer libmysql_c.mysql_free_result(res);
+
+        const n_cols = libmysql_c.mysql_num_fields(res);
+        const n_rows = libmysql_c.mysql_num_rows(res);
+        const field_names = allocator.alloc([]const u8, n_cols) catch return error.DatabaseError;
+        defer {
+            for (field_names) |f| allocator.free(f);
+            allocator.free(field_names);
+        }
+        for (0..n_cols) |c| {
+            const field = libmysql_c.mysql_fetch_field(res) orelse return error.DatabaseError;
+            const name = std.mem.span(field.name);
+            field_names[c] = allocator.dupe(u8, name) catch return error.DatabaseError;
+        }
+        var rows_list: std.ArrayList(Row) = .{};
+        var success = false;
+        defer {
+            if (!success) {
+                for (rows_list.items) |row| {
+                    for (row.columns) |col| allocator.free(col);
+                    allocator.free(row.columns);
+                    for (row.values) |v| {
+                        if (v) |val| {
+                            switch (val) {
+                                .string => |s| allocator.free(s),
+                                else => {},
+                            }
+                        }
+                    }
+                    allocator.free(row.values);
+                }
+            }
+            rows_list.deinit(allocator);
+        }
+        for (0..n_rows) |_| {
+            const row_data = libmysql_c.mysql_fetch_row(res);
+            const lengths = libmysql_c.mysql_fetch_lengths(res);
+            const columns = allocator.alloc([]const u8, n_cols) catch return error.DatabaseError;
+            const values = allocator.alloc(?Value, n_cols) catch return error.DatabaseError;
+            for (0..n_cols) |c| {
+                columns[c] = allocator.dupe(u8, field_names[c]) catch return error.DatabaseError;
+                if (row_data == null or row_data.?[c] == null) {
+                    values[c] = null;
+                } else {
+                    const len = lengths[c];
+                    const val = row_data.?[c].?[0..len];
+                    values[c] = .{ .string = allocator.dupe(u8, val) catch return error.DatabaseError };
+                }
+            }
+            rows_list.append(allocator, .{ .columns = columns, .values = values }) catch return error.DatabaseError;
+        }
+        const rows_slice = allocator.alloc(Row, rows_list.items.len) catch return error.DatabaseError;
+        @memcpy(rows_slice, rows_list.items);
+        success = true;
+        return Rows{ .allocator = allocator, .rows = rows_slice };
+    }
+
+    fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
+        const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
+        const query = formatQuery(self.allocator, self.sql, args) catch return error.DatabaseError;
+        defer self.allocator.free(query);
+        if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
+        _ = libmysql_c.mysql_store_result(self.mysql);
+        libmysql_c.mysql_free_result(libmysql_c.mysql_store_result(self.mysql));
+        return ExecResult{
+            .rows_affected = libmysql_c.mysql_affected_rows(self.mysql),
+            .last_insert_id = @intCast(libmysql_c.mysql_insert_id(self.mysql)),
+        };
+    }
+
+    fn closeFn(ptr: *anyopaque) void {
+        const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
+        self.allocator.free(self.sql);
+        self.allocator.destroy(self);
+    }
+
+    pub fn toStmt(self: *MySqlStmt) Stmt {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .query = queryFn,
+                .exec = execFn,
+                .close = closeFn,
+            },
+        };
+    }
+};
+
+// ==================== Connection Pool ====================
+
+const ConnPool = struct {
+    allocator: std.mem.Allocator,
+    client: *Client,
+    max_open: u32,
+    max_idle: u32,
+    active: std.atomic.Value(u32),
+    idle: std.ArrayList(Conn),
+    mutex: std.Thread.Mutex,
+    cond: std.Thread.Condition,
+    closed: std.atomic.Value(bool),
+
+    pub fn init(allocator: std.mem.Allocator, client: *Client, max_open: u32, max_idle: u32) ConnPool {
+        return .{
+            .allocator = allocator,
+            .client = client,
+            .max_open = max_open,
+            .max_idle = max_idle,
+            .active = std.atomic.Value(u32).init(0),
+            .idle = .{},
+            .mutex = .{},
+            .cond = .{},
+            .closed = std.atomic.Value(bool).init(false),
+        };
+    }
+
+    pub fn deinit(self: *ConnPool) void {
+        self.closed.store(true, .monotonic);
+        self.cond.broadcast();
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.idle.items) |*conn| {
+            conn.close();
+        }
+        self.idle.deinit(self.allocator);
+    }
+
+    pub fn acquire(self: *ConnPool) !Conn {
+        if (self.closed.load(.monotonic)) return error.DatabaseError;
+        self.mutex.lock();
+        while (self.idle.items.len > 0) {
+            const conn = self.idle.pop().?;
+            self.mutex.unlock();
+            conn.ping() catch {
+                conn.close();
+                _ = self.active.fetchSub(1, .monotonic);
+                self.mutex.lock();
+                continue;
+            };
+            return conn;
+        }
+        const current_active = self.active.load(.monotonic);
+        if (current_active < self.max_open) {
+            self.mutex.unlock();
+            const conn = try self.client.newConn();
+            _ = self.active.fetchAdd(1, .monotonic);
+            return conn;
+        }
+        const wait_until = std.time.milliTimestamp() + @as(i64, @intCast(self.client.config.max_wait_ms));
+        while (self.idle.items.len == 0 and std.time.milliTimestamp() < wait_until) {
+            self.cond.timedWait(&self.mutex, @intCast(wait_until - std.time.milliTimestamp())) catch break;
+        }
+        if (self.idle.items.len > 0) {
+            const conn = self.idle.pop().?;
+            self.mutex.unlock();
+            return conn;
+        }
+        self.mutex.unlock();
+        return error.Timeout;
+    }
+
+    pub fn release(self: *ConnPool, conn: Conn) void {
+        if (self.closed.load(.monotonic)) {
+            conn.close();
+            _ = self.active.fetchSub(1, .monotonic);
+            return;
+        }
+        self.mutex.lock();
+        if (self.idle.items.len < self.max_idle) {
+            self.idle.append(self.allocator, conn) catch {
+                self.mutex.unlock();
+                conn.close();
+                _ = self.active.fetchSub(1, .monotonic);
+                return;
+            };
+            self.mutex.unlock();
+            self.cond.signal();
+        } else {
+            self.mutex.unlock();
+            conn.close();
+            _ = self.active.fetchSub(1, .monotonic);
+        }
+    }
+};
+
 // ==================== Unified Client ====================
 
 /// SQL configuration
@@ -700,6 +1149,9 @@ pub const Config = struct {
     password: []const u8 = "",
     sqlite_path: []const u8 = ":memory:",
     postgres_conninfo: []const u8 = "",
+    max_open_conns: u32 = 1,
+    max_idle_conns: u32 = 1,
+    max_wait_ms: u32 = 5000,
 };
 
 /// SQLx client - unified SQL client
@@ -707,25 +1159,37 @@ pub const Client = struct {
     allocator: std.mem.Allocator,
     config: Config,
     conn: ?Conn = null,
+    pool: ?ConnPool = null,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) Client {
         return .{
             .allocator = allocator,
             .config = cfg,
+            .conn = null,
+            .pool = null,
         };
     }
 
     pub fn deinit(self: *Client) void {
+        if (self.pool) |*p| {
+            p.deinit();
+            self.pool = null;
+        }
         if (self.conn) |*c| c.close();
     }
 
-    pub fn connect(self: *Client) !void {
-        if (self.conn != null) return;
+    fn ensurePool(self: *Client) void {
+        if (self.config.max_open_conns > 1 and self.pool == null) {
+            self.pool = ConnPool.init(self.allocator, self, self.config.max_open_conns, self.config.max_idle_conns);
+        }
+    }
+
+    fn newConn(self: *Client) !Conn {
         switch (self.config.driver) {
             .sqlite => {
                 const sqlite = try self.allocator.create(SQLiteConn);
                 sqlite.* = try SQLiteConn.open(self.allocator, self.config.sqlite_path);
-                self.conn = sqlite.toConn();
+                return sqlite.toConn();
             },
             .postgres => {
                 const info = if (self.config.postgres_conninfo.len > 0)
@@ -741,32 +1205,96 @@ pub const Client = struct {
                 defer if (self.config.postgres_conninfo.len == 0) self.allocator.free(info);
                 const pg = try self.allocator.create(PostgresConn);
                 pg.* = try PostgresConn.connect(self.allocator, info);
-                self.conn = pg.toConn();
+                return pg.toConn();
             },
             .mysql => {
                 const mysql = try self.allocator.create(MySqlConn);
                 mysql.* = try MySqlConn.connect(self.allocator, self.config.host, self.config.username, self.config.password, self.config.database, self.config.port);
-                self.conn = mysql.toConn();
+                return mysql.toConn();
+            },
+        }
+    }
+
+    pub fn connect(self: *Client) !void {
+        if (self.conn != null) return;
+        self.conn = try self.newConn();
+    }
+
+    pub fn prepare(self: *Client, sql_str: []const u8) !Stmt {
+        const conn = try self.newConn();
+        errdefer conn.close();
+        var stmt = try self.newStmt(conn, sql_str);
+        stmt.conn = conn;
+        return stmt;
+    }
+
+    fn newStmt(self: *Client, conn: Conn, sql_str: []const u8) !Stmt {
+        switch (self.config.driver) {
+            .sqlite => {
+                const sqlite_conn = @as(*SQLiteConn, @ptrCast(@alignCast(conn.ptr)));
+                const stmt = try self.allocator.create(SQLiteStmt);
+                errdefer self.allocator.destroy(stmt);
+                stmt.* = try SQLiteStmt.prepare(sqlite_conn.db, self.allocator, sql_str);
+                return stmt.toStmt();
+            },
+            .postgres => {
+                const pg_conn = @as(*PostgresConn, @ptrCast(@alignCast(conn.ptr)));
+                const stmt = try self.allocator.create(PostgresStmt);
+                errdefer self.allocator.destroy(stmt);
+                stmt.* = try PostgresStmt.prepare(pg_conn.conn, self.allocator, sql_str);
+                return stmt.toStmt();
+            },
+            .mysql => {
+                const mysql_conn = @as(*MySqlConn, @ptrCast(@alignCast(conn.ptr)));
+                const stmt = try self.allocator.create(MySqlStmt);
+                errdefer self.allocator.destroy(stmt);
+                stmt.* = try MySqlStmt.prepare(mysql_conn.mysql, self.allocator, sql_str);
+                return stmt.toStmt();
             },
         }
     }
 
     pub fn query(self: *Client, sql_str: []const u8, args: []const Value) !Rows {
+        self.ensurePool();
+        if (self.pool) |*p| {
+            const conn = try p.acquire();
+            defer p.release(conn);
+            return conn.query(self.allocator, sql_str, args);
+        }
         if (self.conn == null) try self.connect();
         return self.conn.?.query(self.allocator, sql_str, args);
     }
 
     pub fn exec(self: *Client, sql_str: []const u8, args: []const Value) !ExecResult {
+        self.ensurePool();
+        if (self.pool) |*p| {
+            const conn = try p.acquire();
+            defer p.release(conn);
+            return conn.exec(sql_str, args);
+        }
         if (self.conn == null) try self.connect();
         return self.conn.?.exec(sql_str, args);
     }
 
     pub fn ping(self: *Client) !void {
+        self.ensurePool();
+        if (self.pool) |*p| {
+            const conn = try p.acquire();
+            defer p.release(conn);
+            return conn.ping();
+        }
         if (self.conn == null) try self.connect();
         return self.conn.?.ping();
     }
 
     pub fn beginTx(self: *Client) !Transaction {
+        self.ensurePool();
+        if (self.pool) |*p| {
+            const conn = try p.acquire();
+            errdefer p.release(conn);
+            try conn.begin();
+            return Transaction{ .conn = conn, .pool = p };
+        }
         if (self.conn == null) try self.connect();
         try self.conn.?.begin();
         return Transaction{ .conn = self.conn.? };
@@ -774,7 +1302,10 @@ pub const Client = struct {
 
     pub fn transact(self: *Client, comptime T: type, fn_tx: *const fn (*Transaction) errors.ResultT(T)) errors.ResultT(T) {
         var tx = try self.beginTx();
-        errdefer tx.rollback() catch {};
+        errdefer {
+            tx.rollback() catch {};
+            if (tx.pool) |p| p.release(tx.conn);
+        }
         const result = try fn_tx(&tx);
         try tx.commit();
         return result;
@@ -810,6 +1341,7 @@ pub const Client = struct {
 /// SQL transaction
 pub const Transaction = struct {
     conn: Conn,
+    pool: ?*ConnPool = null,
 
     pub fn query(self: *Transaction, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) !Rows {
         return self.conn.query(allocator, sql_str, args);
@@ -820,11 +1352,19 @@ pub const Transaction = struct {
     }
 
     pub fn commit(self: *Transaction) !void {
-        return self.conn.commit();
+        try self.conn.commit();
+        if (self.pool) |p| {
+            p.release(self.conn);
+            self.pool = null;
+        }
     }
 
     pub fn rollback(self: *Transaction) !void {
-        return self.conn.rollback();
+        try self.conn.rollback();
+        if (self.pool) |p| {
+            p.release(self.conn);
+            self.pool = null;
+        }
     }
 };
 
@@ -1104,6 +1644,74 @@ test "sqlite transact helper" {
     var rows = try client.query("SELECT name FROM users WHERE name = ?1", &.{.{ .string = "TxUser" }});
     defer rows.deinit();
     try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+}
+
+test "sqlite connection pool" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:", .max_open_conns = 3, .max_idle_conns = 2 });
+    defer client.deinit();
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Alice" }});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Bob" }});
+
+    const User = struct {
+        id: i64,
+        name: []const u8,
+    };
+
+    const users = try client.queryRows(User, "SELECT id, name FROM users ORDER BY id", &.{});
+    defer client.deinitQueryRows(User, users);
+    try std.testing.expectEqual(@as(usize, 2), users.len);
+
+    // Transaction through pool
+    const affected = try client.transact(u64, struct {
+        fn doTx(tx: *Transaction) errors.ResultT(u64) {
+            const r = try tx.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Charlie" }});
+            return r.rows_affected;
+        }
+    }.doTx);
+    try std.testing.expectEqual(@as(u64, 1), affected);
+}
+
+test "sqlite prepared statement" {
+    const allocator = std.testing.allocator;
+    const db_path = "/tmp/zigzero_sqlx_stmt_test.db";
+    std.fs.cwd().deleteFile(db_path) catch {};
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = db_path });
+    defer {
+        client.deinit();
+        std.fs.cwd().deleteFile(db_path) catch {};
+    }
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    var stmt = try client.prepare("INSERT INTO users (name) VALUES (?1)");
+    defer stmt.close();
+
+    const r1 = try stmt.exec(&.{.{ .string = "Alice" }});
+    try std.testing.expectEqual(@as(u64, 1), r1.rows_affected);
+    try std.testing.expectEqual(@as(i64, 1), r1.last_insert_id.?);
+
+    const r2 = try stmt.exec(&.{.{ .string = "Bob" }});
+    try std.testing.expectEqual(@as(u64, 1), r2.rows_affected);
+    try std.testing.expectEqual(@as(i64, 2), r2.last_insert_id.?);
+
+    var select_stmt = try client.prepare("SELECT id, name FROM users WHERE name = ?1");
+    defer select_stmt.close();
+
+    const User = struct {
+        id: i64,
+        name: []const u8,
+    };
+
+    var rows = try select_stmt.query(allocator, &.{.{ .string = "Alice" }});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    const user = try rows.rows[0].scan(allocator, User);
+    defer freeScanned(allocator, User, user);
+    try std.testing.expectEqual(@as(i64, 1), user.id);
+    try std.testing.expectEqualStrings("Alice", user.name);
 }
 
 test "sqlx value" {

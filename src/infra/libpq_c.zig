@@ -32,5 +32,7 @@ pub extern "c" fn PQgetisnull(res: ?*const PGresult, row: c_int, col: c_int) c_i
 pub extern "c" fn PQcmdTuples(res: ?*const PGresult) [*c]const u8;
 pub extern "c" fn PQoidValue(res: ?*const PGresult) Oid;
 pub extern "c" fn PQerrorMessage(conn: ?*const PGconn) [*c]const u8;
+pub extern "c" fn PQprepare(conn: ?*PGconn, stmtName: [*c]const u8, query: [*c]const u8, nParams: c_int, paramTypes: ?[*]const Oid) ?*PGresult;
+pub extern "c" fn PQexecPrepared(conn: ?*PGconn, stmtName: [*c]const u8, nParams: c_int, paramValues: ?[*]const ?[*]const u8, paramLengths: ?[*]const c_int, paramFormats: ?[*]const c_int, resultFormat: c_int) ?*PGresult;
 
 pub const Oid = c_uint;
