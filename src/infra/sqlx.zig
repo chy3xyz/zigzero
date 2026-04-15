@@ -420,6 +420,17 @@ pub const MySqlConn = struct {
         const n_cols = libmysql_c.mysql_num_fields(res);
         const n_rows = libmysql_c.mysql_num_rows(res);
 
+        const field_names = allocator.alloc([]const u8, n_cols) catch return error.DatabaseError;
+        defer {
+            for (field_names) |f| allocator.free(f);
+            allocator.free(field_names);
+        }
+        for (0..n_cols) |c| {
+            const field = libmysql_c.mysql_fetch_field(res) orelse return error.DatabaseError;
+            const name = std.mem.span(field.name);
+            field_names[c] = allocator.dupe(u8, name) catch return error.DatabaseError;
+        }
+
         var rows_list: std.ArrayList(Row) = .{};
         var success = false;
         defer {
@@ -449,9 +460,7 @@ pub const MySqlConn = struct {
             const columns = allocator.alloc([]const u8, n_cols) catch return error.DatabaseError;
             const values = allocator.alloc(?Value, n_cols) catch return error.DatabaseError;
             for (0..n_cols) |c| {
-                const field = libmysql_c.mysql_fetch_field(res) orelse continue;
-                const name = std.mem.span(field.name);
-                columns[c] = allocator.dupe(u8, name) catch return error.DatabaseError;
+                columns[c] = allocator.dupe(u8, field_names[c]) catch return error.DatabaseError;
                 if (row_data == null or row_data.?[c] == null) {
                     values[c] = null;
                 } else {
@@ -770,4 +779,64 @@ test "mysql config init" {
     };
     try std.testing.expectEqual(Driver.mysql, cfg.driver);
     try std.testing.expectEqual(@as(u16, 3306), cfg.port);
+}
+
+test "postgres live connection" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{
+        .driver = .postgres,
+        .host = "localhost",
+        .port = 5432,
+        .database = "postgres",
+        .username = "cborli",
+        .password = "",
+    });
+    defer client.deinit();
+
+    try client.connect();
+    try client.ping();
+
+    _ = client.exec("DROP TABLE IF EXISTS zigzero_test_users", &.{}) catch {};
+    _ = try client.exec("CREATE TABLE zigzero_test_users (id SERIAL PRIMARY KEY, name TEXT)", &.{});
+
+    const insert = try client.exec("INSERT INTO zigzero_test_users (name) VALUES ($1)", &.{.{ .string = "Alice" }});
+    try std.testing.expectEqual(@as(u64, 1), insert.rows_affected);
+
+    var rows = try client.query("SELECT id, name FROM zigzero_test_users WHERE name = $1", &.{.{ .string = "Alice" }});
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    try std.testing.expectEqualStrings("Alice", rows.rows[0].get("name").?.string);
+
+    _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_users", &.{});
+}
+
+test "mysql live connection" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{
+        .driver = .mysql,
+        .host = "localhost",
+        .port = 3306,
+        .database = "mysql",
+        .username = "root",
+        .password = "",
+    });
+    defer client.deinit();
+
+    try client.connect();
+    try client.ping();
+
+    _ = client.exec("DROP TABLE IF EXISTS zigzero_test_users", &.{}) catch {};
+    _ = try client.exec("CREATE TABLE zigzero_test_users (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(255))", &.{});
+
+    const insert = try client.exec("INSERT INTO zigzero_test_users (name) VALUES (?)", &.{.{ .string = "Alice" }});
+    try std.testing.expectEqual(@as(u64, 1), insert.rows_affected);
+
+    var rows = try client.query("SELECT id, name FROM zigzero_test_users WHERE name = ?", &.{.{ .string = "Alice" }});
+    defer rows.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    try std.testing.expectEqualStrings("Alice", rows.rows[0].get("name").?.string);
+
+    _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_users", &.{});
 }
