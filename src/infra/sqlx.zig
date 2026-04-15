@@ -1174,6 +1174,26 @@ pub fn defaultAcceptable(err: anyerror) bool {
     return err == error.NotFound;
 }
 
+/// SQL context aligned with go-zero's context.Context usage for sqlx
+pub const SqlContext = struct {
+    deadline_ms: ?i64 = null,
+
+    pub fn isDone(self: SqlContext) bool {
+        if (self.deadline_ms) |d| {
+            return std.time.milliTimestamp() > d;
+        }
+        return false;
+    }
+
+    pub fn withDeadline(deadline_ms: i64) SqlContext {
+        return .{ .deadline_ms = deadline_ms };
+    }
+
+    pub fn withTimeout(timeout_ms: i64) SqlContext {
+        return .{ .deadline_ms = std.time.milliTimestamp() + timeout_ms };
+    }
+};
+
 /// SQLx client - unified SQL client
 pub const Client = struct {
     allocator: std.mem.Allocator,
@@ -1274,6 +1294,11 @@ pub const Client = struct {
         return stmt;
     }
 
+    pub fn prepareCtx(self: *Client, ctx: SqlContext, sql_str: []const u8) !Stmt {
+        if (ctx.isDone()) return error.Timeout;
+        return self.prepare(sql_str);
+    }
+
     pub fn withAcceptable(f: *const fn (anyerror) bool) SqlOption {
         return struct {
             fn apply(client: *Client) void {
@@ -1336,6 +1361,11 @@ pub const Client = struct {
         return result;
     }
 
+    pub fn queryCtx(self: *Client, ctx: SqlContext, sql_str: []const u8, args: []const Value) !Rows {
+        if (ctx.isDone()) return error.Timeout;
+        return self.query(sql_str, args);
+    }
+
     fn doExec(self: *Client, sql_str: []const u8, args: []const Value) !ExecResult {
         self.ensurePool();
         if (self.pool) |*p| {
@@ -1358,6 +1388,11 @@ pub const Client = struct {
         return result;
     }
 
+    pub fn execCtx(self: *Client, ctx: SqlContext, sql_str: []const u8, args: []const Value) !ExecResult {
+        if (ctx.isDone()) return error.Timeout;
+        return self.exec(sql_str, args);
+    }
+
     fn doPing(self: *Client) !void {
         self.ensurePool();
         if (self.pool) |*p| {
@@ -1377,6 +1412,11 @@ pub const Client = struct {
             return err;
         };
         self.cb.?.recordSuccess();
+    }
+
+    pub fn pingCtx(self: *Client, ctx: SqlContext) !void {
+        if (ctx.isDone()) return error.Timeout;
+        return self.ping();
     }
 
     pub fn beginTx(self: *Client) !Transaction {
@@ -1411,6 +1451,11 @@ pub const Client = struct {
         return result;
     }
 
+    pub fn transactCtx(self: *Client, ctx: SqlContext, comptime T: type, fn_tx: *const fn (*Transaction) errors.ResultT(T)) errors.ResultT(T) {
+        if (ctx.isDone()) return error.Timeout;
+        return self.transact(T, fn_tx);
+    }
+
     pub fn queryRow(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
@@ -1418,11 +1463,21 @@ pub const Client = struct {
         return try rows.rows[0].scan(self.allocator, T);
     }
 
+    pub fn queryRowCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRow(T, sql_str, args);
+    }
+
     pub fn queryRowPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
         if (rows.rows.len == 0) return error.NotFound;
         return try rows.rows[0].scanPartial(self.allocator, T);
+    }
+
+    pub fn queryRowPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowPartial(T, sql_str, args);
     }
 
     pub fn queryRows(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
@@ -1439,6 +1494,11 @@ pub const Client = struct {
         return result;
     }
 
+    pub fn queryRowsCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRows(T, sql_str, args);
+    }
+
     pub fn queryRowsPartial(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
         var rows = try self.query(sql_str, args);
         defer rows.deinit();
@@ -1453,6 +1513,11 @@ pub const Client = struct {
         return result;
     }
 
+    pub fn queryRowsPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowsPartial(T, sql_str, args);
+    }
+
     pub fn deinitQueryRows(self: *Client, comptime T: type, items: []T) void {
         for (items) |item| freeScanned(self.allocator, T, item);
         self.allocator.free(items);
@@ -1464,10 +1529,20 @@ pub const Client = struct {
         return self.queryRow(T, sql, args);
     }
 
+    pub fn findOneCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findOne(T, table, where_clause, args);
+    }
+
     pub fn findOnePartial(self: *Client, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRowPartial(T, sql, args);
+    }
+
+    pub fn findOnePartialCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findOnePartial(T, table, where_clause, args);
     }
 
     pub fn findAll(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
@@ -1479,6 +1554,11 @@ pub const Client = struct {
         return self.queryRows(T, sql, args);
     }
 
+    pub fn findAllCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findAll(T, table, where_clause, args);
+    }
+
     pub fn findAllPartial(self: *Client, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
         const sql = if (where_clause) |w|
             try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s}", .{ table, w })
@@ -1486,6 +1566,11 @@ pub const Client = struct {
             try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
         defer self.allocator.free(sql);
         return self.queryRowsPartial(T, sql, args);
+    }
+
+    pub fn findAllPartialCtx(self: *Client, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findAllPartial(T, table, where_clause, args);
     }
 };
 
@@ -1498,7 +1583,17 @@ pub const Transaction = struct {
         return self.conn.query(allocator, sql_str, args);
     }
 
+    pub fn queryCtx(self: *Transaction, ctx: SqlContext, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) !Rows {
+        if (ctx.isDone()) return error.Timeout;
+        return self.conn.query(allocator, sql_str, args);
+    }
+
     pub fn exec(self: *Transaction, sql_str: []const u8, args: []const Value) !ExecResult {
+        return self.conn.exec(sql_str, args);
+    }
+
+    pub fn execCtx(self: *Transaction, ctx: SqlContext, sql_str: []const u8, args: []const Value) !ExecResult {
+        if (ctx.isDone()) return error.Timeout;
         return self.conn.exec(sql_str, args);
     }
 
@@ -1510,12 +1605,22 @@ pub const Transaction = struct {
         }
     }
 
+    pub fn commitCtx(self: *Transaction, ctx: SqlContext) !void {
+        if (ctx.isDone()) return error.Timeout;
+        return self.commit();
+    }
+
     pub fn rollback(self: *Transaction) !void {
         try self.conn.rollback();
         if (self.pool) |p| {
             p.release(self.conn);
             self.pool = null;
         }
+    }
+
+    pub fn rollbackCtx(self: *Transaction, ctx: SqlContext) !void {
+        if (ctx.isDone()) return error.Timeout;
+        return self.rollback();
     }
 };
 
@@ -1611,6 +1716,11 @@ pub const CachedConn = struct {
         return self.client.queryRow(T, sql_str, args);
     }
 
+    pub fn queryRowCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRow(T, cache_key, sql_str, args);
+    }
+
     pub fn queryRowPartial(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !T {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
@@ -1629,6 +1739,11 @@ pub const CachedConn = struct {
 
     pub fn queryRowPartialNoCache(self: *CachedConn, comptime T: type, sql_str: []const u8, args: []const Value) !T {
         return self.client.queryRowPartial(T, sql_str, args);
+    }
+
+    pub fn queryRowPartialCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowPartial(T, cache_key, sql_str, args);
     }
 
     pub fn queryRows(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
@@ -1659,6 +1774,11 @@ pub const CachedConn = struct {
         return self.client.queryRows(T, sql_str, args);
     }
 
+    pub fn queryRowsCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRows(T, cache_key, sql_str, args);
+    }
+
     pub fn queryRowsPartial(self: *CachedConn, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
         if (self.getCache(cache_key)) |cached| {
             defer self.allocator.free(cached);
@@ -1687,6 +1807,11 @@ pub const CachedConn = struct {
         return self.client.queryRowsPartial(T, sql_str, args);
     }
 
+    pub fn queryRowsPartialCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, sql_str: []const u8, args: []const Value) ![]T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.queryRowsPartial(T, cache_key, sql_str, args);
+    }
+
     pub fn exec(self: *CachedConn, cache_keys: []const []const u8, sql_str: []const u8, args: []const Value) !ExecResult {
         const result = try self.client.exec(sql_str, args);
         for (cache_keys) |key| {
@@ -1699,6 +1824,16 @@ pub const CachedConn = struct {
         return self.client.exec(sql_str, args);
     }
 
+    pub fn execCtx(self: *CachedConn, ctx: SqlContext, cache_keys: []const []const u8, sql_str: []const u8, args: []const Value) !ExecResult {
+        if (ctx.isDone()) return error.Timeout;
+        return self.exec(cache_keys, sql_str, args);
+    }
+
+    pub fn execNoCacheCtx(self: *CachedConn, ctx: SqlContext, sql_str: []const u8, args: []const Value) !ExecResult {
+        if (ctx.isDone()) return error.Timeout;
+        return self.execNoCache(sql_str, args);
+    }
+
     pub fn findOne(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: []const u8, args: []const Value) !T {
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
@@ -1709,6 +1844,16 @@ pub const CachedConn = struct {
         const sql = try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s} WHERE {s} LIMIT 1", .{ table, where_clause });
         defer self.allocator.free(sql);
         return self.queryRowNoCache(T, sql, args);
+    }
+
+    pub fn findOneCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findOne(T, cache_key, table, where_clause, args);
+    }
+
+    pub fn findOneNoCacheCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: []const u8, args: []const Value) !T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findOneNoCache(T, table, where_clause, args);
     }
 
     pub fn findAll(self: *CachedConn, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
@@ -1727,6 +1872,16 @@ pub const CachedConn = struct {
             try std.fmt.allocPrint(self.allocator, "SELECT * FROM {s}", .{table});
         defer self.allocator.free(sql);
         return self.queryRowsNoCache(T, sql, args);
+    }
+
+    pub fn findAllCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, cache_key: []const u8, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findAll(T, cache_key, table, where_clause, args);
+    }
+
+    pub fn findAllNoCacheCtx(self: *CachedConn, ctx: SqlContext, comptime T: type, table: []const u8, where_clause: ?[]const u8, args: []const Value) ![]T {
+        if (ctx.isDone()) return error.Timeout;
+        return self.findAllNoCache(T, table, where_clause, args);
     }
 
     fn getCache(self: *CachedConn, key: []const u8) ?[]const u8 {
@@ -1952,6 +2107,27 @@ test "cached conn queryRow and exec" {
     const user3 = try cached.queryRow(User, "user:1", "SELECT id, name FROM users WHERE id = ?1", &.{.{ .int = 1 }});
     defer freeScanned(allocator, User, user3);
     try std.testing.expectEqualStrings("Bob", user3.name);
+}
+
+test "sqlite context deadline" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    const User = struct { id: i64, name: []const u8 };
+
+    // Normal context should work
+    const ctx_ok = SqlContext.withTimeout(5000);
+    const user_ok = try client.queryRowCtx(ctx_ok, User, "SELECT 1 AS id, 'Alice' AS name", &.{});
+    defer freeScanned(allocator, User, user_ok);
+    try std.testing.expectEqual(@as(i64, 1), user_ok.id);
+
+    // Expired context should return Timeout
+    const ctx_expired = SqlContext.withDeadline(std.time.milliTimestamp() - 1);
+    const err = client.queryRowCtx(ctx_expired, User, "SELECT 1 AS id, 'Alice' AS name", &.{}) catch |e| e;
+    try std.testing.expectEqual(errors.Error.Timeout, err);
 }
 
 test "sqlite acceptable error does not trip breaker" {
