@@ -50,6 +50,9 @@ pub const Error = error{
 
     /// Validation error
     ValidationError,
+
+    /// Out of memory
+    OutOfMemory,
 };
 
 /// Result type alias
@@ -91,6 +94,7 @@ pub fn toCode(err: Error) Code {
         Error.NetworkError => .ServerError,
         Error.Timeout => .RequestTimeout,
         Error.ValidationError => .BadRequest,
+        Error.OutOfMemory => .ServerError,
     };
 }
 

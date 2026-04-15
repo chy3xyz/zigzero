@@ -29,6 +29,10 @@ pub const Row = struct {
         }
         return null;
     }
+
+    pub fn scan(self: Row, allocator: std.mem.Allocator, comptime T: type) !T {
+        return scanStruct(allocator, T, self);
+    }
 };
 
 /// Query results
@@ -79,6 +83,9 @@ pub const Conn = struct {
         exec: *const fn (ptr: *anyopaque, sql_str: []const u8, args: []const Value) errors.ResultT(ExecResult),
         close: *const fn (ptr: *anyopaque) void,
         ping: *const fn (ptr: *anyopaque) errors.Result,
+        begin: *const fn (ptr: *anyopaque) errors.Result,
+        commit: *const fn (ptr: *anyopaque) errors.Result,
+        rollback: *const fn (ptr: *anyopaque) errors.Result,
     };
 
     pub fn query(self: Conn, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) errors.ResultT(Rows) {
@@ -96,7 +103,72 @@ pub const Conn = struct {
     pub fn ping(self: Conn) errors.Result {
         return self.vtable.ping(self.ptr);
     }
+
+    pub fn begin(self: Conn) errors.Result {
+        return self.vtable.begin(self.ptr);
+    }
+
+    pub fn commit(self: Conn) errors.Result {
+        return self.vtable.commit(self.ptr);
+    }
+
+    pub fn rollback(self: Conn) errors.Result {
+        return self.vtable.rollback(self.ptr);
+    }
 };
+
+// ==================== Struct Scanning ====================
+
+fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row) !T {
+    const info = @typeInfo(T);
+    if (info != .@"struct") @compileError("scanStruct only supports structs, got " ++ @typeName(T));
+
+    var result: T = undefined;
+    inline for (info.@"struct".fields) |field| {
+        const val = row.get(field.name);
+        const FieldType = field.type;
+
+        if (@typeInfo(FieldType) == .optional) {
+            const ChildType = @typeInfo(FieldType).optional.child;
+            if (val == null or val.? == .null) {
+                @field(result, field.name) = null;
+            } else {
+                @field(result, field.name) = try valueToType(allocator, ChildType, val.?);
+            }
+        } else {
+            if (val == null or val.? == .null) return error.NotFound;
+            @field(result, field.name) = try valueToType(allocator, FieldType, val.?);
+        }
+    }
+    return result;
+}
+
+fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
+    return switch (T) {
+        i64 => if (val == .int) val.int else error.DatabaseError,
+        i32 => if (val == .int) @intCast(val.int) else error.DatabaseError,
+        u64 => if (val == .int) @intCast(val.int) else error.DatabaseError,
+        u32 => if (val == .int) @intCast(val.int) else error.DatabaseError,
+        f64 => if (val == .float) val.float else if (val == .int) @floatFromInt(val.int) else error.DatabaseError,
+        f32 => if (val == .float) @floatCast(val.float) else if (val == .int) @floatFromInt(val.int) else error.DatabaseError,
+        bool => if (val == .bool) val.bool else if (val == .int) val.int != 0 else error.DatabaseError,
+        []const u8 => if (val == .string) (allocator.dupe(u8, val.string) catch return error.DatabaseError) else error.DatabaseError,
+        else => @compileError("Unsupported scan type: " ++ @typeName(T)),
+    };
+}
+
+pub fn freeScanned(allocator: std.mem.Allocator, comptime T: type, val: T) void {
+    const info = @typeInfo(T);
+    if (info != .@"struct") return;
+    inline for (info.@"struct".fields) |field| {
+        const FieldType = field.type;
+        if (FieldType == []const u8) {
+            allocator.free(@field(val, field.name));
+        } else if (@typeInfo(FieldType) == .optional and @typeInfo(FieldType).optional.child == []const u8) {
+            if (@field(val, field.name)) |s| allocator.free(s);
+        }
+    }
+}
 
 // ==================== SQLite Implementation ====================
 
@@ -205,6 +277,24 @@ pub const SQLiteConn = struct {
         if (self.db == null) return error.DatabaseError;
     }
 
+    fn beginFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        const rc = sqlite3_c.sqlite3_exec(self.db, "BEGIN", null, null, null);
+        if (rc != sqlite3_c.SQLITE_OK) return error.DatabaseError;
+    }
+
+    fn commitFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        const rc = sqlite3_c.sqlite3_exec(self.db, "COMMIT", null, null, null);
+        if (rc != sqlite3_c.SQLITE_OK) return error.DatabaseError;
+    }
+
+    fn rollbackFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*SQLiteConn, @ptrCast(@alignCast(ptr)));
+        const rc = sqlite3_c.sqlite3_exec(self.db, "ROLLBACK", null, null, null);
+        if (rc != sqlite3_c.SQLITE_OK) return error.DatabaseError;
+    }
+
     pub fn toConn(self: *SQLiteConn) Conn {
         return .{
             .ptr = self,
@@ -213,6 +303,9 @@ pub const SQLiteConn = struct {
                 .exec = execFn,
                 .close = closeFn,
                 .ping = pingFn,
+                .begin = beginFn,
+                .commit = commitFn,
+                .rollback = rollbackFn,
             },
         };
     }
@@ -377,6 +470,27 @@ pub const PostgresConn = struct {
         if (self.conn == null or libpq_c.PQstatus(self.conn) != libpq_c.ConnStatusType.CONNECTION_OK) return error.DatabaseError;
     }
 
+    fn beginFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        const res = libpq_c.PQexec(self.conn, "BEGIN");
+        defer libpq_c.PQclear(res);
+        if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
+    }
+
+    fn commitFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        const res = libpq_c.PQexec(self.conn, "COMMIT");
+        defer libpq_c.PQclear(res);
+        if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
+    }
+
+    fn rollbackFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*PostgresConn, @ptrCast(@alignCast(ptr)));
+        const res = libpq_c.PQexec(self.conn, "ROLLBACK");
+        defer libpq_c.PQclear(res);
+        if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
+    }
+
     pub fn toConn(self: *PostgresConn) Conn {
         return .{
             .ptr = self,
@@ -385,6 +499,9 @@ pub const PostgresConn = struct {
                 .exec = execFn,
                 .close = closeFn,
                 .ping = pingFn,
+                .begin = beginFn,
+                .commit = commitFn,
+                .rollback = rollbackFn,
             },
         };
     }
@@ -534,6 +651,27 @@ pub const MySqlConn = struct {
         if (self.mysql == null) return error.DatabaseError;
     }
 
+    fn beginFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        if (libmysql_c.mysql_real_query(self.mysql, "START TRANSACTION", 17) != 0) return error.DatabaseError;
+        _ = libmysql_c.mysql_store_result(self.mysql);
+        libmysql_c.mysql_free_result(libmysql_c.mysql_store_result(self.mysql));
+    }
+
+    fn commitFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        if (libmysql_c.mysql_real_query(self.mysql, "COMMIT", 6) != 0) return error.DatabaseError;
+        _ = libmysql_c.mysql_store_result(self.mysql);
+        libmysql_c.mysql_free_result(libmysql_c.mysql_store_result(self.mysql));
+    }
+
+    fn rollbackFn(ptr: *anyopaque) errors.Result {
+        const self = @as(*MySqlConn, @ptrCast(@alignCast(ptr)));
+        if (libmysql_c.mysql_real_query(self.mysql, "ROLLBACK", 8) != 0) return error.DatabaseError;
+        _ = libmysql_c.mysql_store_result(self.mysql);
+        libmysql_c.mysql_free_result(libmysql_c.mysql_store_result(self.mysql));
+    }
+
     pub fn toConn(self: *MySqlConn) Conn {
         return .{
             .ptr = self,
@@ -542,6 +680,9 @@ pub const MySqlConn = struct {
                 .exec = execFn,
                 .close = closeFn,
                 .ping = pingFn,
+                .begin = beginFn,
+                .commit = commitFn,
+                .rollback = rollbackFn,
             },
         };
     }
@@ -626,35 +767,64 @@ pub const Client = struct {
     }
 
     pub fn beginTx(self: *Client) !Transaction {
-        _ = self;
-        return error.NotImplemented;
+        if (self.conn == null) try self.connect();
+        try self.conn.?.begin();
+        return Transaction{ .conn = self.conn.? };
+    }
+
+    pub fn transact(self: *Client, comptime T: type, fn_tx: *const fn (*Transaction) errors.ResultT(T)) errors.ResultT(T) {
+        var tx = try self.beginTx();
+        errdefer tx.rollback() catch {};
+        const result = try fn_tx(&tx);
+        try tx.commit();
+        return result;
+    }
+
+    pub fn queryRow(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) !T {
+        var rows = try self.query(sql_str, args);
+        defer rows.deinit();
+        if (rows.rows.len == 0) return error.NotFound;
+        return try rows.rows[0].scan(self.allocator, T);
+    }
+
+    pub fn queryRows(self: *Client, comptime T: type, sql_str: []const u8, args: []const Value) ![]T {
+        var rows = try self.query(sql_str, args);
+        defer rows.deinit();
+        const result = try self.allocator.alloc(T, rows.rows.len);
+        errdefer {
+            for (result) |item| freeScanned(self.allocator, T, item);
+            self.allocator.free(result);
+        }
+        for (rows.rows, 0..) |row, i| {
+            result[i] = try row.scan(self.allocator, T);
+        }
+        return result;
+    }
+
+    pub fn deinitQueryRows(self: *Client, comptime T: type, items: []T) void {
+        for (items) |item| freeScanned(self.allocator, T, item);
+        self.allocator.free(items);
     }
 };
 
-/// SQL transaction (stub)
+/// SQL transaction
 pub const Transaction = struct {
-    pub fn query(self: *Transaction, sql_str: []const u8, args: []const Value) !Rows {
-        _ = self;
-        _ = sql_str;
-        _ = args;
-        return error.NotImplemented;
+    conn: Conn,
+
+    pub fn query(self: *Transaction, allocator: std.mem.Allocator, sql_str: []const u8, args: []const Value) !Rows {
+        return self.conn.query(allocator, sql_str, args);
     }
 
     pub fn exec(self: *Transaction, sql_str: []const u8, args: []const Value) !ExecResult {
-        _ = self;
-        _ = sql_str;
-        _ = args;
-        return error.NotImplemented;
+        return self.conn.exec(sql_str, args);
     }
 
     pub fn commit(self: *Transaction) !void {
-        _ = self;
-        return error.NotImplemented;
+        return self.conn.commit();
     }
 
     pub fn rollback(self: *Transaction) !void {
-        _ = self;
-        return error.NotImplemented;
+        return self.conn.rollback();
     }
 };
 
@@ -662,6 +832,11 @@ pub const Transaction = struct {
 pub const Builder = struct {
     allocator: std.mem.Allocator,
     table: []const u8,
+    select_columns: ?[][]const u8 = null,
+    where_clauses: ?[][]const u8 = null,
+    order_by_clause: ?[]const u8 = null,
+    limit_val: ?usize = null,
+    offset_val: ?usize = null,
 
     pub fn init(allocator: std.mem.Allocator, table: []const u8) Builder {
         return .{
@@ -670,19 +845,100 @@ pub const Builder = struct {
         };
     }
 
-    pub fn select(self: *const Builder, columns: []const []const u8) ![]u8 {
-        var buf: [1024]u8 = undefined;
-        var fbs = std.io.fixedBufferStream(&buf);
-        const writer = fbs.writer();
-
-        try writer.writeAll("SELECT ");
-        for (columns, 0..) |col, i| {
-            if (i > 0) try writer.writeAll(", ");
-            try writer.writeAll(col);
+    pub fn deinit(self: *Builder) void {
+        if (self.select_columns) |cols| self.allocator.free(cols);
+        if (self.where_clauses) |wheres| {
+            for (wheres) |clause| self.allocator.free(clause);
+            self.allocator.free(wheres);
         }
-        try writer.print(" FROM {s}", .{self.table});
+        if (self.order_by_clause) |o| self.allocator.free(o);
+    }
 
-        return self.allocator.dupe(u8, fbs.getWritten());
+    pub fn selectColumns(self: *Builder, columns: []const []const u8) *Builder {
+        if (self.select_columns) |cols| self.allocator.free(cols);
+        self.select_columns = self.allocator.dupe([]const u8, columns) catch null;
+        return self;
+    }
+
+    pub fn where(self: *Builder, clause: []const u8) *Builder {
+        const new_clause = self.allocator.dupe(u8, clause) catch return self;
+        if (self.where_clauses) |wheres| {
+            const new_w = self.allocator.realloc(wheres, wheres.len + 1) catch {
+                self.allocator.free(new_clause);
+                return self;
+            };
+            new_w[new_w.len - 1] = new_clause;
+            self.where_clauses = new_w;
+        } else {
+            self.where_clauses = self.allocator.alloc([]const u8, 1) catch {
+                self.allocator.free(new_clause);
+                return self;
+            };
+            self.where_clauses.?[0] = new_clause;
+        }
+        return self;
+    }
+
+    pub fn orderBy(self: *Builder, clause: []const u8) *Builder {
+        if (self.order_by_clause) |o| self.allocator.free(o);
+        self.order_by_clause = self.allocator.dupe(u8, clause) catch null;
+        return self;
+    }
+
+    pub fn limit(self: *Builder, n: usize) *Builder {
+        self.limit_val = n;
+        return self;
+    }
+
+    pub fn offset(self: *Builder, n: usize) *Builder {
+        self.offset_val = n;
+        return self;
+    }
+
+    pub fn toSql(self: *const Builder) ![]u8 {
+        var buf: std.ArrayList(u8) = .{};
+        defer buf.deinit(self.allocator);
+        const w = buf.writer(self.allocator);
+
+        if (self.select_columns) |cols| {
+            try w.writeAll("SELECT ");
+            for (cols, 0..) |col, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.writeAll(col);
+            }
+            try std.fmt.format(w, " FROM {s}", .{self.table});
+        } else {
+            try std.fmt.format(w, "SELECT * FROM {s}", .{self.table});
+        }
+
+        if (self.where_clauses) |wheres| {
+            try w.writeAll(" WHERE ");
+            for (wheres, 0..) |clause, i| {
+                if (i > 0) try w.writeAll(" AND ");
+                try w.writeAll(clause);
+            }
+        }
+
+        if (self.order_by_clause) |o| {
+            try std.fmt.format(w, " ORDER BY {s}", .{o});
+        }
+
+        if (self.limit_val) |n| {
+            try std.fmt.format(w, " LIMIT {d}", .{n});
+        }
+
+        if (self.offset_val) |n| {
+            try std.fmt.format(w, " OFFSET {d}", .{n});
+        }
+
+        return self.allocator.dupe(u8, buf.items);
+    }
+
+    pub fn select(self: *const Builder, columns: []const []const u8) ![]u8 {
+        var b = Builder.init(self.allocator, self.table);
+        b.select_columns = self.allocator.dupe([]const u8, columns) catch return error.DatabaseError;
+        defer b.deinit();
+        return b.toSql();
     }
 
     pub fn insert(self: *const Builder, columns: []const []const u8) ![]u8 {
@@ -748,6 +1004,106 @@ test "sqlx builder" {
     const insert_sql = try b.insert(&.{ "name", "email" });
     defer allocator.free(insert_sql);
     try std.testing.expectEqualStrings("INSERT INTO users (name, email) VALUES (?1, ?2)", insert_sql);
+}
+
+test "sqlx builder chainable" {
+    const allocator = std.testing.allocator;
+    var b = Builder.init(allocator, "users");
+    defer b.deinit();
+
+    const sql = try b.selectColumns(&.{ "id", "name" })
+        .where("id = ?1")
+        .where("name = ?2")
+        .orderBy("id DESC")
+        .limit(10)
+        .offset(20)
+        .toSql();
+    defer allocator.free(sql);
+
+    try std.testing.expectEqualStrings("SELECT id, name FROM users WHERE id = ?1 AND name = ?2 ORDER BY id DESC LIMIT 10 OFFSET 20", sql);
+}
+
+test "sqlite transaction commit" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    var tx = try client.beginTx();
+    const insert = try tx.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Bob" }});
+    try std.testing.expectEqual(@as(u64, 1), insert.rows_affected);
+    try tx.commit();
+
+    var rows = try client.query("SELECT name FROM users WHERE name = ?1", &.{.{ .string = "Bob" }});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+}
+
+test "sqlite transaction rollback" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    var tx = try client.beginTx();
+    _ = try tx.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Charlie" }});
+    try tx.rollback();
+
+    var rows = try client.query("SELECT name FROM users WHERE name = ?1", &.{.{ .string = "Charlie" }});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 0), rows.rows.len);
+}
+
+test "sqlite queryRow and queryRows struct scan" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Alice" }});
+    _ = try client.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "Bob" }});
+
+    const User = struct {
+        id: i64,
+        name: []const u8,
+    };
+
+    const user = try client.queryRow(User, "SELECT id, name FROM users WHERE name = ?1", &.{.{ .string = "Alice" }});
+    defer freeScanned(allocator, User, user);
+    try std.testing.expectEqual(@as(i64, 1), user.id);
+    try std.testing.expectEqualStrings("Alice", user.name);
+
+    const users = try client.queryRows(User, "SELECT id, name FROM users ORDER BY id", &.{});
+    defer client.deinitQueryRows(User, users);
+    try std.testing.expectEqual(@as(usize, 2), users.len);
+    try std.testing.expectEqualStrings("Alice", users[0].name);
+    try std.testing.expectEqualStrings("Bob", users[1].name);
+}
+
+test "sqlite transact helper" {
+    const allocator = std.testing.allocator;
+    var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = ":memory:" });
+    defer client.deinit();
+
+    try client.connect();
+    _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
+
+    const affected = try client.transact(u64, struct {
+        fn doTx(tx: *Transaction) errors.ResultT(u64) {
+            const r = try tx.exec("INSERT INTO users (name) VALUES (?1)", &.{.{ .string = "TxUser" }});
+            return r.rows_affected;
+        }
+    }.doTx);
+    try std.testing.expectEqual(@as(u64, 1), affected);
+
+    var rows = try client.query("SELECT name FROM users WHERE name = ?1", &.{.{ .string = "TxUser" }});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
 }
 
 test "sqlx value" {
