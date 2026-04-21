@@ -15,7 +15,8 @@ const http = zigzero.http;
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
-    io_instance.io = init.io;
+    // io_instance.io is set by Server.start() internally
+    // (the async runtime sets io_instance.io to threaded.io())
     io_instance.allocator = allocator;
 
     // Initialize logger

@@ -3,7 +3,7 @@
 **Zero-cost microservice framework for Zig, aligned with go-zero patterns.**
 
 [![CI](https://github.com/knot3bot/zigzero/actions/workflows/ci.yml/badge.svg)](https://github.com/knot3bot/zigzero/actions)
-[![Zig](https://img.shields.io/badge/Zig-0.15.2+-blue.svg)](https://ziglang.org/)
+[![Zig](https://img.shields.io/badge/Zig-0.16.0+-blue.svg)](https://ziglang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## Overview
@@ -96,7 +96,7 @@ pub fn main() !void {
 
 ### Requirements
 
-- **Zig**: 0.15.2 or later
+- **Zig**: 0.16.0 or later
 - **OS**: macOS, Linux, or other Unix-like systems
 - **Optional**: C libraries for `sqlx` module (see below)
 

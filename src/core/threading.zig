@@ -120,17 +120,22 @@ test "routine group" {
 test "task runner" {
     const Ctx = struct {
         var count: std.atomic.Value(usize) = std.atomic.Value(usize).init(0);
+        var started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
     };
     Ctx.count.store(0, .monotonic);
+    Ctx.started.store(false, .monotonic);
 
     var runner = TaskRunner.init(2);
     try runner.run(struct {
         fn f() void {
+            Ctx.started.store(true, .monotonic);
             _ = @atomicRmw(usize, &Ctx.count.raw, .Add, 1, .monotonic);
         }
     }.f);
 
-    // Give thread time to start
-    std.Thread.yield() catch {};
+    // Wait for thread to actually start
+    while (!Ctx.started.load(.monotonic)) {
+        std.Thread.yield() catch {};
+    }
     try std.testing.expectEqual(@as(usize, 1), Ctx.count.load(.monotonic));
 }

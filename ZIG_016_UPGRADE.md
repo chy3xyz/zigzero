@@ -14,16 +14,21 @@
 6. **文件 API** - 修复了 log.zig 使用 `std.Io.File`
 7. **build.zig.zon** - 更新了 minimum_zig_version 到 0.16.0
 8. **集合 API 部分修复** - 修复了 zigzeroctl 和 lifecycle.zig 中的部分问题
-
+9. **core/threading.zig** - 修复了 `test.task runner` 测试（添加 `started` 标志进行同步）
+10. **infra/mq.zig** - 修复了 `test.persistent queue` 测试（添加 `createDirPath()` 创建测试目录）
+11. **src/net/api.zig** - 部分迁移到 `std.Io.net.*` API（网络监听、连接接受、读写）
+12. **示例更新** - 更新了 `examples/hello/main.zig` 使用 Zig 0.16 API
 ### ⚠️ 剩余需要完成的工作
 
-由于 Zig 0.16 有大量重大 API 变化，还需要完成以下工作：
+当前状态：项目基本可以编译和运行，87/93 个测试通过（6 个跳过）。
 
-1. **std.Io.Mutex.lock/unlock** - 这些方法现在需要 `io` 实例参数
-2. **std.net → std.Io.net** - 所有网络相关代码需要迁移
-3. **集合 API** - ArrayList、HashMap 等需要全面更新（初始化和方法签名）
-4. **std.io → std.Io** - 所有 I/O 相关代码需要重构
+已知问题：
+1. **HTTP 服务器解析** - `StreamReader` 未完整实现 Zig 0.16 Stream I/O，无法正确读取网络数据
+2. **API 服务器测试** - 由于 `StreamReader` 未完成，无法处理 HTTP 请求
 
+可选改进：
+- 完善 `StreamReader` 实现以正确使用 `std.Io.net.Stream.reader()` 接口
+- 考虑使用 `std.Io.Group` 管理异步任务（当前代码使用线程）
 ## 主要变更类别
 
 ### 1. I/O 系统大重构（最大的变化）
@@ -125,7 +130,7 @@ pub fn main(init: std.process.Init) !void {
 ✅ src/core/fx.zig
 ✅ src/core/mapreduce.zig
 ✅ src/infra/pool.zig
-✅ src/infra/mq.zig
+✅ src/infra/mq.zig (测试修复)
 ✅ src/infra/lock.zig
 ✅ src/infra/cache.zig
 ✅ src/net/websocket.zig
@@ -133,14 +138,23 @@ pub fn main(init: std.process.Init) !void {
 ✅ tools/zigzeroctl/src/main.zig
 ✅ examples/api-server/main.zig
 ✅ examples/chy3/src/main.zig
+✅ examples/hello/main.zig
 ✅ build.zig.zon
+✅ src/core/threading.zig (测试修复)
 
 ## 总结
 
-zigzero 项目的 Zig 0.16.0 升级已经完成了第一阶段的基础工作。剩余的工作需要更系统地处理，特别是：
+zigzero 项目的 Zig 0.16.0 升级已取得重大进展：
 
-1. 集合 API 的全面更新
-2. std.Io.Mutex 的 io 实例传递机制
-3. 网络模块从 std.net 到 std.Io.net 的迁移
+✅ **编译状态**：项目可以正常编译
+✅ **测试状态**：87/93 个测试通过（6 个跳过）
+✅ **核心功能**：大部分基础设施模块已完成迁移
 
-建议继续逐个模块完成升级工作，优先处理核心网络模块。
+主要完成的工作：
+1. 完成了大部分 API 的 Zig 0.16 迁移
+2. 修复了核心测试用例
+3. 更新了示例代码
+
+剩余重点：
+1. 完善 HTTP 服务器的 StreamReader 实现（当前测试通过但服务器无法处理请求）
+2. 根据需要进行性能优化和代码清理

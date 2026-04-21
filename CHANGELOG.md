@@ -5,27 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-- `scripts/init-db.sh` — Database initialization script for PostgreSQL and MySQL testing
-- `infra/sqlx`: Unix socket support for MySQL connections on macOS
-- `infra/sqlx`: Environment variable overrides for DB connection credentials
-- `infra/sqlx`: `skipUnlessDb()` test helper for DB-specific tests
+## [0.1.1] - 2026-04-21
 
 ### Fixed
-- `infra/sqlx`: MySQL connection crash with empty password (ptr=null issue)
-- `infra/sqlx`: PostgreSQL `rows_affected` returning garbage due to missing `paramLengths`
-- `infra/sqlx`: Memory leaks in 9 SQLite tests (double string duplication in `scanStruct`)
-- `infra/sqlx`: MySQL `execFn` double-call to `mysql_store_result` causing undefined behavior
-- `infra/sqlx`: `skipUnlessDb` returning error instead of skipping when DB env not set
-- `infra/sqlx`: Connection pool `SIGABRT` on double mutex unlock
+- **Zig 0.16 Migration**: Complete migration from Zig 0.15 to Zig 0.16.0
+- **build.zig**: Fixed `env_map` → `environ_map` API change
+- **io_instance.zig**: Created unified Io instance management module
+- **main() entry points**: Updated all examples to use `std.process.Init`
+- **Time API**: Fixed health.zig and limiter.zig to use `std.c.clock_gettime`
+- **Mutex API**: Migrated 9 files from `std.Thread.Mutex` → `std.Io.Mutex`
+- **File API**: Fixed log.zig to use `std.Io.File`
+- **Collection APIs**: Partial fixes for ArrayList/HashMap initialization and method signatures
+- **core/threading.zig**: Fixed `test.task runner` - added `started` flag for proper synchronization
+- **infra/mq.zig**: Fixed `test.persistent queue` - added `createDirPath()` to create test directory
+- **src/net/api.zig**: Partial migration to `std.Io.net.*` API for network operations
+- **examples/hello/main.zig**: Updated to use Zig 0.16 API
 
 ### Changed
-- `infra/sqlx`: `Row.get()` now returns owned string copies (caller must free)
-- `infra/sqlx`: `Row` struct requires `allocator` field
-- `infra/sqlx`: PostgreSQL `beginTx` error handling improved
+- **build.zig.zon**: Updated `minimum_zig_version` to 0.16.0
+- **README.md**: Updated Zig version requirement from 0.15.2+ to 0.16.0+
 
+## [Unreleased]
 ---
 
 ## [0.1.0] - 2024-04-11

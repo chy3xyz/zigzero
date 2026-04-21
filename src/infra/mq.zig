@@ -169,7 +169,9 @@ pub const PersistentQueue = struct {
     mutex: std.Io.Mutex,
 
     pub fn init(allocator: std.mem.Allocator, data_dir: []const u8, queue_name: []const u8) !PersistentQueue {
-        // makePath removed for Zig 0.16 catch {};
+        // Ensure data directory exists
+        std.Io.Dir.cwd().createDirPath(io_instance.io, data_dir) catch {};
+
 
         const log_path = try std.fs.path.join(allocator, &.{ data_dir, queue_name });
         defer allocator.free(log_path);

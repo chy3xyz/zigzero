@@ -678,7 +678,9 @@ const ResponseWriter = struct {
         try w.writeAll("\r\n");
         try w.writeAll(body);
 
-        _ = try stream.write(buf.items);
+        var io_buffer: [4096]u8 = undefined;
+        var stream_writer = stream.writer(io_instance.io, &io_buffer);
+        try stream_writer.writeAll(buf.items);
     }
 };
 
@@ -869,13 +871,13 @@ pub const Server = struct {
 
         var parser = RequestParser.init(arena_alloc);
         var request = parser.parse(&stream_reader, self.max_body_size) catch |err| {
-            const err_msg = std.fmt.allocPrint(arena_alloc, "Parse error: {any}", .{err}) catch "Parse error";
-            self.logger.err(err_msg);
             const status: u16 = if (err == error.BodyTooLarge) 413 else 400;
             const msg = if (err == error.BodyTooLarge) "Payload Too Large" else "Bad Request";
-            const response = std.fmt.allocPrint(arena_alloc, "HTTP/1.1 {d} {s}\r\n\r\n", .{ status, msg }) catch return;
-            // TODO: Zig 0.16 Stream I/O
-            _ = response;
+
+            // Write error response directly to stream
+            var io_buffer: [4096]u8 = undefined;
+            var stream_writer = conn.writer(io_instance.io, &io_buffer);
+            stream_writer.interface.print("HTTP/1.1 {d} {s}\r\n\r\n{s}", .{ status, msg, msg }) catch {};
             return;
         };
         defer request.deinit(arena_alloc);
