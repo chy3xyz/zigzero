@@ -3,13 +3,7 @@
 //! Provides health check endpoints and probes.
 
 const std = @import("std");
-
-// Helper function for getting millisecond timestamp in Zig 0.16
-fn milliTimestamp() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    return ts.sec * 1000 + @divFloor(ts.nsec, 1000000);
-}
+const compat = @import("../compat.zig");
 
 /// Health status
 pub const Status = enum {
@@ -30,7 +24,7 @@ pub const Result = struct {
             .name = name,
             .status = status,
             .message = null,
-            .timestamp = milliTimestamp(),
+            .timestamp = compat.milliTimestamp(),
         };
     }
 
@@ -80,7 +74,7 @@ pub const Registry = struct {
                     .name = entry.key_ptr.*,
                     .status = .unhealthy,
                     .message = @errorName(err),
-                    .timestamp = milliTimestamp(),
+                    .timestamp = compat.milliTimestamp(),
                 };
             };
             try results.put(entry.key_ptr.*, result);
@@ -128,6 +122,40 @@ test "health registry" {
 
     try registry.register("memory", checks.memory);
     try registry.register("disk", checks.disk);
+
+    const status = try registry.overall();
+    try std.testing.expectEqual(Status.healthy, status);
+}
+
+
+test "health check result with message" {
+    var r = Result.init("test", .degraded);
+    r = r.withMessage("high latency");
+    try std.testing.expectEqualStrings("test", r.name);
+    try std.testing.expectEqual(Status.degraded, r.status);
+    try std.testing.expectEqualStrings("high latency", r.message.?);
+    try std.testing.expect(r.timestamp > 0);
+}
+
+test "health registry catches checker errors" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
+
+    const failingChecker = struct {
+        fn check(allocator: std.mem.Allocator) !Result {
+            _ = allocator;
+            return error.SimulatedFailure;
+        }
+    }.check;
+
+    try registry.register("failing", failingChecker);
+    const status = try registry.overall();
+    try std.testing.expectEqual(Status.unhealthy, status);
+}
+
+test "health registry empty is healthy" {
+    var registry = Registry.init(std.testing.allocator);
+    defer registry.deinit();
 
     const status = try registry.overall();
     try std.testing.expectEqual(Status.healthy, status);

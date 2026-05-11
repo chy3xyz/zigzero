@@ -3,16 +3,9 @@
 //! Provides structured logging with levels, rotation, and async support.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const config = @import("../config.zig");
 const errors = @import("../core/errors.zig");
-const io_instance = @import("../io_instance.zig");
-
-// Helper function for getting timestamp in Zig 0.16
-fn timestamp() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    return ts.sec;
-}
 
 /// Log level enum
 pub const Level = enum(u8) {
@@ -64,20 +57,18 @@ pub const Entry = struct {
 /// File logger with rotation
 pub const FileLogger = struct {
     allocator: std.mem.Allocator,
-    io: std.Io,
     path: []const u8,
     max_size: u64,
     max_backups: u32,
     current_size: u64,
     file: ?std.Io.File,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_size: u64, max_backups: u32) !FileLogger {
-        const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = false, .read = true }) catch null;
-        const current_size = if (file) |f| f.getEndPos(io) catch 0 else 0;
+    pub fn init(allocator: std.mem.Allocator, path: []const u8, max_size: u64, max_backups: u32) !FileLogger {
+        const file = compat.cwd().createFile(path, .{ .truncate = false, .read = true }) catch null;
+        const current_size = if (file) |f| f.getEndPos() catch 0 else 0;
 
         return .{
             .allocator = allocator,
-            .io = io,
             .path = try allocator.dupe(u8, path),
             .max_size = max_size,
             .max_backups = max_backups,
@@ -87,7 +78,7 @@ pub const FileLogger = struct {
     }
 
     pub fn deinit(self: *FileLogger) void {
-        if (self.file) |f| f.close(self.io);
+        if (self.file) |f| f.close();
         self.allocator.free(self.path);
     }
 
@@ -97,15 +88,15 @@ pub const FileLogger = struct {
         }
 
         if (self.file) |f| {
-            try f.writeStreamingAll(self.io, msg);
+            try compat.fileWrite(f, msg);
             self.current_size += msg.len;
-            try f.sync(self.io);
+            try f.sync(compat.io());
         }
     }
 
     fn rotate(self: *FileLogger) !void {
         if (self.file) |f| {
-            f.close(self.io);
+            f.close(compat.io());
             self.file = null;
         }
 
@@ -117,14 +108,14 @@ pub const FileLogger = struct {
             const new_path = try std.fmt.allocPrint(self.allocator, "{s}.{d}", .{ self.path, i });
             defer self.allocator.free(new_path);
 
-            std.Io.Dir.cwd().rename(old_path, std.Io.Dir.cwd(), new_path, self.io) catch {};
+            compat.cwd().rename(old_path, compat.cwd(), new_path, compat.io()) catch {};
         }
 
         const backup_path = try std.fmt.allocPrint(self.allocator, "{s}.1", .{self.path});
         defer self.allocator.free(backup_path);
-        std.Io.Dir.cwd().rename(self.path, std.Io.Dir.cwd(), backup_path, self.io) catch {};
+        compat.cwd().rename(self.path, compat.cwd(), backup_path, compat.io()) catch {};
 
-        self.file = try std.Io.Dir.cwd().createFile(self.io, self.path, .{});
+        self.file = try compat.cwd().createFile(compat.io(), self.path, .{});
         self.current_size = 0;
     }
 };
@@ -156,10 +147,10 @@ pub const Logger = struct {
     }
 
     /// Create a logger with file output
-    pub fn withFile(self: Logger, allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_size: u64, max_backups: u32) !Logger {
+    pub fn withFile(self: Logger, allocator: std.mem.Allocator, path: []const u8, max_size: u64, max_backups: u32) !Logger {
         var logger = self;
         logger.mode = .both;
-        logger.file_logger = try FileLogger.init(allocator, io, path, max_size, max_backups);
+        logger.file_logger = try FileLogger.init(allocator, path, max_size, max_backups);
         return logger;
     }
 
@@ -198,18 +189,38 @@ pub const Logger = struct {
         }
     }
 
-    /// Internal log function
+    /// Internal log function. Uses a stack buffer for the common case to avoid
+    /// page_allocator churn in the hot path.
     fn log(self: *const Logger, level: Level, msg: []const u8) void {
-        const ts = timestamp();
-        const formatted = if (self.encoding == .json)
-            formatJson(std.heap.page_allocator, ts, self.service_name, level, msg) catch return
+        const timestamp = compat.timestamp();
+
+        // Fast path: try to format into a stack buffer to avoid allocation.
+        var stack_buf: [4096]u8 = undefined;
+        const result = if (self.encoding == .json)
+            std.fmt.bufPrint(&stack_buf, "{{\"timestamp\":{d},\"level\":\"{s}\",\"service\":\"{s}\",\"message\":\"{s}\"}}\n", .{
+                timestamp,
+                level.toString(),
+                self.service_name,
+                msg,
+            })
         else
-            std.fmt.allocPrint(std.heap.page_allocator, "[{d}] [{s}] [{s}] {s}\n", .{ ts, self.service_name, level.toString(), msg }) catch return;
-        defer std.heap.page_allocator.free(formatted);
+            std.fmt.bufPrint(&stack_buf, "[{d}] [{s}] [{s}] {s}\n", .{ timestamp, self.service_name, level.toString(), msg });
+
+        const formatted: []const u8 = result catch |fmt_err| switch (fmt_err) {
+            error.NoSpaceLeft => blk: {
+                // Slow path: message is huge, fall back to page_allocator.
+                const alloced = if (self.encoding == .json)
+                    formatJson(std.heap.page_allocator, timestamp, self.service_name, level, msg) catch return
+                else
+                    std.fmt.allocPrint(std.heap.page_allocator, "[{d}] [{s}] [{s}] {s}\n", .{ timestamp, self.service_name, level.toString(), msg }) catch return;
+                break :blk alloced;
+            },
+        };
+        defer if (@intFromPtr(formatted.ptr) != @intFromPtr(&stack_buf[0])) std.heap.page_allocator.free(formatted);
 
         if (self.mode == .console or self.mode == .both) {
-const stdout = std.Io.File.stdout();
-            stdout.writeStreamingAll(io_instance.io, formatted) catch return;
+            const stdout = compat.stdout();
+            compat.fileWrite(stdout, formatted) catch return;
         }
 
         const fl_ptr = @constCast(&self.file_logger);
@@ -221,9 +232,9 @@ const stdout = std.Io.File.stdout();
     }
 };
 
-fn formatJson(allocator: std.mem.Allocator, ts: i64, service: []const u8, level: Level, msg: []const u8) ![]u8 {
+fn formatJson(allocator: std.mem.Allocator, timestamp: i64, service: []const u8, level: Level, msg: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{{\"timestamp\":{d},\"level\":\"{s}\",\"service\":\"{s}\",\"message\":\"{s}\"}}\n", .{
-        ts,
+        timestamp,
         level.toString(),
         service,
         msg,

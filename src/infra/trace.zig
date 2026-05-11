@@ -3,7 +3,7 @@
 //! Provides OpenTelemetry-compatible distributed tracing.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const log = @import("log.zig");
 
 /// Trace ID
@@ -38,7 +38,7 @@ pub const Span = struct {
             .span_id = span_id,
             .parent_span_id = parent_id,
             .name = try allocator.dupe(u8, name),
-            .start_time = io_instance.millis(),
+            .start_time = compat.milliTimestamp(),
             .attributes = std.StringHashMap([]const u8).init(allocator),
             .allocator = allocator,
         };
@@ -64,7 +64,7 @@ pub const Span = struct {
 
     /// End the span
     pub fn end(self: *Span) void {
-        self.end_time = io_instance.millis();
+        self.end_time = compat.milliTimestamp();
     }
 
     /// Set span status
@@ -74,7 +74,7 @@ pub const Span = struct {
 
     /// Get duration in milliseconds
     pub fn getDurationMs(self: *const Span) i64 {
-        const end_time = self.end_time orelse io_instance.millis();
+        const end_time = self.end_time orelse compat.milliTimestamp();
         return end_time - self.start_time;
     }
 
@@ -159,16 +159,17 @@ pub const Tracer = struct {
     }
 };
 
+/// Generate random trace ID
 fn generateTraceId() TraceId {
     var id: TraceId = undefined;
-    std.Io.random(io_instance.io, &id);
+    compat.randomBytes(&id);
     return id;
 }
 
 /// Generate random span ID
 fn generateSpanId() SpanId {
     var id: SpanId = undefined;
-    std.Io.random(io_instance.io, &id);
+    compat.randomBytes(&id);
     return id;
 }
 

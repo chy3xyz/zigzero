@@ -53,12 +53,27 @@ fn handleHealth(ctx: *api.Context) !void {
     });
 }
 
+const ListWriter = struct {
+    list: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+
+    pub fn writeAll(self: ListWriter, data: []const u8) !void {
+        try self.list.appendSlice(self.allocator, data);
+    }
+
+    pub fn print(self: ListWriter, comptime fmt: []const u8, args: anytype) !void {
+        try self.list.print(self.allocator, fmt, args);
+    }
+};
+
 fn handleMetrics(ctx: *api.Context) !void {
     const registry = @as(*metric.Registry, @ptrCast(@alignCast(ctx.user_data.?)));
-    var w = std.Io.Writer.Allocating.init(ctx.allocator);
-    defer w.deinit();
-    try registry.exportPrometheus(&w.writer);
-    try ctx.response_body.appendSlice(ctx.allocator, w.written());
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(ctx.allocator);
+    const writer = ListWriter{ .list = &buf, .allocator = ctx.allocator };
+    try registry.exportPrometheus(writer);
+    try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
+    try ctx.response_body.appendSlice(ctx.allocator, buf.items);
     ctx.responded = true;
 }
 
@@ -66,12 +81,13 @@ fn handleMetrics(ctx: *api.Context) !void {
 // Main
 // ============================================================================
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    zigzero.io_instance.io = init.io;
-    zigzero.io_instance.allocator = allocator;
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    zigzero.compat.initIo(allocator);
+    defer zigzero.compat.deinitIo();
 
-    // --- Infrastructure: metrics -----------------------------------------
     // --- Infrastructure: metrics -----------------------------------------
     var registry = metric.Registry.init(allocator);
     defer registry.deinit();

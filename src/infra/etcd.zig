@@ -128,10 +128,10 @@ pub const Client = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, resp.body, .{});
         defer parsed.deinit();
 
-        var result = std.ArrayList(KV).init(self.allocator);
+        var result: std.ArrayList(KV) = .empty;
         errdefer {
             for (result.items) |*kv| kv.deinit(self.allocator);
-            result.deinit();
+            result.deinit(self.allocator);
         }
 
         const kvs = parsed.value.object.get("kvs") orelse return result;

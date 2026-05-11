@@ -3,7 +3,7 @@
 //! Aligned with go-zero's core/fx package.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("errors.zig");
 
 /// Parallel executes a function for each item in a slice concurrently.
@@ -13,29 +13,25 @@ pub fn Parallel(comptime T: type, _allocator: std.mem.Allocator, items: []const 
     const workers = if (max_workers == 0) items.len else @min(max_workers, items.len);
     if (workers == 0) return;
 
-    var active = std.atomic.Value(usize).init(0);
-    var completed = std.atomic.Value(usize).init(0);
+    var wg: compat.WaitGroup = .init;
+    var semaphore = compat.Semaphore.initWithPermits(@intCast(workers));
 
     for (items) |item| {
-        while (active.load(.monotonic) >= workers) {
-            std.Thread.yield() catch {};
-        }
-        _ = @atomicRmw(usize, &active.raw, .Add, 1, .monotonic);
+        semaphore.wait();
+        wg.start();
         const thread = try std.Thread.spawn(.{}, struct {
-            fn run(i: T, f: *const fn (T) void, a: *std.atomic.Value(usize), c: *std.atomic.Value(usize)) void {
+            fn run(i: T, f: *const fn (T) void, s: *compat.Semaphore, w: *compat.WaitGroup) void {
                 defer {
-                    _ = @atomicRmw(usize, &a.raw, .Sub, 1, .monotonic);
-                    _ = @atomicRmw(usize, &c.raw, .Add, 1, .monotonic);
+                    s.post();
+                    w.finish();
                 }
                 f(i);
             }
-        }.run, .{ item, func, &active, &completed });
+        }.run, .{ item, func, &semaphore, &wg });
         thread.detach();
     }
 
-    while (completed.load(.monotonic) < items.len) {
-        std.Thread.yield() catch {};
-    }
+    wg.wait();
 }
 
 /// Map applies a transform to each element concurrently.
@@ -46,33 +42,32 @@ pub fn Map(comptime In: type, comptime Out: type, allocator: std.mem.Allocator, 
     const workers = if (max_workers == 0) items.len else @min(max_workers, items.len);
     if (workers == 0) return results;
 
-    var active = std.atomic.Value(usize).init(0);
-    var completed = std.atomic.Value(usize).init(0);
-    var mutex = std.Io.Mutex.init;
+    var wg: compat.WaitGroup = .init;
+    var mutex: compat.Mutex = .init;
+    var semaphore = compat.Semaphore.initWithPermits(@intCast(workers));
+    var err: ?anyerror = null;
 
     for (items, 0..) |item, idx| {
-        while (active.load(.monotonic) >= workers) {
-            std.Thread.yield() catch {};
-        }
-        _ = @atomicRmw(usize, &active.raw, .Add, 1, .monotonic);
+        semaphore.wait();
+        wg.start();
         const thread = try std.Thread.spawn(.{}, struct {
-            fn run(i: In, index: usize, f: *const fn (In) Out, res: []Out, a: *std.atomic.Value(usize), c: *std.atomic.Value(usize), m: *std.Io.Mutex) void {
+            fn run(i: In, index: usize, f: *const fn (In) Out, res: []Out, s: *compat.Semaphore, w: *compat.WaitGroup, m: *compat.Mutex, e: *?anyerror) void {
                 defer {
-                    _ = @atomicRmw(usize, &a.raw, .Sub, 1, .monotonic);
-                    _ = @atomicRmw(usize, &c.raw, .Add, 1, .monotonic);
+                    s.post();
+                    w.finish();
                 }
                 const out = f(i);
-                m.lock(io_instance.io) catch {};
+                m.lock();
                 res[index] = out;
-                m.unlock(io_instance.io);
+                m.unlock();
+                _ = e;
             }
-        }.run, .{ item, idx, func, results, &active, &completed, &mutex });
+        }.run, .{ item, idx, func, results, &semaphore, &wg, &mutex, &err });
         thread.detach();
     }
 
-    while (completed.load(.monotonic) < items.len) {
-        std.Thread.yield() catch {};
-    }
+    wg.wait();
+    if (err) |e| return e;
     return results;
 }
 
@@ -87,7 +82,7 @@ pub fn Stream(comptime T: type) type {
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
-                .items = .empty,
+                .items = std.ArrayList(T).empty,
             };
         }
 

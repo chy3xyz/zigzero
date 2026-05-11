@@ -344,9 +344,26 @@ test "prometheus export" {
     const counter = try registry.counter("test_counter", "Test counter");
     counter.inc();
 
-    var buf: [1024]u8 = undefined;
-    var fbs = std.Io.Writer.fixed(&buf);
-    try registry.exportPrometheus(&fbs);
-    const output = fbs.buffered();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const TestWriter = struct {
+        list: *std.ArrayList(u8),
+        alloc: std.mem.Allocator,
+
+        pub fn writeAll(self: @This(), bytes: []const u8) !void {
+            try self.list.appendSlice(self.alloc, bytes);
+        }
+
+        pub fn print(self: @This(), comptime fmt_str: []const u8, args: anytype) !void {
+            const s = try std.fmt.allocPrint(self.alloc, fmt_str, args);
+            defer self.alloc.free(s);
+            try self.list.appendSlice(self.alloc, s);
+        }
+    };
+    const writer = TestWriter{ .list = &buf, .alloc = allocator };
+    try registry.exportPrometheus(writer);
+
+    const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "test_counter") != null);
 }

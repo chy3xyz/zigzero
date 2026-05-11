@@ -68,7 +68,7 @@ pub const main_zig =
     \\const health = zigzero.health;
     \\
     \\pub fn main() !void {{
-    \\    var gpa = std.heap.GeneralPurposeAllocator(.{{}}){{}};
+    \\    var gpa: std.heap.DebugAllocator(.{{}}) = .init;
     \\    defer _ = gpa.deinit();
     \\    const allocator = gpa.allocator();
     \\

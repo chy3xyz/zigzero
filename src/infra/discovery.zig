@@ -6,6 +6,7 @@ const std = @import("std");
 const errors = @import("../core/errors.zig");
 const loadbalancer = @import("loadbalancer.zig");
 const etcd = @import("etcd.zig");
+const compat = @import("../compat.zig");
 
 /// Service node
 pub const Node = struct {
@@ -233,10 +234,10 @@ pub const EtcdDiscovery = struct {
     }
 
     fn keepAliveLoop(self: *EtcdDiscovery, ttl: i64) void {
-        _ = ttl;
+        const interval_ms = @max(1000, @as(u64, @intCast(ttl)) * 1000 / 3);
         while (self.keepalive_running.load(.monotonic)) {
             self.etcd.keepAlive(self.lease_id) catch {};
-            std.Thread.yield() catch {};
+            compat.sleep(interval_ms * std.time.ns_per_ms);
         }
     }
 };

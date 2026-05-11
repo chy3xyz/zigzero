@@ -3,7 +3,7 @@
 //! Provides scheduled task execution aligned with go-zero's cron patterns.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 
 /// Cron expression (simplified: minute hour day month dow)
 pub const Expression = struct {
@@ -44,7 +44,7 @@ pub const Scheduler = struct {
     pub fn init(allocator: std.mem.Allocator) Scheduler {
         return .{
             .allocator = allocator,
-            .jobs = .{},
+            .jobs = .empty,
             .running = std.atomic.Value(bool).init(false),
         };
     }
@@ -83,28 +83,28 @@ pub const Scheduler = struct {
 
     fn runLoop(self: *Scheduler) void {
         while (self.running.load(.monotonic)) {
-            const now = io_instance.seconds();
+            const now = compat.timestamp();
             for (self.jobs.items) |*job| {
                 if (job.schedule.matches(now) and job.last_run < @divFloor(now, 60) * 60) {
                     job.task(job.context);
                     job.last_run = now;
                 }
             }
-            std.Thread.yield() catch {};
+            compat.sleep(1 * std.time.ns_per_s);
         }
     }
 };
 
 /// Run a task every N seconds
 pub fn every(seconds: u64, task: *const fn (*anyopaque) void, context: *anyopaque) void {
-    const start = io_instance.seconds();
+    const start = compat.timestamp();
     while (true) {
-        const now = io_instance.seconds();
+        const now = compat.timestamp();
         if (now - start >= @as(i64, @intCast(seconds))) {
             task(context);
             break;
         }
-        std.Thread.yield() catch {};
+        compat.sleep(100 * std.time.ns_per_ms);
     }
 }
 

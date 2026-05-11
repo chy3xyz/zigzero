@@ -3,7 +3,7 @@
 //! Provides a reusable connection pool pattern aligned with go-zero.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 
 /// Connection factory interface
@@ -31,8 +31,8 @@ pub fn Pool(comptime T: type) type {
         max_active: u32,
         active_count: std.atomic.Value(u32),
         idle_conns: std.ArrayList(Node),
-        mutex: std.Io.Mutex,
-        cond: std.Thread.Condition,
+        mutex: compat.Mutex,
+        cond: compat.Condition,
         max_wait_ms: u32 = 5000,
         closed: std.atomic.Value(bool),
 
@@ -51,9 +51,9 @@ pub fn Pool(comptime T: type) type {
                 .min_idle = config.min_idle,
                 .max_active = config.max_active,
                 .active_count = std.atomic.Value(u32).init(0),
-                .idle_conns = .{},
-                .mutex = std.Io.Mutex.init,
-                .cond = .{},
+                .idle_conns = .empty,
+                .mutex = .init,
+                .cond = .init,
                 .max_wait_ms = config.max_wait_ms,
                 .closed = std.atomic.Value(bool).init(false),
             };
@@ -64,7 +64,7 @@ pub fn Pool(comptime T: type) type {
                 const conn = createFn() catch continue;
                 try pool.idle_conns.append(allocator, .{
                     .conn = conn,
-                    .last_used = io_instance.millis(),
+                    .last_used = compat.milliTimestamp(),
                 });
                 _ = pool.active_count.fetchAdd(1, .monotonic);
             }
@@ -76,8 +76,8 @@ pub fn Pool(comptime T: type) type {
             self.closed.store(true, .monotonic);
             self.cond.broadcast();
 
-            self.mutex.lockUncancelable(io_instance.io);
-            defer self.mutex.unlock(io_instance.io);
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
             for (self.idle_conns.items) |node| {
                 self.destroyFn(node.conn);
@@ -89,14 +89,14 @@ pub fn Pool(comptime T: type) type {
         pub fn acquire(self: *Self) !*T {
             if (self.closed.load(.monotonic)) return error.ServerError;
 
-            self.mutex.lockUncancelable(io_instance.io);
+            self.mutex.lock();
 
             // Try to get an idle connection
             while (self.idle_conns.items.len > 0) {
                 const node = self.idle_conns.pop();
                 if (node) |n| {
                     if (self.validateFn(n.conn)) {
-                        self.mutex.unlock(io_instance.io);
+                        self.mutex.unlock();
                         return n.conn;
                     }
                     self.destroyFn(n.conn);
@@ -107,25 +107,25 @@ pub fn Pool(comptime T: type) type {
             // Check if we can create a new connection
             const current_active = self.active_count.load(.monotonic);
             if (current_active < self.max_active) {
-                self.mutex.unlock(io_instance.io);
+                self.mutex.unlock();
                 const conn = try self.createFn();
                 _ = self.active_count.fetchAdd(1, .monotonic);
                 return conn;
             }
 
             // Wait for a connection to be released
-            const wait_until = io_instance.millis() + @as(i64, @intCast(self.max_wait_ms));
-            while (self.idle_conns.items.len == 0 and io_instance.millis() < wait_until) {
-                self.cond.timedWait(&self.mutex, @intCast(wait_until - io_instance.millis())) catch break;
+            const wait_until = compat.milliTimestamp() + @as(i64, @intCast(self.max_wait_ms));
+            while (self.idle_conns.items.len == 0 and compat.milliTimestamp() < wait_until) {
+                self.cond.timedWait(&self.mutex, @intCast(wait_until - compat.milliTimestamp())) catch break;
             }
 
             if (self.idle_conns.items.len > 0) {
                 const node = self.idle_conns.pop();
-                self.mutex.unlock(io_instance.io);
+                self.mutex.unlock();
                 if (node) |n| return n.conn;
             }
 
-            self.mutex.unlock(io_instance.io);
+            self.mutex.unlock();
             return error.Timeout;
         }
 
@@ -137,17 +137,17 @@ pub fn Pool(comptime T: type) type {
                 return;
             }
 
-            self.mutex.lockUncancelable(io_instance.io);
+            self.mutex.lock();
             self.idle_conns.append(self.allocator, .{
                 .conn = conn,
-                .last_used = io_instance.millis(),
+                .last_used = compat.milliTimestamp(),
             }) catch {
-                self.mutex.unlock(io_instance.io);
+                self.mutex.unlock();
                 self.destroyFn(conn);
                 _ = self.active_count.fetchSub(1, .monotonic);
                 return;
             };
-            self.mutex.unlock(io_instance.io);
+            self.mutex.unlock();
             self.cond.signal();
         }
 
@@ -158,9 +158,9 @@ pub fn Pool(comptime T: type) type {
 
         /// Current idle connection count
         pub fn idle(self: *Self) usize {
-            self.mutex.lockUncancelable(io_instance.io);
+            self.mutex.lock();
             const count = self.idle_conns.items.len;
-            self.mutex.unlock(io_instance.io);
+            self.mutex.unlock();
             return count;
         }
     };
@@ -189,7 +189,7 @@ test "connection pool" {
     const createFn = struct {
         fn create() errors.ResultT(*u32) {
             CreateCtx.count.* += 1;
-            const ptr = std.heap.page_allocator.create(u32) catch return error.ServerError;
+            const ptr = std.testing.allocator.create(u32) catch return error.ServerError;
             ptr.* = 42;
             return ptr;
         }
@@ -198,7 +198,7 @@ test "connection pool" {
     const destroyFn = struct {
         fn destroy(ptr: *u32) void {
             DestroyCtx.count.* += 1;
-            std.heap.page_allocator.destroy(ptr);
+            std.testing.allocator.destroy(ptr);
         }
     }.destroy;
 
@@ -225,4 +225,109 @@ test "connection pool" {
     pool.release(conn);
 
     try std.testing.expect(create_count >= 2);
+}
+
+
+test "connection pool max active and timeout" {
+    const CreateCtx = struct {
+        var count: *u32 = undefined;
+    };
+    const DestroyCtx = struct {
+        var count: *u32 = undefined;
+    };
+
+    var create_count: u32 = 0;
+    var destroy_count: u32 = 0;
+    CreateCtx.count = &create_count;
+    DestroyCtx.count = &destroy_count;
+
+    const createFn = struct {
+        fn create() errors.ResultT(*u32) {
+            CreateCtx.count.* += 1;
+            const ptr = std.testing.allocator.create(u32) catch return error.ServerError;
+            ptr.* = 42;
+            return ptr;
+        }
+    }.create;
+
+    const destroyFn = struct {
+        fn destroy(ptr: *u32) void {
+            DestroyCtx.count.* += 1;
+            std.testing.allocator.destroy(ptr);
+        }
+    }.destroy;
+
+    const validateFn = struct {
+        fn validate(ptr: *u32) bool {
+            _ = ptr;
+            return true;
+        }
+    }.validate;
+
+    var pool = try Pool(u32).init(
+        std.testing.allocator,
+        createFn,
+        destroyFn,
+        validateFn,
+        .{ .min_idle = 1, .max_active = 2, .max_wait_ms = 50 },
+    );
+    defer pool.deinit();
+
+    // Exhaust pool
+    const c1 = try pool.acquire();
+    const c2 = try pool.acquire();
+    try std.testing.expectEqual(@as(u32, 2), pool.active());
+
+    // Third acquire should timeout quickly
+    const c3 = pool.acquire();
+    try std.testing.expectError(error.Timeout, c3);
+
+    pool.release(c1);
+    pool.release(c2);
+}
+
+test "connection pool validation rejects bad connections" {
+    const ValidateCtx = struct {
+        var count: u32 = 0;
+    };
+    ValidateCtx.count = 0;
+
+    const createFn = struct {
+        fn create() errors.ResultT(*u32) {
+            const ptr = std.testing.allocator.create(u32) catch return error.ServerError;
+            ptr.* = 42;
+            return ptr;
+        }
+    }.create;
+
+    const destroyFn = struct {
+        fn destroy(ptr: *u32) void {
+            std.testing.allocator.destroy(ptr);
+        }
+    }.destroy;
+
+    const validateFn = struct {
+        fn validate(ptr: *u32) bool {
+            _ = ptr;
+            ValidateCtx.count += 1;
+            return ValidateCtx.count <= 1; // Reject after first validation
+        }
+    }.validate;
+
+    var pool = try Pool(u32).init(
+        std.testing.allocator,
+        createFn,
+        destroyFn,
+        validateFn,
+        .{ .min_idle = 1, .max_active = 2 },
+    );
+    defer pool.deinit();
+
+    const c1 = try pool.acquire();
+    pool.release(c1);
+
+    // On next acquire, validation should fail and connection be destroyed + recreated
+    const c2 = try pool.acquire();
+    try std.testing.expectEqual(@as(u32, 42), c2.*);
+    pool.release(c2);
 }

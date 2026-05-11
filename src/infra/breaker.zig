@@ -3,7 +3,7 @@
 //! Implements the circuit breaker pattern aligned with go-zero's breaker.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 
 /// Circuit breaker state
@@ -54,7 +54,7 @@ pub const CircuitBreaker = struct {
         switch (self.state) {
             .closed => return true,
             .open => {
-                const now = io_instance.seconds();
+                const now = compat.timestamp();
                 if (now - self.opened_at >= @as(i64, @intCast(self.config.sleep_duration_sec))) {
                     self.state = .half_open;
                     self.total_requests = 0;
@@ -84,7 +84,7 @@ pub const CircuitBreaker = struct {
     pub fn recordFailure(self: *CircuitBreaker) void {
         self.total_requests += 1;
         self.failed_requests += 1;
-        self.last_failure_time = io_instance.seconds();
+        self.last_failure_time = compat.timestamp();
 
         if (self.state == .closed) {
             if (self.shouldTrip()) {
@@ -110,7 +110,7 @@ pub const CircuitBreaker = struct {
     /// Open the circuit
     fn open(self: *CircuitBreaker) void {
         self.state = .open;
-        self.opened_at = io_instance.seconds();
+        self.opened_at = compat.timestamp();
     }
 
     /// Close the circuit (reset)
@@ -142,4 +142,62 @@ test "circuit breaker" {
     // Should trip after enough failures
     try std.testing.expect(cb.state == .open);
     try std.testing.expect(!cb.allow());
+}
+
+
+test "circuit breaker half-open recovery" {
+    var cb = CircuitBreaker.withConfig(.{
+        .request_threshold = 5,
+        .failure_rate_threshold = 50,
+        .sleep_duration_sec = 0, // instant retry for testing
+        .half_open_success_threshold = 2,
+    });
+
+    // Trip the breaker
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        cb.recordFailure();
+    }
+    try std.testing.expect(cb.state == .open);
+
+    // Immediately transition to half-open (sleep_duration_sec = 0)
+    try std.testing.expect(cb.allow());
+    try std.testing.expect(cb.state == .half_open);
+
+    // Record successes to close the breaker
+    cb.recordSuccess();
+    cb.recordSuccess();
+    try std.testing.expect(cb.state == .closed);
+    try std.testing.expect(cb.allow());
+}
+
+test "circuit breaker half-open reopens on failure" {
+    var cb = CircuitBreaker.withConfig(.{
+        .request_threshold = 5,
+        .failure_rate_threshold = 50,
+        .sleep_duration_sec = 0,
+        .half_open_success_threshold = 2,
+    });
+
+    // Trip the breaker
+    var i: u32 = 0;
+    while (i < 5) : (i += 1) {
+        cb.recordFailure();
+    }
+    try std.testing.expect(cb.state == .open);
+
+    // Transition to half-open
+    try std.testing.expect(cb.allow());
+    try std.testing.expect(cb.state == .half_open);
+
+    // One failure should reopen
+    cb.recordFailure();
+    try std.testing.expect(cb.state == .open);
+}
+
+test "circuit breaker acceptable db error" {
+    try std.testing.expect(errors.isAcceptableDbError(error.NotFound));
+    try std.testing.expect(errors.isAcceptableDbError(error.SerializationFailure));
+    try std.testing.expect(!errors.isAcceptableDbError(error.ConnectionFailed));
+    try std.testing.expect(!errors.isAcceptableDbError(error.QueryFailed));
 }

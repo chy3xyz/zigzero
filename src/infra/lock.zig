@@ -3,7 +3,7 @@
 //! Provides distributed locking patterns aligned with go-zero.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 const redis = @import("redis.zig");
 
@@ -37,12 +37,12 @@ pub const RedisLock = struct {
         if (self.client.stream) |stream| {
             var cmd_builder: std.ArrayList(u8) = .empty;
             defer cmd_builder.deinit(self.client.allocator);
-            cmd_builder.writer(self.client.allocator).writeAll(script_fmt) catch return error.RedisError;
-            cmd_builder.writer(self.client.allocator).print("${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
-            cmd_builder.writer(self.client.allocator).print("${d}\r\n{s}\r\n", .{ value.len, value }) catch return error.RedisError;
-            _ = stream.write(cmd_builder.items) catch return error.RedisError;
+            cmd_builder.appendSlice(self.client.allocator, script_fmt) catch return error.RedisError;
+            cmd_builder.print(self.client.allocator, "${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
+            cmd_builder.print(self.client.allocator, "${d}\r\n{s}\r\n", .{ value.len, value }) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd_builder.items) catch return error.RedisError;
             var buf: [256]u8 = undefined;
-            _ = stream.read(&buf) catch return error.RedisError;
+            _ = compat.net.streamRead(stream, &buf) catch return error.RedisError;
         }
         return;
     }
@@ -53,9 +53,9 @@ pub const RedisLock = struct {
         if (self.client.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.client.allocator, "*3\\r\\n$6\\r\\nEXPIRE\\r\\n${d}\\r\\n{s}\\r\\n${d}\\r\\n{d}\\r\\n", .{ key.len, key, std.fmt.count("{d}", .{ttl_seconds}), ttl_seconds }) catch return error.RedisError;
             defer self.client.allocator.free(cmd);
-            _ = stream.write(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
             var buf: [256]u8 = undefined;
-            const n = stream.read(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             if (n > 1 and buf[0] == ':') {
                 const val = std.fmt.parseInt(i32, buf[1..n], 10) catch return error.RedisError;
                 return val == 1;
@@ -67,13 +67,13 @@ pub const RedisLock = struct {
 
 /// In-process lock for single-node use
 pub const LocalLock = struct {
-    mutex: std.Io.Mutex,
+    mutex: compat.Mutex,
     locked: std.atomic.Value(bool),
     owner: ?[]const u8,
 
     pub fn init() LocalLock {
         return .{
-            .mutex = std.Io.Mutex.init,
+            .mutex = .init,
             .locked = std.atomic.Value(bool).init(false),
             .owner = null,
         };
@@ -81,26 +81,26 @@ pub const LocalLock = struct {
 
     pub fn acquire(self: *LocalLock, key: []const u8, value: []const u8, ttl_seconds: u32) errors.ResultT(bool) {
         _ = ttl_seconds;
-        self.mutex.lockUncancelable(io_instance.io);
+        self.mutex.lock();
         if (self.locked.load(.monotonic)) {
-            self.mutex.unlock(io_instance.io);
+            self.mutex.unlock();
             return false;
         }
         self.locked.store(true, .monotonic);
         self.owner = key;
         _ = value;
-        self.mutex.unlock(io_instance.io);
+        self.mutex.unlock();
         return true;
     }
 
     pub fn release(self: *LocalLock, key: []const u8, value: []const u8) errors.Result {
         _ = value;
-        self.mutex.lockUncancelable(io_instance.io);
+        self.mutex.lock();
         if (self.owner != null and std.mem.eql(u8, self.owner.?, key)) {
             self.locked.store(false, .monotonic);
             self.owner = null;
         }
-        self.mutex.unlock(io_instance.io);
+        self.mutex.unlock();
     }
 };
 

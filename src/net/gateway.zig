@@ -4,6 +4,7 @@
 //! Routes incoming HTTP requests to upstream backend services.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const api = @import("api.zig");
 const http = @import("http.zig");
 const loadbalancer = @import("../infra/loadbalancer.zig");
@@ -20,7 +21,7 @@ pub const Upstream = struct {
         return .{
             .allocator = allocator,
             .name = name,
-            .endpoints = .empty,
+            .endpoints = std.ArrayList([]const u8).empty,
             .lb = loadbalancer.LoadBalancer.init(allocator, .round_robin),
         };
     }

@@ -4,6 +4,7 @@
 //! Aligned with go-zero's zrpc package.
 
 const std = @import("std");
+const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 const breaker = @import("../infra/breaker.zig");
 const loadbalancer = @import("../infra/loadbalancer.zig");
@@ -92,19 +93,19 @@ pub const Client = struct {
             std.mem.copyForwards(u8, request_builder.items[0..@sizeOf(RpcHeader)], std.mem.asBytes(&header));
 
             // Connect to endpoint
-            const address = std.net.Address.parseIp4(endpoint.address, self.config.port) catch continue;
-            const stream = std.net.tcpConnectToAddress(address) catch continue;
-            defer stream.close();
+            const address = compat.net.IpAddress.parseIp4(endpoint.address, self.config.port) catch continue;
+            const stream = compat.net.tcpConnectToAddress(address) catch continue;
+            defer compat.net.streamClose(stream);
 
             // Send request
-            _ = stream.write(request_builder.items) catch continue;
+            compat.net.streamWrite(stream, request_builder.items) catch continue;
 
             // Read response header
             var resp_header: RpcHeader = undefined;
             const header_bytes = std.mem.asBytes(&resp_header);
             var bytes_read: usize = 0;
             while (bytes_read < @sizeOf(RpcHeader)) {
-                const n = stream.read(header_bytes[bytes_read..]) catch break;
+                const n = compat.net.streamRead(stream, header_bytes[bytes_read..]) catch break;
                 if (n == 0) break;
                 bytes_read += n;
             }
@@ -121,7 +122,7 @@ pub const Client = struct {
 
             bytes_read = 0;
             while (bytes_read < resp_body.len) {
-                const n = stream.read(resp_body[bytes_read..]) catch break;
+                const n = compat.net.streamRead(stream, resp_body[bytes_read..]) catch break;
                 if (n == 0) break;
                 bytes_read += n;
             }
@@ -156,7 +157,7 @@ pub const Server = struct {
     config: ServerConfig,
     services: std.StringHashMap(*anyopaque),
     handler_map: std.StringHashMap(HandlerFn),
-    listener: ?std.net.Server = null,
+    listener: ?compat.net.Server = null,
     running: std.atomic.Value(bool),
 
     const ServerConfig = struct {
@@ -213,9 +214,9 @@ pub const Server = struct {
 
     /// Start the RPC server
     pub fn start(self: *Server) !void {
-        const address = std.net.Address.parseIp4(self.config.host, self.config.port) catch return error.ServerError;
+        const address = compat.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.ServerError;
 
-        var server = address.listen(.{
+        var server = address.listen(compat.io(), .{
             .reuse_address = true,
             .kernel_backlog = 128,
         }) catch return error.ServerError;
@@ -226,33 +227,33 @@ pub const Server = struct {
         std.log.info("RPC server listening on {s}:{d}", .{ self.config.host, self.config.port });
 
         while (self.running.load(.monotonic)) {
-            const conn = server.accept() catch |err| {
+            const stream = server.accept(compat.io()) catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 std.log.err("Accept error: {any}", .{err});
                 continue;
             };
 
-            const conn_ptr = try self.allocator.create(std.net.Server.Connection);
-            conn_ptr.* = conn;
-
-            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn_ptr }) catch |err| {
+            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, stream }) catch |err| {
                 std.log.err("Failed to spawn thread: {any}", .{err});
-                conn_ptr.stream.close();
-                self.allocator.destroy(conn_ptr);
+                compat.net.streamClose(stream);
                 continue;
             };
             thread.detach();
         }
     }
 
-    fn handleConnection(self: *Server, conn: *std.net.Server.Connection) void {
+    fn handleConnection(self: *Server, stream: compat.net.Stream) void {
         defer {
-            conn.stream.close();
-            self.allocator.destroy(conn);
+            compat.net.streamClose(stream);
         }
 
-        const reader = conn.stream.reader();
-        const writer = conn.stream.writer();
+        var read_buf: [4096]u8 = undefined;
+        const stream_reader = stream.reader(compat.io(), &read_buf);
+        const reader = stream_reader.interface;
+
+        var write_buf: [4096]u8 = undefined;
+        const stream_writer = stream.writer(compat.io(), &write_buf);
+        const writer = stream_writer.interface;
 
         // Read request header
         var header: RpcHeader = undefined;
@@ -260,7 +261,7 @@ pub const Server = struct {
         var bytes_read: usize = 0;
 
         while (bytes_read < @sizeOf(RpcHeader)) {
-            const n = reader.read(header_bytes[bytes_read..]) catch return;
+            const n = reader.readSliceShort(header_bytes[bytes_read..]) catch return;
             if (n == 0) return;
             bytes_read += n;
         }
@@ -276,7 +277,7 @@ pub const Server = struct {
 
         bytes_read = 0;
         while (bytes_read < method_name.len) {
-            const n = reader.read(method_name[bytes_read..]) catch return;
+            const n = reader.readSliceShort(method_name[bytes_read..]) catch return;
             if (n == 0) return;
             bytes_read += n;
         }
@@ -287,7 +288,7 @@ pub const Server = struct {
 
         bytes_read = 0;
         while (bytes_read < body.len) {
-            const n = reader.read(body[bytes_read..]) catch return;
+            const n = reader.readSliceShort(body[bytes_read..]) catch return;
             if (n == 0) return;
             bytes_read += n;
         }
@@ -301,7 +302,7 @@ pub const Server = struct {
                 .method_len = 0,
                 .body_len = 0,
             };
-            _ = writer.write(std.mem.asBytes(&err_header)) catch {};
+            writer.writeAll(std.mem.asBytes(&err_header)) catch {};
             return;
         };
 
@@ -326,15 +327,15 @@ pub const Server = struct {
             .body_len = @intCast(response.len),
         };
 
-        _ = writer.write(std.mem.asBytes(&resp_header)) catch {};
-        _ = writer.write(response) catch {};
+        writer.writeAll(std.mem.asBytes(&resp_header)) catch {};
+        writer.writeAll(response) catch {};
     }
 
     /// Stop the server
     pub fn stop(self: *Server) void {
         self.running.store(false, .monotonic);
         if (self.listener) |*l| {
-            l.deinit();
+            l.deinit(compat.io());
             self.listener = null;
         }
     }

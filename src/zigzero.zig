@@ -15,9 +15,8 @@ const std = @import("std");
 
 pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
 pub const name = "zigzero";
+pub const compat = @import("compat.zig");
 
-// Io instance for Zig 0.16+
-pub const io_instance = @import("io_instance.zig");
 // Core
 pub const errors = @import("core/errors.zig");
 pub const fx = @import("core/fx.zig");

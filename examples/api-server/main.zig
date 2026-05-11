@@ -1,6 +1,6 @@
 const std = @import("std");
+const compat = @import("zigzero").compat;
 const zigzero = @import("zigzero");
-const io_instance = zigzero.io_instance;
 const api = zigzero.api;
 const log = zigzero.log;
 const health = zigzero.health;
@@ -13,11 +13,12 @@ const limiter = zigzero.limiter;
 const breaker = zigzero.breaker;
 const http = zigzero.http;
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    // io_instance.io is set by Server.start() internally
-    // (the async runtime sets io_instance.io to threaded.io())
-    io_instance.allocator = allocator;
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    compat.initIo(allocator);
+    defer compat.deinitIo();
 
     // Initialize logger
     log.initFromConfig(.{
@@ -126,9 +127,7 @@ pub fn main(init: std.process.Init) !void {
         .path = "/slow",
         .handler = struct {
             fn handle(ctx: *api.Context) !void {
-                // Simulate slow processing
-                var i: u32 = 0;
-                while (i < 10000000) : (i += 1) {}
+                compat.sleep(200 * std.time.ns_per_ms);
                 try ctx.jsonStruct(200, .{ .status = "completed" });
             }
         }.handle,
@@ -156,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
                 const token = try middleware.generateToken(ctx.allocator, .{
                     .sub = "user123",
                     .username = "alice",
-                    .exp = io_instance.seconds() + 3600,
+                    .exp = compat.timestamp() + 3600,
                 }, "my-secret-key");
                 defer ctx.allocator.free(token);
                 try ctx.jsonStruct(200, .{ .token = token });

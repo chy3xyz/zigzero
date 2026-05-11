@@ -2,23 +2,25 @@ const std = @import("std");
 const zigzero = @import("zigzero");
 const api = zigzero.api;
 const log = zigzero.log;
+const compat = zigzero.compat;
 
-pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
-    _ = allocator;
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    compat.initIo(gpa.allocator());
+    defer compat.deinitIo();
+
     // Initialize logger
     log.initFromConfig(.{
         .service_name = "hello-api",
         .level = "info",
     });
-    const logger = log.Logger.new(.info, "hello-api");
 
     // Create server
-    var server = api.Server.init(allocator, 8080, logger);
-    defer server.deinit();
+    var server = api.Server.new(8080);
 
     // Add health check endpoint
-    try server.addRoute(.{
+    server.addRoute(.{
         .method = .GET,
         .path = "/health",
         .handler = struct {
@@ -29,7 +31,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     // Add hello endpoint
-    try server.addRoute(.{
+    server.addRoute(.{
         .method = .GET,
         .path = "/hello/:name",
         .handler = struct {
@@ -41,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
     });
 
     // Add JSON POST endpoint
-    try server.addRoute(.{
+    server.addRoute(.{
         .method = .POST,
         .path = "/echo",
         .handler = struct {
@@ -53,6 +55,6 @@ pub fn main(init: std.process.Init) !void {
         }.handle,
     });
 
-    logger.info("Starting server on port 8080");
+    log.default().info("Starting server on port 8080");
     try server.start();
 }

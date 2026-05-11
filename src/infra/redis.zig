@@ -3,7 +3,7 @@
 //! Provides Redis operations aligned with go-zero's redis functionality.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 const config = @import("../config.zig");
 
@@ -11,7 +11,8 @@ const config = @import("../config.zig");
 pub const Redis = struct {
     allocator: std.mem.Allocator,
     config: config.RedisConfig,
-    stream: ?std.Io.net.Stream = null,
+    stream: ?compat.net.Stream = null,
+    mutex: compat.Mutex = .init,
 
     /// Create a new Redis client
     pub fn new(allocator: std.mem.Allocator, cfg: config.RedisConfig) !Redis {
@@ -19,44 +20,50 @@ pub const Redis = struct {
             .allocator = allocator,
             .config = cfg,
             .stream = null,
+            .mutex = .init,
         };
     }
 
     /// Deinitialize Redis client
     pub fn deinit(self: *Redis) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |s| {
-            s.close(io_instance.io);
+            compat.net.streamClose(s);
             self.stream = null;
         }
     }
 
     /// Connect to Redis server
     pub fn connect(self: *Redis) !void {
-        const address = std.net.Address.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
-        self.stream = std.net.tcpConnectToAddress(address) catch return error.RedisError;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const address = compat.net.IpAddress.parseIp4(self.config.host, self.config.port) catch return error.RedisError;
+        self.stream = compat.net.tcpConnectToAddress(address) catch return error.RedisError;
     }
 
     /// Disconnect from Redis server
     pub fn disconnect(self: *Redis) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |s| {
-            s.close(io_instance.io);
+            compat.net.streamClose(s);
             self.stream = null;
         }
     }
 
     /// Get a value by key
     pub fn get(self: *Redis, key: []const u8) errors.ResultT(?[]const u8) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nGET\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w_buf: [1]u8 = undefined;
-            var _w = stream.writer(io_instance.io, &_w_buf);
-            _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [4096]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             // Parse bulk string response
@@ -81,6 +88,8 @@ pub const Redis = struct {
 
     /// Set a value with expiration
     pub fn set(self: *Redis, key: []const u8, value: []const u8, ex_seconds: ?u32) errors.Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = if (ex_seconds) |ex|
                 std.fmt.allocPrint(self.allocator, "*5\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n$2\r\nEX\r\n${d}\r\n{d}\r\n", .{ key.len, key, value.len, value, std.fmt.count("{d}", .{ex}), ex }) catch return error.RedisError
@@ -88,13 +97,10 @@ pub const Redis = struct {
                 std.fmt.allocPrint(self.allocator, "*3\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w_buf: [1]u8 = undefined;
-            var _w = stream.writer(io_instance.io, &_w_buf);
-            _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            _ = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            _ = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             return;
         }
         return error.RedisError;
@@ -102,15 +108,16 @@ pub const Redis = struct {
 
     /// Set a value only if key doesn't exist
     pub fn setNX(self: *Redis, key: []const u8, value: []const u8) errors.ResultT(bool) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nSETNX\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -123,22 +130,22 @@ pub const Redis = struct {
 
     /// Delete keys
     pub fn del(self: *Redis, keys: []const []const u8) errors.ResultT(u32) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
-            var cmd_w = std.Io.Writer.Allocating.init(self.allocator);
-            defer cmd_w.deinit();
-            const w = &cmd_w.writer;
-            w.print("*{d}\r\n$3\r\nDEL\r\n", .{keys.len + 1}) catch return error.RedisError;
+            var cmd_builder: std.ArrayList(u8) = .empty;
+            defer cmd_builder.deinit(self.allocator);
+
+            var w = compat.arrayListWriter(&cmd_builder, self.allocator);
+            try w.print("*{d}\r\n$3\r\nDEL\r\n", .{keys.len + 1});
             for (keys) |key| {
-                w.print("${d}\r\n{s}\r\n", .{ key.len, key}) catch return error.RedisError;
+                try w.print("${d}\r\n{s}\r\n", .{ key.len, key });
             }
 
-            var _w_buf: [1]u8 = undefined;
-            var _w = stream.writer(io_instance.io, &_w_buf);
-            _w.interface.writeAll(cmd_w.written()) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd_builder.items) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -151,15 +158,16 @@ pub const Redis = struct {
 
     /// Check if key exists
     pub fn exists(self: *Redis, key: []const u8) errors.ResultT(bool) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$6\r\nEXISTS\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -172,15 +180,16 @@ pub const Redis = struct {
 
     /// Increment a value
     pub fn incr(self: *Redis, key: []const u8) errors.ResultT(i64) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nINCR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -193,15 +202,16 @@ pub const Redis = struct {
 
     /// Decrement a value
     pub fn decr(self: *Redis, key: []const u8) errors.ResultT(i64) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nDECR\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -214,15 +224,16 @@ pub const Redis = struct {
 
     /// Expire a key
     pub fn expire(self: *Redis, key: []const u8, seconds: u32) errors.Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n", .{ key.len, key, std.fmt.count("{d}", .{seconds}), seconds }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            _ = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            _ = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             return;
         }
         return error.RedisError;
@@ -230,15 +241,16 @@ pub const Redis = struct {
 
     /// Get remaining TTL
     pub fn ttl(self: *Redis, key: []const u8) errors.ResultT(i64) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nTTL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -251,6 +263,8 @@ pub const Redis = struct {
 
     /// Acquire a distributed lock
     pub fn lock(self: *Redis, key: []const u8, value: []const u8, ttl_seconds: u32) errors.ResultT(bool) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const px = ttl_seconds * 1000;
             const cmd = std.fmt.allocPrint(self.allocator, "*5\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n$2\r\nNX\r\n$2\r\nPX\r\n${d}\r\n{d}\r\n", .{
@@ -258,11 +272,10 @@ pub const Redis = struct {
             }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len >= 3 and std.mem.eql(u8, response[0..3], "+OK")) {
@@ -274,30 +287,32 @@ pub const Redis = struct {
 
     /// Release a distributed lock
     pub fn unlock(self: *Redis, key: []const u8) errors.Result {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$3\r\nDEL\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            _ = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            _ = compat.net.streamRead(stream, &buf) catch return error.RedisError;
         }
         return;
     }
 
     /// List operations
     pub fn lPush(self: *Redis, key: []const u8, value: []const u8) errors.ResultT(u32) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$5\r\nLPUSH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{ key.len, key, value.len, value }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -309,15 +324,16 @@ pub const Redis = struct {
     }
 
     pub fn rPop(self: *Redis, key: []const u8) errors.ResultT(?[]const u8) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*2\r\n$4\r\nRPOP\r\n${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [4096]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1) {
@@ -341,17 +357,18 @@ pub const Redis = struct {
 
     /// Hash operations
     pub fn hSet(self: *Redis, key: []const u8, field: []const u8, value: []const u8) errors.ResultT(bool) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*4\r\n$4\r\nHSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
                 key.len, key, field.len, field, value.len, value,
             }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -363,17 +380,18 @@ pub const Redis = struct {
     }
 
     pub fn hGet(self: *Redis, key: []const u8, field: []const u8) errors.ResultT(?[]const u8) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$4\r\nHGET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
                 key.len, key, field.len, field,
             }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [4096]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1) {
@@ -397,17 +415,18 @@ pub const Redis = struct {
 
     /// Pub/Sub
     pub fn publish(self: *Redis, channel: []const u8, message: []const u8) errors.ResultT(u32) {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (self.stream) |stream| {
             const cmd = std.fmt.allocPrint(self.allocator, "*3\r\n$7\r\nPUBLISH\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n", .{
                 channel.len, channel, message.len, message,
             }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
-            var _w = stream.writer(io_instance.io, &[_]u8{0}); _w.interface.writeAll(cmd) catch return error.RedisError;
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
 
             var buf: [256]u8 = undefined;
-            var r = stream.reader(io_instance.io, &buf);
-            const n = r.interface.readSliceShort(&buf) catch return error.RedisError;
+            const n = compat.net.streamRead(stream, &buf) catch return error.RedisError;
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
@@ -416,6 +435,82 @@ pub const Redis = struct {
             }
         }
         return error.RedisError;
+    }
+};
+
+/// Connection pool for Redis clients
+pub const RedisPool = struct {
+    allocator: std.mem.Allocator,
+    conns: std.ArrayList(Redis),
+    mutex: compat.Mutex,
+    available: std.ArrayList(usize),
+    cond: compat.Condition,
+    max_conns: usize,
+    config: config.RedisConfig,
+
+    pub fn init(allocator: std.mem.Allocator, cfg: config.RedisConfig, max_conns: usize) !RedisPool {
+        var conns: std.ArrayList(Redis) = .empty;
+        errdefer conns.deinit(allocator);
+        try conns.ensureTotalCapacity(allocator, max_conns);
+        var available: std.ArrayList(usize) = .empty;
+        errdefer available.deinit(allocator);
+        try available.ensureTotalCapacity(allocator, max_conns);
+        var i: usize = 0;
+        while (i < max_conns) : (i += 1) {
+            const redis = try Redis.new(allocator, cfg);
+            try conns.append(allocator, redis);
+            try available.append(allocator, i);
+        }
+        return RedisPool{
+            .allocator = allocator,
+            .conns = conns,
+            .mutex = .init,
+            .available = available,
+            .cond = .init,
+            .max_conns = max_conns,
+            .config = cfg,
+        };
+    }
+
+    pub fn deinit(self: *RedisPool) void {
+        for (self.conns.items) |*conn| {
+            conn.deinit();
+        }
+        self.conns.deinit(self.allocator);
+        self.available.deinit(self.allocator);
+    }
+
+    pub fn connect(self: *RedisPool) !void {
+        for (self.conns.items) |*conn| {
+            conn.connect() catch {};
+        }
+    }
+
+    pub fn acquire(self: *RedisPool) !*Redis {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.available.items.len == 0) {
+            self.cond.wait(&self.mutex);
+        }
+        const idx = self.available.pop() orelse return error.RedisError;
+        return &self.conns.items[idx];
+    }
+
+    pub fn release(self: *RedisPool, redis: *Redis) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var found = false;
+        var index: usize = 0;
+        for (self.conns.items, 0..) |*conn, i| {
+            if (conn == redis) {
+                index = i;
+                found = true;
+                break;
+            }
+        }
+        std.debug.assert(found);
+        self.available.append(self.allocator, index) catch unreachable;
+        self.cond.signal();
     }
 };
 
@@ -487,7 +582,7 @@ pub const ClusterNode = struct {
 /// Redis cluster client
 pub const RedisCluster = struct {
     allocator: std.mem.Allocator,
-    nodes: std.ArrayList(Redis),
+    nodes: std.ArrayList(RedisPool),
     node_configs: std.ArrayList(config.RedisConfig),
 
     const Self = @This();
@@ -495,8 +590,8 @@ pub const RedisCluster = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .nodes = .empty,
-            .node_configs = .empty,
+            .nodes = std.ArrayList(RedisPool).empty,
+            .node_configs = std.ArrayList(config.RedisConfig).empty,
         };
     }
 
@@ -515,11 +610,11 @@ pub const RedisCluster = struct {
         const host_copy = try self.allocator.dupe(u8, host);
         const cfg = config.RedisConfig{ .host = host_copy, .port = port };
         try self.node_configs.append(self.allocator, cfg);
-        const redis = try Redis.new(self.allocator, cfg);
-        try self.nodes.append(self.allocator, redis);
+        const pool = try RedisPool.init(self.allocator, cfg, 10);
+        try self.nodes.append(self.allocator, pool);
     }
 
-    fn selectNode(self: *Self, key: []const u8) ?*Redis {
+    fn selectNode(self: *Self, key: []const u8) ?*RedisPool {
         if (self.nodes.items.len == 0) return null;
         if (self.nodes.items.len == 1) return &self.nodes.items[0];
         const slot = keySlot(key);
@@ -534,54 +629,74 @@ pub const RedisCluster = struct {
     }
 
     pub fn get(self: *Self, key: []const u8) errors.ResultT(?[]const u8) {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.get(key);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.get(key);
     }
 
     pub fn set(self: *Self, key: []const u8, value: []const u8, ex_seconds: ?u32) errors.Result {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.set(key, value, ex_seconds);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.set(key, value, ex_seconds);
     }
 
     pub fn del(self: *Self, keys: []const []const u8) errors.ResultT(u32) {
         if (keys.len == 0) return 0;
-        const node = self.selectNode(keys[0]) orelse return error.RedisError;
-        return node.del(keys);
+        const pool = self.selectNode(keys[0]) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.del(keys);
     }
 
     pub fn exists(self: *Self, key: []const u8) errors.ResultT(bool) {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.exists(key);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.exists(key);
     }
 
     pub fn incr(self: *Self, key: []const u8) errors.ResultT(i64) {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.incr(key);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.incr(key);
     }
 
     pub fn decr(self: *Self, key: []const u8) errors.ResultT(i64) {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.decr(key);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.decr(key);
     }
 
     pub fn expire(self: *Self, key: []const u8, seconds: u32) errors.Result {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.expire(key, seconds);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.expire(key, seconds);
     }
 
     pub fn ttl(self: *Self, key: []const u8) errors.ResultT(i64) {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.ttl(key);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.ttl(key);
     }
 
     pub fn hSet(self: *Self, key: []const u8, field: []const u8, value: []const u8) errors.ResultT(bool) {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.hSet(key, field, value);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.hSet(key, field, value);
     }
 
     pub fn hGet(self: *Self, key: []const u8, field: []const u8) errors.ResultT(?[]const u8) {
-        const node = self.selectNode(key) orelse return error.RedisError;
-        return node.hGet(key, field);
+        const pool = self.selectNode(key) orelse return error.RedisError;
+        const conn = pool.acquire() catch return error.RedisError;
+        defer pool.release(conn);
+        return conn.hGet(key, field);
     }
 };
 
@@ -657,4 +772,34 @@ test "redis cluster init" {
     const node1 = cluster.selectNode("mykey");
     const node2 = cluster.selectNode("mykey");
     try std.testing.expectEqual(node1, node2);
+}
+
+
+test "redis pool init and acquire/release" {
+    const allocator = std.testing.allocator;
+    var pool = try RedisPool.init(allocator, config.RedisConfig{ .host = "127.0.0.1", .port = 6379 }, 3);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), pool.conns.items.len);
+    try std.testing.expectEqual(@as(usize, 3), pool.available.items.len);
+
+    // Acquire all connections
+    const conn1 = try pool.acquire();
+    const conn2 = try pool.acquire();
+    const conn3 = try pool.acquire();
+
+    try std.testing.expectEqual(@as(usize, 0), pool.available.items.len);
+
+    // Release them back
+    pool.release(conn1);
+    pool.release(conn2);
+    pool.release(conn3);
+
+    try std.testing.expectEqual(@as(usize, 3), pool.available.items.len);
+}
+
+test "redis mutex exists" {
+    // Verify that the Redis struct now has a mutex field (compile-time check)
+    const r = try Redis.new(std.testing.allocator, config.RedisConfig{});
+    _ = r.mutex;
 }

@@ -3,7 +3,7 @@
 //! Provides various load balancing strategies aligned with go-zero's loadbalance.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 
 /// Load balancer algorithm type
 pub const Algorithm = enum {
@@ -119,7 +119,7 @@ pub const LoadBalancer = struct {
         const healthy_total = self.healthyCount();
         if (healthy_total == 0) return null;
 
-        const seed = @as(u64, @intCast(io_instance.seconds()));
+        const seed = @as(u64, @intCast(compat.timestamp()));
         var rng = std.Random.DefaultPrng.init(seed);
         const target_idx = rng.random().uintLessThan(u32, @as(u32, @intCast(healthy_total)));
 

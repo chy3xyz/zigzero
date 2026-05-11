@@ -3,7 +3,7 @@
 //! Provides common middleware implementations like auth, CORS, logging.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const api = @import("../net/api.zig");
 const errors = @import("../core/errors.zig");
 const limiter = @import("../infra/limiter.zig");
@@ -83,40 +83,39 @@ fn signJwt(allocator: std.mem.Allocator, claims: Claims, secret: []const u8) ![]
     const header_b64 = try base64UrlEncode(allocator, header);
     defer allocator.free(header_b64);
 
-    var payload_buf = std.Io.Writer.Allocating.init(allocator);
-    defer payload_buf.deinit();
-    const w = &payload_buf.writer;
+    var payload_buf: std.ArrayList(u8) = .empty;
+    defer payload_buf.deinit(allocator);
 
-    try w.writeAll("{");
+    try payload_buf.appendSlice(allocator, "{");
     var first = true;
     if (claims.sub) |sub| {
-        if (!first) try w.writeAll(",");
+        if (!first) try payload_buf.appendSlice(allocator, ",");
         first = false;
-        try w.print("\"sub\":\"{s}\"", .{sub});
+        try payload_buf.print(allocator, "\"sub\":\"{s}\"", .{sub});
     }
     if (claims.user_id) |uid| {
-        if (!first) try w.writeAll(",");
+        if (!first) try payload_buf.appendSlice(allocator, ",");
         first = false;
-        try w.print("\"user_id\":\"{s}\"", .{uid});
+        try payload_buf.print(allocator, "\"user_id\":\"{s}\"", .{uid});
     }
     if (claims.username) |un| {
-        if (!first) try w.writeAll(",");
+        if (!first) try payload_buf.appendSlice(allocator, ",");
         first = false;
-        try w.print("\"username\":\"{s}\"", .{un});
+        try payload_buf.print(allocator, "\"username\":\"{s}\"", .{un});
     }
     if (claims.exp) |exp| {
-        if (!first) try w.writeAll(",");
+        if (!first) try payload_buf.appendSlice(allocator, ",");
         first = false;
-        try w.print("\"exp\":{d}", .{exp});
+        try payload_buf.print(allocator, "\"exp\":{d}", .{exp});
     }
     if (claims.iat) |iat| {
-        if (!first) try w.writeAll(",");
+        if (!first) try payload_buf.appendSlice(allocator, ",");
         first = false;
-        try w.print("\"iat\":{d}", .{iat});
+        try payload_buf.print(allocator, "\"iat\":{d}", .{iat});
     }
-    try w.writeAll("}");
+    try payload_buf.appendSlice(allocator, "}");
 
-    const payload_b64 = try base64UrlEncode(allocator, payload_buf.written());
+    const payload_b64 = try base64UrlEncode(allocator, payload_buf.items);
     defer allocator.free(payload_b64);
 
     const signed_data = try std.fmt.allocPrint(allocator, "{s}.{s}", .{ header_b64, payload_b64 });
@@ -190,13 +189,11 @@ pub fn requestId() api.Middleware {
             fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
                 _ = data;
                 const request_id = ctx.header("X-Request-ID") orelse blk: {
-                    const timestamp = io_instance.seconds();
-                const random = ctx: {
-                    var buf: [4]u8 = undefined;
-                    std.Io.random(io_instance.io, &buf);
-                    break :ctx @as(u32, @bitCast(buf));
-                };
-                    const id = std.fmt.allocPrint(std.heap.page_allocator, "{d}-{x}", .{ timestamp, random }) catch "";
+                    // Stack buffer avoids page_allocator allocation + leak.
+                    var buf: [64]u8 = undefined;
+                    const timestamp = compat.timestamp();
+                    const random = compat.randomInt(u32);
+                    const id = std.fmt.bufPrint(&buf, "{d}-{x}", .{ timestamp, random }) catch "";
                     break :blk id;
                 };
                 try ctx.setHeader("X-Request-ID", request_id);
@@ -289,9 +286,9 @@ pub fn logging() api.Middleware {
         .func = struct {
             fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
                 _ = data;
-                const start = io_instance.millis();
+                const start = compat.milliTimestamp();
                 try next(ctx);
-                const duration = io_instance.millis() - start;
+                const duration = compat.milliTimestamp() - start;
                 const msg = std.fmt.allocPrint(ctx.allocator, "{s} {s} - {d} ({d}ms)", .{
                     ctx.method.toString(),
                     ctx.raw_path,
@@ -415,7 +412,7 @@ pub fn observability(registry: *metric.Registry) api.Middleware {
         .func = struct {
             fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
                 const reg = @as(*metric.Registry, @ptrCast(@alignCast(data.?)));
-                const start = io_instance.millis();
+                const start = compat.milliTimestamp();
 
                 // Auto trace span
                 var tracer = trace.Tracer.init(ctx.allocator, ctx.logger.service_name) catch null;
@@ -432,7 +429,7 @@ pub fn observability(registry: *metric.Registry) api.Middleware {
 
                 try next(ctx);
 
-                const duration = io_instance.millis() - start;
+                const duration = compat.milliTimestamp() - start;
 
                 // Record metrics
                 const requests = reg.counter("http_requests_total", "Total HTTP requests") catch null;
@@ -456,13 +453,27 @@ pub fn observability(registry: *metric.Registry) api.Middleware {
 }
 
 /// Prometheus metrics handler (expects registry in ctx.user_data)
+const ListWriter = struct {
+    list: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+
+    pub fn writeAll(self: ListWriter, data: []const u8) !void {
+        try self.list.appendSlice(self.allocator, data);
+    }
+
+    pub fn print(self: ListWriter, comptime fmt: []const u8, args: anytype) !void {
+        try self.list.print(self.allocator, fmt, args);
+    }
+};
+
 pub fn prometheusHandler(ctx: *api.Context) !void {
     const registry = @as(*metric.Registry, @ptrCast(@alignCast(ctx.user_data.?)));
-    var buf = std.Io.Writer.Allocating.init(ctx.allocator);
-    defer buf.deinit();
-    try registry.exportPrometheus(&buf.writer);
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(ctx.allocator);
+    const writer = ListWriter{ .list = &buf, .allocator = ctx.allocator };
+    try registry.exportPrometheus(writer);
     try ctx.setHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8");
-    try ctx.response_body.appendSlice(ctx.allocator, buf.written());
+    try ctx.response_body.appendSlice(ctx.allocator, buf.items);
     ctx.responded = true;
 }
 
@@ -494,9 +505,9 @@ pub fn requestTimeout(timeout_ms: u32) api.Middleware {
         .func = struct {
             fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
                 const timeout = @as(u32, @intCast(@intFromPtr(data.?) & 0xFFFFFFFF));
-                const start = io_instance.millis();
+                const start = compat.milliTimestamp();
                 try next(ctx);
-                const elapsed = io_instance.millis() - start;
+                const elapsed = compat.milliTimestamp() - start;
                 if (@as(i64, @intCast(timeout)) < elapsed) {
                     ctx.status_code = 408;
                     ctx.responded = true;
@@ -534,24 +545,23 @@ pub fn healthHandler(ctx: *api.Context) !void {
     var results = try registry.checkAll();
     defer results.deinit();
 
-    var buf = std.Io.Writer.Allocating.init(ctx.allocator);
-    defer buf.deinit();
-    const w = &buf.writer;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(ctx.allocator);
 
-    try w.writeAll("{\"status\":\"");
+    try buf.appendSlice(ctx.allocator, "{\"status\":\"");
     const overall = try registry.overall();
     const status_str = switch (overall) {
         .healthy => "healthy",
         .degraded => "degraded",
         .unhealthy => "unhealthy",
     };
-    try w.writeAll(status_str);
-    try w.writeAll("\",\"checks\":{");
+    try buf.appendSlice(ctx.allocator, status_str);
+    try buf.appendSlice(ctx.allocator, "\",\"checks\":{");
 
     var first = true;
     var iter = results.iterator();
     while (iter.next()) |entry| {
-        if (!first) try w.writeAll(",");
+        if (!first) try buf.appendSlice(ctx.allocator, ",");
         first = false;
         const r = entry.value_ptr.*;
         const check_status = switch (r.status) {
@@ -560,15 +570,15 @@ pub fn healthHandler(ctx: *api.Context) !void {
             .unhealthy => "unhealthy",
         };
         if (r.message) |msg| {
-            try w.print("\"{s}\":{{\"status\":\"{s}\",\"message\":\"{s}\"}}", .{ r.name, check_status, msg });
+            try buf.print(ctx.allocator, "\"{s}\":{{\"status\":\"{s}\",\"message\":\"{s}\"}}", .{ r.name, check_status, msg });
         } else {
-            try w.print("\"{s}\":{{\"status\":\"{s}\"}}", .{ r.name, check_status });
+            try buf.print(ctx.allocator, "\"{s}\":{{\"status\":\"{s}\"}}", .{ r.name, check_status });
         }
     }
-    try w.writeAll("}}");
+    try buf.appendSlice(ctx.allocator, "}}");
 
     const code: u16 = if (overall == .unhealthy) 503 else 200;
-    try ctx.json(code, buf.written());
+    try ctx.json(code, buf.items);
 }
 
 test "jwt generate and verify" {

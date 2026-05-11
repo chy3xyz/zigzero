@@ -3,7 +3,7 @@
 //! Aligned with go-zero's core/mr package.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("errors.zig");
 const threading = @import("threading.zig");
 
@@ -30,36 +30,32 @@ pub fn MapReduce(comptime In: type, comptime Out: type) type {
             const results = try self.allocator.alloc(Out, items.len);
             errdefer self.allocator.free(results);
 
-            var active = std.atomic.Value(usize).init(0);
-            var completed = std.atomic.Value(usize).init(0);
-            var mutex = std.Io.Mutex.init;
+            var wg: compat.WaitGroup = .init;
+            var mutex: compat.Mutex = .init;
+            var semaphore = compat.Semaphore.initWithPermits(@intCast(workers));
             var map_err: ?anyerror = null;
 
             for (items, 0..) |item, idx| {
-                while (active.load(.monotonic) >= workers) {
-                    std.Thread.yield() catch {};
-                }
-                _ = @atomicRmw(usize, &active.raw, .Add, 1, .monotonic);
+                semaphore.wait();
+                wg.start();
                 const thread = try std.Thread.spawn(.{}, struct {
-                    fn run(i: In, index: usize, f: *const fn (In) Out, res: []Out, a: *std.atomic.Value(usize), c: *std.atomic.Value(usize), m: *std.Io.Mutex, e: *?anyerror) void {
+                    fn run(i: In, index: usize, f: *const fn (In) Out, res: []Out, s: *compat.Semaphore, w: *compat.WaitGroup, m: *compat.Mutex, e: *?anyerror) void {
                         defer {
-                            _ = @atomicRmw(usize, &a.raw, .Sub, 1, .monotonic);
-                            _ = @atomicRmw(usize, &c.raw, .Add, 1, .monotonic);
+                            s.post();
+                            w.finish();
                         }
                         const out = f(i);
-                        m.lock(io_instance.io) catch {};
+                        m.lock();
                         if (e.* == null) {
                             res[index] = out;
                         }
-                        m.unlock(io_instance.io);
+                        m.unlock();
                     }
-                }.run, .{ item, idx, mapper, results, &active, &completed, &mutex, &map_err });
+                }.run, .{ item, idx, mapper, results, &semaphore, &wg, &mutex, &map_err });
                 thread.detach();
             }
 
-            while (completed.load(.monotonic) < items.len) {
-                std.Thread.yield() catch {};
-            }
+            wg.wait();
             if (map_err) |e| return e;
             return results;
         }
@@ -77,23 +73,21 @@ pub fn MapReduce(comptime In: type, comptime Out: type) type {
             const base_size = items.len / workers;
             const remainder = items.len % workers;
 
-            var active = std.atomic.Value(usize).init(0);
-            var completed = std.atomic.Value(usize).init(0);
+            var wg: compat.WaitGroup = .init;
+            var semaphore = compat.Semaphore.initWithPermits(@intCast(workers));
 
             var start: usize = 0;
             for (0..workers) |worker_idx| {
                 const extra: usize = if (worker_idx < remainder) 1 else 0;
                 const end = start + base_size + extra;
 
-                while (active.load(.monotonic) >= workers) {
-                    std.Thread.yield() catch {};
-                }
-                _ = @atomicRmw(usize, &active.raw, .Add, 1, .monotonic);
+                semaphore.wait();
+                wg.start();
                 const thread = try std.Thread.spawn(.{}, struct {
-                    fn run(s: usize, e: usize, arr: []const Out, initial_val: Out, f: *const fn (Out, Out) Out, res: []Out, idx: usize, a: *std.atomic.Value(usize), c: *std.atomic.Value(usize)) void {
+                    fn run(s: usize, e: usize, arr: []const Out, initial_val: Out, f: *const fn (Out, Out) Out, res: []Out, idx: usize, sem: *compat.Semaphore, w: *compat.WaitGroup) void {
                         defer {
-                            _ = @atomicRmw(usize, &a.raw, .Sub, 1, .monotonic);
-                            _ = @atomicRmw(usize, &c.raw, .Add, 1, .monotonic);
+                            sem.post();
+                            w.finish();
                         }
                         var acc = initial_val;
                         for (arr[s..e]) |item| {
@@ -101,14 +95,12 @@ pub fn MapReduce(comptime In: type, comptime Out: type) type {
                         }
                         res[idx] = acc;
                     }
-                }.run, .{ start, end, items, initial, combiner, chunk_results, worker_idx, &active, &completed });
+                }.run, .{ start, end, items, initial, combiner, chunk_results, worker_idx, &semaphore, &wg });
                 thread.detach();
                 start = end;
             }
 
-            while (completed.load(.monotonic) < workers) {
-                std.Thread.yield() catch {};
-            }
+            wg.wait();
 
             var final = initial;
             for (chunk_results) |r| {
@@ -129,29 +121,25 @@ pub fn MapReduce(comptime In: type, comptime Out: type) type {
             if (items.len == 0) return;
             const workers = if (self.max_workers == 0) items.len else @min(self.max_workers, items.len);
 
-            var active = std.atomic.Value(usize).init(0);
-            var completed = std.atomic.Value(usize).init(0);
+            var wg: compat.WaitGroup = .init;
+            var semaphore = compat.Semaphore.initWithPermits(@intCast(workers));
 
             for (items) |item| {
-                while (active.load(.monotonic) >= workers) {
-                    std.Thread.yield() catch {};
-                }
-                _ = @atomicRmw(usize, &active.raw, .Add, 1, .monotonic);
+                semaphore.wait();
+                wg.start();
                 const thread = try std.Thread.spawn(.{}, struct {
-                    fn run(i: In, f: *const fn (In) void, a: *std.atomic.Value(usize), c: *std.atomic.Value(usize)) void {
+                    fn run(i: In, f: *const fn (In) void, s: *compat.Semaphore, w: *compat.WaitGroup) void {
                         defer {
-                            _ = @atomicRmw(usize, &a.raw, .Sub, 1, .monotonic);
-                            _ = @atomicRmw(usize, &c.raw, .Add, 1, .monotonic);
+                            s.post();
+                            w.finish();
                         }
                         f(i);
                     }
-                }.run, .{ item, worker, &active, &completed });
+                }.run, .{ item, worker, &semaphore, &wg });
                 thread.detach();
             }
 
-            while (completed.load(.monotonic) < items.len) {
-                std.Thread.yield() catch {};
-            }
+            wg.wait();
         }
     };
 }

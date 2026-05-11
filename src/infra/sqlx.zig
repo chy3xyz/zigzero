@@ -4,19 +4,12 @@
 //! Supports SQLite, PostgreSQL, and MySQL via C bindings.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 const sqlite3_c = @import("sqlite3_c.zig");
 const libpq_c = @import("libpq_c.zig");
 const libmysql_c = @import("libmysql_c.zig");
 const breaker = @import("breaker.zig");
-// Helper: get current time in nanoseconds (Zig 0.16 replacement for std.time.nanoTimestamp)
-fn nanoTimestamp() i128 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    return ts.sec * 1_000_000_000 + ts.nsec;
-}
-
 
 /// SQL value types for parameterized queries
 pub const Value = union(enum) {
@@ -651,6 +644,12 @@ pub const PostgresConn = struct {
 
 // ==================== MySQL Implementation ====================
 
+fn appendFmtToBuf(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt_str: []const u8, args: anytype) !void {
+    const s = try std.fmt.allocPrint(allocator, fmt_str, args);
+    defer allocator.free(s);
+    try buf.appendSlice(allocator, s);
+}
+
 fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Value) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -662,16 +661,8 @@ fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Valu
             arg_idx += 1;
             switch (arg) {
                 .null => try buf.appendSlice(allocator, "NULL"),
-                .int => |v| {
-                    const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
-                    defer allocator.free(s);
-                    try buf.appendSlice(allocator, s);
-                },
-                .float => |v| {
-                    const s = try std.fmt.allocPrint(allocator, "{d}", .{v});
-                    defer allocator.free(s);
-                    try buf.appendSlice(allocator, s);
-                },
+                .int => |v| try appendFmtToBuf(&buf, allocator, "{d}", .{v}),
+                .float => |v| try appendFmtToBuf(&buf, allocator, "{d}", .{v}),
                 .string => |v| {
                     try buf.append(allocator, '\'');
                     try buf.appendSlice(allocator, v);
@@ -1220,7 +1211,8 @@ const ConnPool = struct {
     reconnect_delay_ms: u32 = 100,
     active: std.atomic.Value(u32),
     idle: std.ArrayList(Conn),
-    mutex: std.Io.Mutex,
+    mutex: compat.Mutex,
+    cond: compat.Condition,
     closed: std.atomic.Value(bool),
 
     pub fn init(allocator: std.mem.Allocator, client: *Client, max_open: u32, max_idle: u32) ConnPool {
@@ -1232,27 +1224,28 @@ const ConnPool = struct {
             .max_wait_ms = client.config.max_wait_ms,
             .active = std.atomic.Value(u32).init(0),
             .idle = .empty,
-            .mutex = std.Io.Mutex.init,
+            .mutex = .init,
+            .cond = .init,
             .closed = std.atomic.Value(bool).init(false),
         };
     }
 
     pub fn deinit(self: *ConnPool) void {
         self.closed.store(true, .monotonic);
-        self.mutex.lockUncancelable(io_instance.io);
-        defer self.mutex.unlock(io_instance.io);
+        self.cond.broadcast();
+        self.mutex.lock();
+        defer self.mutex.unlock();
         for (self.idle.items) |*conn| {
             conn.close();
         }
         self.idle.deinit(self.allocator);
     }
 
-
     /// Reconnect and add a new idle connection to the pool
     fn reconnect(self: *ConnPool) !void {
         const conn = self.client.newConn() catch return;
-        self.mutex.lockUncancelable(io_instance.io);
-        defer self.mutex.unlock(io_instance.io);
+        self.mutex.lock();
+        defer self.mutex.unlock();
         self.idle.append(self.allocator, conn) catch {
             conn.close();
         };
@@ -1264,7 +1257,7 @@ const ConnPool = struct {
         while (attempts < self.max_reconnect_attempts) : (attempts += 1) {
             const conn = self.client.newConn() catch {
                 if (attempts < self.max_reconnect_attempts - 1) {
-                    std.Thread.yield() catch {};
+                    compat.sleep(std.time.ns_per_ms * self.reconnect_delay_ms);
                     self.reconnect() catch {};
                 }
                 continue;
@@ -1273,7 +1266,7 @@ const ConnPool = struct {
             conn.ping() catch {
                 conn.close();
                 if (attempts < self.max_reconnect_attempts - 1) {
-                    std.Thread.yield() catch {};
+                    compat.sleep(std.time.ns_per_ms * self.reconnect_delay_ms);
                     self.reconnect() catch {};
                 }
                 continue;
@@ -1286,35 +1279,34 @@ const ConnPool = struct {
     pub fn acquire(self: *ConnPool) !Conn {
         if (self.closed.load(.monotonic)) return error.ConnectionFailed;
 
-        self.mutex.lockUncancelable(io_instance.io);
+        self.mutex.lock();
 
         // Try to get from idle pool
         if (self.idle.items.len > 0) {
             const conn = self.idle.pop().?;
-            self.mutex.unlock(io_instance.io);
+            self.mutex.unlock();
             return conn;
         }
 
         // Create new connection if under limit
         const current_active = self.active.load(.monotonic);
         if (current_active < self.max_open) {
-            self.mutex.unlock(io_instance.io);
+            self.mutex.unlock();
             const conn = self.client.newConn() catch return error.ConnectionFailed;
             _ = self.active.fetchAdd(1, .monotonic);
             return conn;
         }
 
-        // Wait for a connection to become available (busy-wait with yield)
-        const wait_until = io_instance.millis() + @as(i64, @intCast(self.max_wait_ms));
-        while (self.idle.items.len == 0 and io_instance.millis() < wait_until) {
-            self.mutex.unlock(io_instance.io);
-            std.Thread.yield() catch {};
-            self.mutex.lockUncancelable(io_instance.io);
+        // Wait for a connection to become available
+        const wait_until = compat.milliTimestamp() + @as(i64, @intCast(self.max_wait_ms));
+        while (self.idle.items.len == 0 and compat.milliTimestamp() < wait_until) {
+            self.cond.timedWait(&self.mutex, @intCast(wait_until - compat.milliTimestamp())) catch break;
+            break;
         }
 
         if (self.idle.items.len > 0) {
             const conn = self.idle.pop().?;
-            self.mutex.unlock(io_instance.io);
+            self.mutex.unlock();
             // final health check before returning
             conn.ping() catch {
                 conn.close();
@@ -1324,7 +1316,7 @@ const ConnPool = struct {
             return conn;
         }
 
-        self.mutex.unlock(io_instance.io);
+        self.mutex.unlock();
         return error.Timeout;
     }
 
@@ -1334,8 +1326,8 @@ const ConnPool = struct {
             _ = self.active.fetchSub(1, .monotonic);
             return;
         }
-        self.mutex.lockUncancelable(io_instance.io);
-        defer self.mutex.unlock(io_instance.io);
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         // Return to idle pool if not full, otherwise close
         if (self.idle.items.len < self.max_idle) {
@@ -1344,6 +1336,7 @@ const ConnPool = struct {
                 _ = self.active.fetchSub(1, .monotonic);
                 return;
             };
+            self.cond.signal();
         } else {
             conn.close();
             _ = self.active.fetchSub(1, .monotonic);
@@ -1382,7 +1375,7 @@ pub const SqlContext = struct {
 
     pub fn isDone(self: SqlContext) bool {
         if (self.deadline_ms) |d| {
-            return io_instance.millis() > d;
+            return compat.milliTimestamp() > d;
         }
         return false;
     }
@@ -1392,7 +1385,7 @@ pub const SqlContext = struct {
     }
 
     pub fn withTimeout(timeout_ms: i64) SqlContext {
-        return .{ .deadline_ms = io_instance.millis() + timeout_ms };
+        return .{ .deadline_ms = compat.milliTimestamp() + timeout_ms };
     }
 };
 
@@ -1410,23 +1403,42 @@ pub const Span = struct {
     start_ns: i128,
     end_ns: ?i128 = null,
     attributes: std.StringHashMap([]const u8),
+    allocator: ?std.mem.Allocator = null,
 
     pub fn init(name: []const u8) Span {
+        return initWithAllocator(std.heap.page_allocator, name);
+    }
+
+    pub fn initWithAllocator(allocator: std.mem.Allocator, name: []const u8) Span {
         return .{
             .name = name,
-            .start_ns = nanoTimestamp(),
+            .start_ns = compat.nanoTimestamp(),
             .end_ns = null,
-            .attributes = std.StringHashMap([]const u8).init(std.heap.page_allocator),
+            .attributes = std.StringHashMap([]const u8).init(allocator),
+            .allocator = allocator,
         };
     }
 
+    pub fn deinit(self: *Span) void {
+        self.attributes.deinit();
+    }
+
     pub fn setAttribute(self: *Span, key: []const u8, value: []const u8) void {
-        self.attributes.put(key, value) catch {};
+        const allocator = self.allocator orelse std.heap.page_allocator;
+        const key_copy = allocator.dupe(u8, key) catch return;
+        const value_copy = allocator.dupe(u8, value) catch {
+            allocator.free(key_copy);
+            return;
+        };
+        self.attributes.put(key_copy, value_copy) catch {
+            allocator.free(key_copy);
+            allocator.free(value_copy);
+        };
     }
 
     pub fn end(self: *Span) void {
         if (self.end_ns == null) {
-            self.end_ns = nanoTimestamp();
+            self.end_ns = compat.nanoTimestamp();
         }
     }
 };
@@ -1583,14 +1595,14 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
 
-        const t0 = nanoTimestamp();
+        const t0 = compat.nanoTimestamp();
         const result = self.doQuery(sql_str, args) catch |err| {
-            const elapsed: u64 = @intCast(nanoTimestamp() - t0);
+            const elapsed: u64 = @intCast(compat.nanoTimestamp() - t0);
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
-        const elapsed: u64 = @intCast(nanoTimestamp() - t0);
+        const elapsed: u64 = @intCast(compat.nanoTimestamp() - t0);
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
         return result;
@@ -1616,14 +1628,14 @@ pub const Client = struct {
         self.ensureBreaker();
         if (!self.cb.?.allow()) return error.CircuitBreakerOpen;
 
-        const t0 = nanoTimestamp();
+        const t0 = compat.nanoTimestamp();
         const result = self.doExec(sql_str, args) catch |err| {
-            const elapsed: u64 = @intCast(nanoTimestamp() - t0);
+            const elapsed: u64 = @intCast(compat.nanoTimestamp() - t0);
             if (self.metrics_callback) |cb| cb(elapsed, sql_str, false, @errorName(err));
             if (!self.isAcceptable(err)) self.cb.?.recordFailure();
             return err;
         };
-        const elapsed: u64 = @intCast(nanoTimestamp() - t0);
+        const elapsed: u64 = @intCast(compat.nanoTimestamp() - t0);
         if (self.metrics_callback) |cb| cb(elapsed, sql_str, true, null);
         self.cb.?.recordSuccess();
         return result;
@@ -2283,9 +2295,9 @@ pub const Builder = struct {
     }
 
     pub fn toSql(self: *const Builder) ![]u8 {
-        var buf_w = std.Io.Writer.Allocating.init(self.allocator);
-        defer buf_w.deinit();
-        const w = &buf_w.writer;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const w = compat.arrayListWriter(&buf, self.allocator);
 
         if (self.select_columns) |cols| {
             try w.writeAll("SELECT ");
@@ -2293,14 +2305,14 @@ pub const Builder = struct {
                 if (i > 0) try w.writeAll(", ");
                 try w.writeAll(col);
             }
-            try w.print(" FROM {s}", .{self.table});
+            try w.print( " FROM {s}", .{self.table});
         } else {
-            try w.print("SELECT * FROM {s}", .{self.table});
+            try w.print( "SELECT * FROM {s}", .{self.table});
         }
 
         if (self.join_clauses) |joins| {
             for (joins) |clause| {
-                try w.print(" {s}", .{clause});
+                try w.print( " {s}", .{clause});
             }
         }
 
@@ -2313,26 +2325,26 @@ pub const Builder = struct {
         }
 
         if (self.group_by_clause) |g| {
-            try w.print(" GROUP BY {s}", .{g});
+            try w.print( " GROUP BY {s}", .{g});
         }
 
         if (self.having_clause) |h| {
-            try w.print(" HAVING {s}", .{h});
+            try w.print( " HAVING {s}", .{h});
         }
 
         if (self.order_by_clause) |o| {
-            try w.print(" ORDER BY {s}", .{o});
+            try w.print( " ORDER BY {s}", .{o});
         }
 
         if (self.limit_val) |n| {
-            try w.print(" LIMIT {d}", .{n});
+            try w.print( " LIMIT {d}", .{n});
         }
 
         if (self.offset_val) |n| {
-            try w.print(" OFFSET {d}", .{n});
+            try w.print( " OFFSET {d}", .{n});
         }
 
-        return self.allocator.dupe(u8, buf_w.written());
+        return self.allocator.dupe(u8, buf.items);
     }
 
     pub fn select(self: *const Builder, columns: []const []const u8) ![]u8 {
@@ -2343,9 +2355,9 @@ pub const Builder = struct {
     }
 
     pub fn insert(self: *const Builder, columns: []const []const u8) ![]u8 {
-        var buf: [1024]u8 = undefined;
-        var fbs = std.Io.Writer.fixed(&buf);
-        const writer = &fbs;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const writer = compat.arrayListWriter(&buf, self.allocator);
 
         try writer.print("INSERT INTO {s} (", .{self.table});
         for (columns, 0..) |col, i| {
@@ -2359,13 +2371,13 @@ pub const Builder = struct {
         }
         try writer.writeAll(")");
 
-        return self.allocator.dupe(u8, fbs.buffered());
+        return self.allocator.dupe(u8, buf.items);
     }
 
     pub fn batchInsert(self: *const Builder, columns: []const []const u8, row_count: usize) ![]u8 {
-        var buf_w = std.Io.Writer.Allocating.init(self.allocator);
-        defer buf_w.deinit();
-        const writer = &buf_w.writer;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+        const writer = compat.arrayListWriter(&buf, self.allocator);
 
         try writer.print("INSERT INTO {s} (", .{self.table});
         for (columns, 0..) |col, i| {
@@ -2385,18 +2397,17 @@ pub const Builder = struct {
             try writer.writeAll(")");
         }
 
-        return self.allocator.dupe(u8, buf_w.written());
+        return self.allocator.dupe(u8, buf.items);
     }
-
 
     pub fn update(self: *const Builder, columns: []const []const u8) ![]u8 {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
-        const w = buf.writer(self.allocator);
-        try std.fmt.format(w, "UPDATE {s} SET ", .{self.table});
+        const w = compat.arrayListWriter(&buf, self.allocator);
+        try w.print( "UPDATE {s} SET ", .{self.table});
         for (columns, 0..) |col, i| {
             if (i > 0) try w.writeAll(", ");
-            try std.fmt.format(w, "{s} = ?{d}", .{ col, i + 1 });
+            try w.print( "{s} = ?{d}", .{ col, i + 1 });
         }
         return self.allocator.dupe(u8, buf.items);
     }
@@ -2422,10 +2433,11 @@ pub const Builder = struct {
 /// In CI: postgres job sets DB=postgres, mysql job sets DB=mysql,
 /// sqlite job leaves DB unset so all tests run.
 fn skipUnlessDb(comptime db: []const u8) !void {
-    const db_env = std.mem.span(std.c.getenv(@as([*:0]const u8, "DB")) orelse {
-        // DB env var not set: skip this DB-specific test (don't run it).
-        return error.SkipZigTest;
-    });
+    const db_env = std.process.Environ.getAlloc(std.testing.environ, std.testing.allocator, "DB") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(db_env);
     if (!std.mem.eql(u8, db_env, db)) {
         return error.SkipZigTest;
     }
@@ -2490,7 +2502,7 @@ test "sqlite context deadline" {
     try std.testing.expectEqual(@as(i64, 1), user_ok.id);
 
     // Expired context should return Timeout
-    const ctx_expired = SqlContext.withDeadline(io_instance.millis() - 1);
+    const ctx_expired = SqlContext.withDeadline(compat.milliTimestamp() - 1);
     const err = client.queryRowCtx(ctx_expired, User, "SELECT 1 AS id, 'Alice' AS name", &.{}) catch |e| e;
     try std.testing.expectEqual(errors.Error.Timeout, err);
 }
@@ -2815,11 +2827,11 @@ test "sqlite connection pool" {
 test "sqlite prepared statement" {
     const allocator = std.testing.allocator;
     const db_path = "/tmp/zigzero_sqlx_stmt_test.db";
-    std.Io.Dir.cwd().deleteFile(io_instance.io, db_path) catch {};
+    compat.deleteFile(db_path) catch {};
     var client = Client.init(allocator, .{ .driver = .sqlite, .sqlite_path = db_path });
     defer {
         client.deinit();
-        std.Io.Dir.cwd().deleteFile(io_instance.io, db_path) catch {};
+        compat.deleteFile(db_path) catch {};
     }
 
     _ = try client.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", &.{});
@@ -2889,7 +2901,14 @@ test "postgres live connection" {
 
     // Support env overrides for CI and local dev
     const conninfo_default = "host=localhost port=5432 dbname=postgres user=cborli";
-    const conninfo = std.mem.span(std.c.getenv(@as([*:0]const u8, "PGconninfo"))) orelse conninfo_default;
+    const conninfo = std.process.Environ.getAlloc(std.testing.environ, allocator, "PGconninfo") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => conninfo_default,
+        else => return err,
+    };
+    const conninfo_owned = conninfo.ptr != conninfo_default.ptr;
+    if (conninfo_owned) {
+        defer allocator.free(conninfo);
+    }
 
     var client = Client.init(allocator, .{
         .driver = .postgres,
@@ -2925,13 +2944,37 @@ test "mysql live connection" {
 
     // Support env overrides for CI and local dev
     const host_default = "127.0.0.1";
-    const host = std.mem.span(std.c.getenv(@as([*:0]const u8, "MYSQL_HOST"))) orelse host_default;
+    const host = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_HOST") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => host_default,
+        else => return err,
+    };
+    if (host.ptr != host_default.ptr) {
+        defer allocator.free(host);
+    }
     const user_default = "root";
-    const user = std.mem.span(std.c.getenv(@as([*:0]const u8, "MYSQL_USER"))) orelse user_default;
+    const user = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_USER") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => user_default,
+        else => return err,
+    };
+    if (user.ptr != user_default.ptr) {
+        defer allocator.free(user);
+    }
     const pass_default = "";
-    const pass = std.mem.span(std.c.getenv(@as([*:0]const u8, "MYSQL_PASSWORD"))) orelse pass_default;
+    const pass = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_PASSWORD") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => pass_default,
+        else => return err,
+    };
+    if (pass.ptr != pass_default.ptr) {
+        defer allocator.free(pass);
+    }
     const db_default = "zigzero_test";
-    const db = std.mem.span(std.c.getenv(@as([*:0]const u8, "MYSQL_DATABASE"))) orelse db_default;
+    const db = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_DATABASE") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => db_default,
+        else => return err,
+    };
+    if (db.ptr != db_default.ptr) {
+        defer allocator.free(db);
+    }
 
     var client = Client.init(allocator, .{
         .driver = .mysql,

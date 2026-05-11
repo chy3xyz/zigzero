@@ -3,21 +3,8 @@
 //! Provides token bucket and sliding window rate limiting aligned with go-zero's limit.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
-
-// Helper functions for getting timestamps in Zig 0.16
-fn nanoTimestamp() i128 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    return ts.sec * 1_000_000_000 + ts.nsec;
-}
-
-fn milliTimestamp() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-    return ts.sec * 1000 + @divFloor(ts.nsec, 1000000);
-}
 
 /// Rate limiter type
 pub const Type = enum {
@@ -49,7 +36,7 @@ pub const TokenBucket = struct {
             .rate = rate,
             .burst = burst,
             .tokens = @as(f64, @floatFromInt(burst)),
-            .last_update = nanoTimestamp(),
+            .last_update = compat.nanoTimestamp(),
         };
     }
 
@@ -71,7 +58,7 @@ pub const TokenBucket = struct {
 
     /// Replenish tokens based on elapsed time
     fn replenish(self: *TokenBucket) void {
-        const now = nanoTimestamp();
+        const now = compat.nanoTimestamp();
         const elapsed = @as(f64, @floatFromInt(now - self.last_update)) / 1_000_000_000.0;
 
         self.tokens = @min(@as(f64, @floatFromInt(self.burst)), self.tokens + elapsed * self.rate);
@@ -92,33 +79,34 @@ pub const SlidingWindow = struct {
             .allocator = allocator,
             .rate = rate,
             .window_size_ns = @as(i64, @intCast(window_sec)) * 1_000_000_000,
-            .requests = std.ArrayList(i64).init(allocator),
+            .requests = std.ArrayList(i64).empty,
         };
     }
 
     pub fn deinit(self: *SlidingWindow) void {
-        self.requests.deinit();
+        self.requests.deinit(self.allocator);
     }
 
-    /// Try to allow a request
+    /// Try to allow a request. Expired entries are removed in-place (O(n) scan,
+    /// but avoids O(n²) orderedRemove shuffle).
     pub fn allow(self: *SlidingWindow) bool {
-        const now = nanoTimestamp();
+        const now = compat.nanoTimestamp();
         const window_start = now - self.window_size_ns;
 
-        // Remove expired requests
-        var i: usize = 0;
-        while (i < self.requests.items.len) {
-            if (self.requests.items[i] <= window_start) {
-                _ = self.requests.orderedRemove(i);
-            } else {
-                i += 1;
+        // In-place compaction: shift live timestamps to the front.
+        var write_idx: usize = 0;
+        for (self.requests.items) |ts| {
+            if (ts > window_start) {
+                self.requests.items[write_idx] = ts;
+                write_idx += 1;
             }
         }
+        self.requests.shrinkRetainingCapacity(write_idx);
 
         // Check if under limit
         const count = @as(u32, @intCast(self.requests.items.len));
         if (count < @as(u32, @intFromFloat(self.rate))) {
-            self.requests.append(now) catch return false;
+            self.requests.append(self.allocator, @intCast(now)) catch return false;
             return true;
         }
 
@@ -132,7 +120,7 @@ pub const IpLimiter = struct {
     rate: f64,
     burst: u32,
     buckets: std.StringHashMap(TokenBucket),
-    mutex: std.Io.Mutex,
+    mutex: compat.Mutex,
     last_cleanup: i64,
     cleanup_interval_ms: i64,
 
@@ -142,8 +130,8 @@ pub const IpLimiter = struct {
             .rate = rate,
             .burst = burst,
             .buckets = std.StringHashMap(TokenBucket).init(allocator),
-            .mutex = std.Io.Mutex.init,
-            .last_cleanup = milliTimestamp(),
+            .mutex = .init,
+            .last_cleanup = compat.milliTimestamp(),
             .cleanup_interval_ms = 60000, // cleanup every 60s
         };
     }
@@ -158,8 +146,8 @@ pub const IpLimiter = struct {
 
     /// Check if request from ip is allowed
     pub fn allow(self: *IpLimiter, ip: []const u8) bool {
-        self.mutex.lockUncancelable(io_instance.io);
-        defer self.mutex.unlock(io_instance.io);
+        self.mutex.lock();
+        defer self.mutex.unlock();
 
         const gop = self.buckets.getOrPut(ip) catch return false;
         if (!gop.found_existing) {
@@ -170,7 +158,7 @@ pub const IpLimiter = struct {
         const result = gop.value_ptr.allow();
 
         // Periodic cleanup of stale buckets
-        const now = milliTimestamp();
+        const now = compat.milliTimestamp();
         if (now - self.last_cleanup > self.cleanup_interval_ms) {
             self.last_cleanup = now;
             self.cleanupStaleBuckets();
@@ -180,7 +168,7 @@ pub const IpLimiter = struct {
     }
 
     fn cleanupStaleBuckets(self: *IpLimiter) void {
-        const now = nanoTimestamp();
+        const now = compat.nanoTimestamp();
         var iter = self.buckets.iterator();
         var to_remove: std.ArrayList([]const u8) = .empty;
         defer {
@@ -204,17 +192,29 @@ pub const IpLimiter = struct {
 
 /// Global rate limiter storage
 var global_limiters: std.StringHashMapUnmanaged(TokenBucket) = .{};
+var global_limiter_mutex: compat.Mutex = .init;
+var limiter_allocator: ?std.mem.Allocator = null;
 
-/// Get or create a rate limiter
+/// Initialize global limiter storage with a dedicated allocator.
+/// Call this once during application startup (e.g. with GPA allocator).
+pub fn initGlobalLimiters(allocator: std.mem.Allocator) void {
+    limiter_allocator = allocator;
+}
+
+/// Get or create a rate limiter. Thread-safe.
 pub fn getLimiter(name: []const u8, config: Config) *TokenBucket {
-    const gpa = std.heap.page_allocator;
-    if (global_limiters.get(gpa, name)) |limiter| {
+    const allocator = limiter_allocator orelse std.heap.page_allocator;
+
+    global_limiter_mutex.lock();
+    defer global_limiter_mutex.unlock();
+
+    if (global_limiters.getPtr(name)) |limiter| {
         return limiter;
     }
 
     const limiter = TokenBucket.new(config.rate, config.burst);
-    global_limiters.put(gpa, name, limiter) catch return &global_limiters.get(gpa, name).?;
-    return &global_limiters.get(gpa, name).?;
+    global_limiters.put(allocator, name, limiter) catch return global_limiters.getPtr(name).?;
+    return global_limiters.getPtr(name).?;
 }
 
 test "token bucket" {
@@ -243,4 +243,31 @@ test "ip limiter" {
     // Different IP should have its own bucket
     try std.testing.expect(limiter.allow("192.168.1.2"));
     try std.testing.expect(limiter.allow("192.168.1.2"));
+}
+
+
+test "sliding window compaction" {
+    const allocator = std.testing.allocator;
+    var sw = try SlidingWindow.init(allocator, 100.0, 1);
+    defer sw.deinit();
+
+    // Fill up to limit
+    var i: u32 = 0;
+    while (i < 100) : (i += 1) {
+        try std.testing.expect(sw.allow());
+    }
+    // Should reject when at limit
+    try std.testing.expect(!sw.allow());
+
+    // After compaction, expired entries should be removed correctly
+    // (we can't easily sleep in tests, but we verify internal state consistency)
+    try std.testing.expectEqual(@as(usize, 100), sw.requests.items.len);
+}
+
+test "global limiter thread safety init" {
+    // Just verify getLimiter doesn't crash and returns a stable pointer
+    const ptr1 = getLimiter("test-limit-1", .{ .rate = 10.0, .burst = 5 });
+    const ptr2 = getLimiter("test-limit-1", .{ .rate = 10.0, .burst = 5 });
+    try std.testing.expectEqual(ptr1, ptr2);
+    try std.testing.expect(ptr1.allow());
 }

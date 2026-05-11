@@ -15,13 +15,13 @@ fn detectPqPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
     }
     const target = b.graph.host.result;
     if (target.os.tag == .macos) {
-        if (dirExists("/opt/homebrew/opt/libpq")) {
+        if (dirExists(b, "/opt/homebrew/opt/libpq")) {
             return .{
                 .include = "/opt/homebrew/opt/libpq/include",
                 .lib = "/opt/homebrew/opt/libpq/lib",
             };
         }
-        if (dirExists("/usr/local/opt/libpq")) {
+        if (dirExists(b, "/usr/local/opt/libpq")) {
             return .{
                 .include = "/usr/local/opt/libpq/include",
                 .lib = "/usr/local/opt/libpq/lib",
@@ -35,7 +35,7 @@ fn detectPqPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
             "/usr/pgsql/include",
         };
         for (candidates) |c| {
-            if (dirExists(c)) {
+            if (dirExists(b, c)) {
                 return .{
                     .include = c,
                     .lib = "/usr/lib/x86_64-linux-gnu",
@@ -60,7 +60,7 @@ fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
             "/usr/local/opt/mysql-client",
         };
         for (prefixes) |prefix| {
-            if (dirExists(prefix)) {
+            if (dirExists(b, prefix)) {
                 return .{
                     .include = b.fmt("{s}/include/mariadb", .{prefix}),
                     .lib = b.fmt("{s}/lib", .{prefix}),
@@ -74,7 +74,7 @@ fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
             "/usr/local/include/mariadb",
         };
         for (candidates) |c| {
-            if (dirExists(c)) {
+            if (dirExists(b, c)) {
                 return .{
                     .include = c,
                     .lib = "/usr/lib/x86_64-linux-gnu",
@@ -86,9 +86,9 @@ fn detectMysqlPaths(b: *std.Build, allocator: std.mem.Allocator) CLibPaths {
     return .{};
 }
 
-fn dirExists(path: []const u8) bool {
-    _ = path;
-    return true; // Simplified for Zig 0.16 upgrade
+fn dirExists(b: *std.Build, path: []const u8) bool {
+    std.Io.Dir.accessAbsolute(b.graph.io, path, .{}) catch return false;
+    return true;
 }
 
 fn linkDbLibs(mod: *std.Build.Module, b: *std.Build) void {
@@ -133,6 +133,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    ctl_module.addImport("zigzero", zigzero_mod);
     const ctl = b.addExecutable(.{
         .name = "zigzeroctl",
         .root_module = ctl_module,

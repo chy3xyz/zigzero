@@ -4,7 +4,7 @@
 //! Aligned with go-zero's rest package.
 
 const std = @import("std");
-const io_instance = @import("../io_instance.zig");
+const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 const log = @import("../infra/log.zig");
 const trace = @import("../infra/trace.zig");
@@ -92,7 +92,7 @@ pub const Context = struct {
     user_data: ?*anyopaque = null,
     trace_context: ?trace.TraceContext = null,
     validation_error_message: ?[]const u8 = null,
-    stream: ?std.Io.net.Stream = null,
+    stream: ?compat.net.Stream = null,
     upgraded: bool = false,
 
     // Middleware chain fields
@@ -110,7 +110,7 @@ pub const Context = struct {
             .params = std.StringHashMap([]const u8).init(allocator),
             .headers = std.StringHashMap([]const u8).init(allocator),
             .form = std.StringHashMap([]const u8).init(allocator),
-            .response_body = .empty,
+            .response_body = std.ArrayList(u8).empty,
             .response_headers = std.StringHashMap([]const u8).init(allocator),
             .logger = logger,
         };
@@ -332,15 +332,17 @@ fn parseFormBody(allocator: std.mem.Allocator, body: []const u8) !std.StringHash
 
 /// Simple stream reader wrapper for HTTP parsing
 const StreamReader = struct {
-    stream: std.Io.net.Stream,
+    stream: compat.net.Stream,
     buf: [8192]u8 = undefined,
     pos: usize = 0,
     end: usize = 0,
 
     fn readByte(self: *StreamReader) !?u8 {
         if (self.pos >= self.end) {
-            // TODO: Zig 0.16 Stream I/O requires Reader
-            return null;
+            const n = try compat.net.streamRead(self.stream, &self.buf);
+            if (n == 0) return null;
+            self.pos = 0;
+            self.end = n;
         }
         const b = self.buf[self.pos];
         self.pos += 1;
@@ -355,14 +357,26 @@ const StreamReader = struct {
             i += 1;
             if (b == delimiter) return out[0..i];
         }
-        return out[0..i];
+        return error.LineTooLong;
     }
 
     fn readAll(self: *StreamReader, out: []u8) !usize {
-        // TODO: Zig 0.16 Stream I/O requires Reader
-        _ = out;
-        _ = self;
-        return 0;
+        var total: usize = 0;
+        while (total < out.len) {
+            // First, drain any buffered bytes
+            if (self.pos < self.end) {
+                const avail = self.end - self.pos;
+                const to_copy = @min(avail, out.len - total);
+                @memcpy(out[total..][0..to_copy], self.buf[self.pos..][0..to_copy]);
+                self.pos += to_copy;
+                total += to_copy;
+                continue;
+            }
+            const n = try compat.net.streamRead(self.stream, out[total..]);
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
     }
 };
 
@@ -661,26 +675,22 @@ fn getStatusText(status: u16) []const u8 {
 
 /// HTTP response writer
 const ResponseWriter = struct {
-    pub fn write(allocator: std.mem.Allocator, stream: std.Io.net.Stream, status: u16, headers: *const std.StringHashMap([]const u8), body: []const u8) !void {
-        var buf = std.Io.Writer.Allocating.init(allocator);
-        defer buf.deinit();
-        const w = &buf.writer;
-
+    pub fn write(allocator: std.mem.Allocator, stream: compat.net.Stream, status: u16, headers: *const std.StringHashMap([]const u8), body: []const u8) !void {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(allocator);
         const status_text = getStatusText(status);
-        try w.print("HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
+        try buf.print(allocator, "HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
 
         var iter = headers.iterator();
         while (iter.next()) |entry| {
-            try w.print("{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
+            try buf.print(allocator, "{s}: {s}\r\n", .{ entry.key_ptr.*, entry.value_ptr.* });
         }
 
-        try w.print("Content-Length: {d}\r\n", .{body.len});
-        try w.writeAll("\r\n");
-        try w.writeAll(body);
+        try buf.print(allocator, "Content-Length: {d}\r\n", .{body.len});
+        try buf.appendSlice(allocator, "\r\n");
+        try buf.appendSlice(allocator, body);
 
-        var io_buffer: [4096]u8 = undefined;
-        var stream_writer = stream.writer(io_instance.io, &io_buffer);
-        try stream_writer.writeAll(buf.items);
+        compat.net.streamWrite(stream, buf.items) catch {};
     }
 };
 
@@ -756,6 +766,100 @@ pub const RouteGroup = struct {
     }
 };
 
+/// Server configuration
+pub const ServerConfig = struct {
+    port: u16 = 8080,
+    max_body_size: usize = 8 * 1024 * 1024, // 8MB
+    request_timeout_ms: u32 = 30000, // 30s
+    worker_threads: u32 = 0, // 0 = CPU count
+    max_queue_size: usize = 1024,
+};
+
+/// Worker pool for handling connections with bounded queue.
+/// Replaces thread-per-connection to prevent thread explosion under load.
+const WorkerPool = struct {
+    allocator: std.mem.Allocator,
+    workers: []std.Thread,
+    queue: std.ArrayList(compat.net.Stream),
+    mutex: compat.Mutex,
+    cond: compat.Condition,
+    running: std.atomic.Value(bool),
+    max_queue_size: usize,
+    server: *Server,
+    started_count: usize = 0,
+
+    pub fn init(allocator: std.mem.Allocator, server: *Server, worker_count: u32, max_queue_size: usize) !WorkerPool {
+        const count = if (worker_count == 0)
+            @max(2, std.Thread.getCpuCount() catch 2)
+        else
+            worker_count;
+
+        const workers = try allocator.alloc(std.Thread, count);
+        errdefer allocator.free(workers);
+
+        return WorkerPool{
+            .allocator = allocator,
+            .workers = workers,
+            .queue = std.ArrayList(compat.net.Stream).empty,
+            .mutex = .init,
+            .cond = .init,
+            .running = std.atomic.Value(bool).init(true),
+            .max_queue_size = max_queue_size,
+            .server = server,
+        };
+    }
+
+    pub fn start(self: *WorkerPool) !void {
+        for (0..self.workers.len) |i| {
+            self.workers[i] = try std.Thread.spawn(.{}, workerLoop, .{self});
+            self.started_count += 1;
+        }
+    }
+
+    pub fn deinit(self: *WorkerPool) void {
+        self.mutex.lock();
+        self.running.store(false, .monotonic);
+        self.cond.broadcast();
+        self.mutex.unlock();
+        for (self.workers[0..self.started_count]) |worker| {
+            worker.join();
+        }
+        self.allocator.free(self.workers);
+        self.queue.deinit(self.allocator);
+    }
+
+    /// Submit a connection to the pool. Returns false if queue is full (server overloaded).
+    pub fn submit(self: *WorkerPool, stream: compat.net.Stream) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.queue.items.len >= self.max_queue_size) {
+            return false;
+        }
+
+        self.queue.append(self.allocator, stream) catch return false;
+        self.cond.signal();
+        return true;
+    }
+
+    fn workerLoop(self: *WorkerPool) void {
+        while (self.running.load(.monotonic)) {
+            self.mutex.lock();
+            while (self.queue.items.len == 0 and self.running.load(.monotonic)) {
+                self.cond.wait(&self.mutex);
+            }
+            if (!self.running.load(.monotonic)) {
+                self.mutex.unlock();
+                break;
+            }
+            const stream = self.queue.orderedRemove(0);
+            self.mutex.unlock();
+
+            self.server.handleConnection(stream);
+        }
+    }
+};
+
 /// HTTP server
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -764,31 +868,42 @@ pub const Server = struct {
     global_middleware: std.ArrayList(Middleware),
     name: []const u8,
     running: std.atomic.Value(bool),
-    server_socket: ?std.Io.net.Server = null,
+    server_socket: ?compat.net.Server = null,
     logger: log.Logger,
     max_body_size: usize,
     request_timeout_ms: u32,
+    worker_pool: ?WorkerPool = null,
 
     pub fn init(allocator: std.mem.Allocator, port: u16, logger: log.Logger) Server {
+        return initWithConfig(allocator, logger, .{ .port = port });
+    }
+
+    pub fn initWithConfig(allocator: std.mem.Allocator, logger: log.Logger, config: ServerConfig) Server {
         return .{
             .allocator = allocator,
-            .port = port,
+            .port = config.port,
             .router = Router.init(allocator),
-            .global_middleware = .empty,
+            .global_middleware = std.ArrayList(Middleware).empty,
             .name = "zigzero-api",
             .running = std.atomic.Value(bool).init(false),
             .server_socket = null,
             .logger = logger,
-            .max_body_size = 8 * 1024 * 1024, // 8MB default
-            .request_timeout_ms = 30000, // 30s default
+            .max_body_size = config.max_body_size,
+            .request_timeout_ms = config.request_timeout_ms,
+            .worker_pool = null,
         };
     }
 
     pub fn deinit(self: *Server) void {
+        self.stop();
+        if (self.worker_pool) |*pool| {
+            pool.deinit();
+            self.worker_pool = null;
+        }
         self.router.deinit();
         self.global_middleware.deinit(self.allocator);
         if (self.server_socket) |*ss| {
-            ss.deinit(io_instance.io);
+            ss.deinit(compat.io());
         }
     }
 
@@ -807,77 +922,89 @@ pub const Server = struct {
         try self.global_middleware.append(self.allocator, mw);
     }
 
-    /// Start the server
+    /// Start the server with worker pool
     pub fn start(self: *Server) !void {
-        const addr = std.Io.net.IpAddress.parseIp4("0.0.0.0", self.port) catch {
+        const addr = compat.net.IpAddress.parseIp4("0.0.0.0", self.port) catch |err| {
+            self.logger.err(try std.fmt.allocPrint(self.allocator, "Failed to parse bind address: {any}", .{err}));
             return error.ServerError;
         };
 
-        var server = addr.listen(io_instance.io, .{
+        var server = addr.listen(compat.io(), .{
             .reuse_address = true,
             .kernel_backlog = 128,
-        }) catch {
+        }) catch |err| {
+            self.logger.err(try std.fmt.allocPrint(self.allocator, "Failed to listen on port {d}: {any}", .{ self.port, err }));
             return error.ServerError;
         };
 
         self.server_socket = server;
         self.running.store(true, .monotonic);
 
-        self.logger.info(try std.fmt.allocPrint(self.allocator, "Server listening on port {d}", .{self.port}));
+        // Initialize worker pool (default: CPU count threads, 1024 queue)
+        const pool_config = ServerConfig{};
+        self.worker_pool = try WorkerPool.init(self.allocator, self, pool_config.worker_threads, pool_config.max_queue_size);
+        try self.worker_pool.?.start();
+
+        self.logger.info(try std.fmt.allocPrint(self.allocator, "Server listening on port {d} with {d} workers", .{
+            self.port,
+            self.worker_pool.?.workers.len,
+        }));
 
         while (self.running.load(.monotonic)) {
-            const conn = server.accept(io_instance.io) catch |err| {
+            const stream = server.accept(compat.io()) catch |err| {
                 if (!self.running.load(.monotonic)) break;
                 self.logger.err(try std.fmt.allocPrint(self.allocator, "Accept error: {any}", .{err}));
                 continue;
             };
 
-            const conn_ptr = try self.allocator.create(std.Io.net.Stream);
-            conn_ptr.* = conn;
-
-            const thread = std.Thread.spawn(.{}, handleConnection, .{ self, conn_ptr }) catch |err| {
-                self.logger.err(try std.fmt.allocPrint(self.allocator, "Failed to spawn thread: {any}", .{err}));
-                conn_ptr.close(io_instance.io);
-                self.allocator.destroy(conn_ptr);
-                continue;
-            };
-            thread.detach();
+            if (self.worker_pool) |*pool| {
+                if (!pool.submit(stream)) {
+                    self.logger.warn(try std.fmt.allocPrint(self.allocator, "Server overloaded, rejecting connection", .{}));
+                    const reject_response = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 21\r\n\r\nService Unavailable\r\n";
+                    compat.net.streamWrite(stream, reject_response) catch {};
+                    compat.net.streamClose(stream);
+                }
+            } else {
+                // Fallback (should never happen)
+                compat.net.streamClose(stream);
+            }
         }
     }
 
     /// Stop the server
     pub fn stop(self: *Server) void {
         self.running.store(false, .monotonic);
+        if (self.worker_pool) |*pool| {
+            pool.cond.broadcast();
+        }
         if (self.server_socket) |*ss| {
-            ss.deinit(io_instance.io);
+            ss.deinit(compat.io());
             self.server_socket = null;
         }
     }
 
-    fn handleConnection(self: *Server, conn: *std.Io.net.Stream) void {
+    fn handleConnection(self: *Server, stream: compat.net.Stream) void {
         var close_stream = true;
         defer {
-            if (close_stream) conn.close(io_instance.io);
-            self.allocator.destroy(conn);
+            if (close_stream) compat.net.streamClose(stream);
         }
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const arena_alloc = arena.allocator();
 
-        var stream_reader = StreamReader{ .stream = conn.* };
+        var stream_reader = StreamReader{ .stream = stream };
 
-        const start_time = io_instance.millis();
+        const start_time = compat.milliTimestamp();
 
         var parser = RequestParser.init(arena_alloc);
         var request = parser.parse(&stream_reader, self.max_body_size) catch |err| {
+            const err_msg = std.fmt.allocPrint(arena_alloc, "Parse error: {any}", .{err}) catch "Parse error";
+            self.logger.err(err_msg);
             const status: u16 = if (err == error.BodyTooLarge) 413 else 400;
             const msg = if (err == error.BodyTooLarge) "Payload Too Large" else "Bad Request";
-
-            // Write error response directly to stream
-            var io_buffer: [4096]u8 = undefined;
-            var stream_writer = conn.writer(io_instance.io, &io_buffer);
-            stream_writer.interface.print("HTTP/1.1 {d} {s}\r\n\r\n{s}", .{ status, msg, msg }) catch {};
+            const response = std.fmt.allocPrint(arena_alloc, "HTTP/1.1 {d} {s}\r\n\r\n", .{ status, msg }) catch return;
+            compat.net.streamWrite(stream, response) catch {};
             return;
         };
         defer request.deinit(arena_alloc);
@@ -890,7 +1017,7 @@ pub const Server = struct {
             return;
         };
         defer ctx.deinit();
-        ctx.stream = conn.*;
+        ctx.stream = stream;
 
         // Copy query params
         var query_iter = request.query.iterator();
@@ -948,7 +1075,7 @@ pub const Server = struct {
         }
 
         // Check request timeout
-        const elapsed = io_instance.millis() - start_time;
+        const elapsed = compat.milliTimestamp() - start_time;
         if (elapsed > self.request_timeout_ms) {
             const timeout_msg = std.fmt.allocPrint(arena_alloc, "Request timeout: {s} {s} took {d}ms", .{ request.method.toString(), request.path, elapsed }) catch "Request timeout";
             self.logger.warn(timeout_msg);
@@ -959,6 +1086,8 @@ pub const Server = struct {
             return;
         }
 
+        // Send response
+        ResponseWriter.write(arena_alloc, stream, ctx.status_code, &ctx.response_headers, ctx.response_body.items) catch {};
     }
 
     fn executeWithMiddleware(self: *Server, ctx: *Context, final_handler: HandlerFn, route_middleware: []const Middleware) !void {
@@ -1104,4 +1233,35 @@ test "route group" {
     // Route should exist at /api/v1/users
     const matched = server.router.match(.GET, "/api/v1/users");
     try std.testing.expect(matched != null);
+}
+
+
+test "worker pool queue limits" {
+    const allocator = std.testing.allocator;
+    const logger = log.Logger.new(.info, "test");
+    var server = Server.initWithConfig(allocator, logger, .{
+        .port = 0,
+        .worker_threads = 2,
+        .max_queue_size = 3,
+    });
+    defer server.deinit();
+
+    // WorkerPool should be initializable even without starting the server
+    var pool = try WorkerPool.init(allocator, &server, 2, 3);
+    defer pool.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), pool.workers.len);
+    try std.testing.expectEqual(@as(usize, 3), pool.max_queue_size);
+
+    // Queue bounds are verified by WorkerPool.init parameters;
+    // actual stream submission requires a valid connection.
+}
+
+test "server config defaults" {
+    const cfg = ServerConfig{};
+    try std.testing.expectEqual(@as(u16, 8080), cfg.port);
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024), cfg.max_body_size);
+    try std.testing.expectEqual(@as(u32, 30000), cfg.request_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 0), cfg.worker_threads);
+    try std.testing.expectEqual(@as(usize, 1024), cfg.max_queue_size);
 }

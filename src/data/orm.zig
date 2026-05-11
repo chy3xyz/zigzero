@@ -173,34 +173,39 @@ pub const Query = struct {
         return self;
     }
 
-    pub fn build(self: *const Query) ![]const u8 {
-        var buf = std.Io.Writer.Allocating.init(self.allocator);
-        defer buf.deinit();
-        const w = &buf.writer;
+    fn appendFmt(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt_str: []const u8, args: anytype) !void {
+        const s = try std.fmt.allocPrint(allocator, fmt_str, args);
+        defer allocator.free(s);
+        try buf.appendSlice(allocator, s);
+    }
 
-        try w.print("SELECT {s} FROM {s}", .{ self.select_fields, self.table });
+    pub fn build(self: *const Query) ![]const u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.allocator);
+
+        try appendFmt(&buf, self.allocator, "SELECT {s} FROM {s}", .{ self.select_fields, self.table });
 
         if (self.where_clauses.items.len > 0) {
-            try w.writeAll(" WHERE ");
+            try buf.appendSlice(self.allocator, " WHERE ");
             for (self.where_clauses.items, 0..) |clause, i| {
-                if (i > 0) try w.writeAll(" AND ");
-                try w.writeAll(clause);
+                if (i > 0) try buf.appendSlice(self.allocator, " AND ");
+                try buf.appendSlice(self.allocator, clause);
             }
         }
 
         if (self.order_by) |order_field| {
-            try w.print(" ORDER BY {s}", .{order_field});
+            try appendFmt(&buf, self.allocator, " ORDER BY {s}", .{order_field});
         }
 
         if (self.limit_val) |n| {
-            try w.print(" LIMIT {d}", .{n});
+            try appendFmt(&buf, self.allocator, " LIMIT {d}", .{n});
         }
 
         if (self.offset_val) |n| {
-            try w.print(" OFFSET {d}", .{n});
+            try appendFmt(&buf, self.allocator, " OFFSET {d}", .{n});
         }
 
-        return try self.allocator.dupe(u8, buf.written());
+        return try self.allocator.dupe(u8, buf.items);
     }
 };
 
