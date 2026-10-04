@@ -142,8 +142,8 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
     if (info != .@"struct") @compileError("scanStruct only supports structs, got " ++ @typeName(T));
 
     var result: T = undefined;
-    inline for (info.@"struct".fields) |field| {
-        const FieldType = field.type;
+    const s_info = info.@"struct";
+    inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
         const is_optional = @typeInfo(FieldType) == .optional;
         const BaseType = if (is_optional) @typeInfo(FieldType).optional.child else FieldType;
         const is_string = BaseType == []const u8;
@@ -153,29 +153,29 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
             // row.get() duplicates the string; valueToType would duplicate again.
             found: {
                 for (row.columns, 0..) |col, ci| {
-                    if (std.mem.eql(u8, col, field.name)) {
+                    if (std.mem.eql(u8, col, field_name)) {
                         const raw_val = row.values[ci];
                         if (raw_val == null or raw_val.? == .null) {
                             if (is_optional) {
-                                @field(result, field.name) = null;
+                                @field(result, field_name) = null;
                             } else if (partial) {
-                                @field(result, field.name) = &[_]u8{};
+                                @field(result, field_name) = &[_]u8{};
                             } else {
                                 return error.NotFound;
                             }
                         } else {
                             // raw_val.? is .string. Dupe it once (owned); freeScanned frees it.
                             const str = raw_val.?.string;
-                            @field(result, field.name) = allocator.dupe(u8, str) catch return error.DatabaseError;
+                            @field(result, field_name) = allocator.dupe(u8, str) catch return error.DatabaseError;
                         }
                         break :found;
                     }
                 }
                 // Column not found
                 if (is_optional) {
-                    @field(result, field.name) = null;
+                    @field(result, field_name) = null;
                 } else if (partial) {
-                    @field(result, field.name) = &[_]u8{};
+                    @field(result, field_name) = &[_]u8{};
                 } else {
                     return error.NotFound;
                 }
@@ -184,23 +184,23 @@ fn scanStruct(allocator: std.mem.Allocator, comptime T: type, row: Row, partial:
         }
 
         // Non-string fields: use row.get() as before (no duplication concern)
-        const val = row.get(field.name);
+        const val = row.get(field_name);
         if (is_optional) {
             const ChildType = BaseType;
             if (val == null or val.? == .null) {
-                @field(result, field.name) = null;
+                @field(result, field_name) = null;
             } else {
-                @field(result, field.name) = try valueToType(allocator, ChildType, val.?);
+                @field(result, field_name) = try valueToType(allocator, ChildType, val.?);
             }
         } else {
             if (val == null or val.? == .null) {
                 if (partial) {
-                    @field(result, field.name) = std.mem.zeroes(FieldType);
+                    @field(result, field_name) = std.mem.zeroes(FieldType);
                 } else {
                     return error.NotFound;
                 }
             } else {
-                @field(result, field.name) = try valueToType(allocator, FieldType, val.?);
+                @field(result, field_name) = try valueToType(allocator, FieldType, val.?);
             }
         }
     }
@@ -224,12 +224,12 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
 pub fn freeScanned(allocator: std.mem.Allocator, comptime T: type, val: T) void {
     const info = @typeInfo(T);
     if (info != .@"struct") return;
-    inline for (info.@"struct".fields) |field| {
-        const FieldType = field.type;
+    const s_info = info.@"struct";
+    inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
         if (FieldType == []const u8) {
-            allocator.free(@field(val, field.name));
+            allocator.free(@field(val, field_name));
         } else if (@typeInfo(FieldType) == .optional and @typeInfo(FieldType).optional.child == []const u8) {
-            if (@field(val, field.name)) |s| allocator.free(s);
+            if (@field(val, field_name)) |s| allocator.free(s);
         }
     }
 }
@@ -1898,13 +1898,13 @@ pub const Transaction = struct {
 
 fn deepCopyStruct(allocator: std.mem.Allocator, comptime T: type, src: T) !T {
     var dst = src;
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        const FieldType = field.type;
+    const s_info = @typeInfo(T).@"struct";
+    inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
         if (FieldType == []const u8) {
-            @field(dst, field.name) = try allocator.dupe(u8, @field(src, field.name));
+            @field(dst, field_name) = try allocator.dupe(u8, @field(src, field_name));
         } else if (@typeInfo(FieldType) == .optional and @typeInfo(FieldType).optional.child == []const u8) {
-            if (@field(src, field.name)) |s| {
-                @field(dst, field.name) = try allocator.dupe(u8, s);
+            if (@field(src, field_name)) |s| {
+                @field(dst, field_name) = try allocator.dupe(u8, s);
             }
         }
     }

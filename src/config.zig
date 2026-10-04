@@ -249,9 +249,10 @@ pub const Loader = struct {
         var cfg: T = undefined;
         const json = parsed.value;
 
-        inline for (@typeInfo(T).@"struct".fields) |field| {
-            if (json.object.get(field.name)) |value| {
-                @field(cfg, field.name) = try parseField(self.allocator, field.type, value);
+        const s_info = @typeInfo(T).@"struct";
+        inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
+            if (json.object.get(field_name)) |value| {
+                @field(cfg, field_name) = try parseField(self.allocator, FieldType, value);
             }
         }
 
@@ -278,8 +279,9 @@ pub const Loader = struct {
         var cfg: T = undefined;
         var buf: [256]u8 = undefined;
 
-        inline for (@typeInfo(T).@"struct".fields) |field| {
-            const upper_name = std.ascii.upperString(&buf, field.name);
+        const s_info = @typeInfo(T).@"struct";
+        inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
+            const upper_name = std.ascii.upperString(&buf, field_name);
             const env_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ prefix, upper_name });
             defer self.allocator.free(env_name);
 
@@ -287,7 +289,7 @@ pub const Loader = struct {
             defer self.allocator.free(c_env_name);
             if (std.c.getenv(c_env_name.ptr)) |c_value| {
                 const value = std.mem.span(c_value);
-                @field(cfg, field.name) = try parseEnvValue(self.allocator, field.type, value);
+                @field(cfg, field_name) = try parseEnvValue(self.allocator, FieldType, value);
             }
         }
 

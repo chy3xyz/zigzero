@@ -5,7 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.2] - 2026-10-05
+
+### Fixed
+- **Zig 0.17.0 stable adaptation**: Aligned with the final 0.17.0 release (type info restructuring landed after the 0.17.0-dev snapshot used for 0.2.1)
+  - Migrated `@typeInfo(T).@"struct".fields` (unified `StructField` array) to the parallel-array layout: `field_names` / `field_types` / `field_attrs`
+  - Migrated `@typeInfo(T).@"struct".decls` to `decl_names`
+  - Affected: `src/data/validate.zig`, `src/data/orm.zig`, `src/config.zig`, `src/net/api.zig`, `src/net/rpc.zig`, `src/infra/sqlx.zig`
+  - Updated `docs/getting-started/installation.md` and `CONTRIBUTING.md` to require Zig 0.17.0+
+  - Synced hardcoded version constants in `src/zigzero.zig` and `build.zig`, and dependency URLs in README/docs, with the v0.2.2 release
 
 ## [0.2.1] - 2026-05-28
 

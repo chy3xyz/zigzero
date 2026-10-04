@@ -109,8 +109,8 @@ fn getTableName(comptime T: type) []const u8 {
 /// Get primary key field
 fn getPrimaryKey(comptime T: type) []const u8 {
     // Check for 'id' field by convention
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (std.mem.eql(u8, field.name, "id")) {
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| {
+        if (std.mem.eql(u8, field_name, "id")) {
             return "id";
         }
     }
@@ -120,8 +120,8 @@ fn getPrimaryKey(comptime T: type) []const u8 {
 /// Get all field names
 fn getFields(comptime T: type) []const []const u8 {
     comptime var fields: []const []const u8 = &[_][]const u8{};
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        fields = fields ++ .{field.name};
+    inline for (@typeInfo(T).@"struct".field_names) |field_name| {
+        fields = fields ++ .{field_name};
     }
     return fields;
 }

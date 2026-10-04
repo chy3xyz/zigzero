@@ -56,7 +56,7 @@ zig build
 .{
     .dependencies = .{
         .zigzero = .{
-            .url = "https://github.com/knot3bot/zigzero/archive/refs/tags/v0.2.1.tar.gz",
+            .url = "https://github.com/knot3bot/zigzero/archive/refs/tags/v0.2.2.tar.gz",
             .hash = "<zig will print the expected hash after first fetch>",
         },
     },

@@ -264,24 +264,25 @@ pub const Context = struct {
         const t_info = @typeInfo(T);
         if (t_info != .@"struct") @compileError("T must be a struct");
 
-        inline for (t_info.@"struct".fields) |field| {
-            const has_source = @hasField(SourcesType, field.name);
+        const s_info = t_info.@"struct";
+        inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
+            const has_source = @hasField(SourcesType, field_name);
             if (!has_source) continue;
 
-            const source: FieldSource = @field(sources, field.name);
+            const source: FieldSource = @field(sources, field_name);
             const value_str: ?[]const u8 = switch (source) {
-                .path => self.params.get(field.name),
-                .query => self.query.get(field.name),
-                .form => self.form.get(field.name),
-                .header => self.headers.get(field.name),
+                .path => self.params.get(field_name),
+                .query => self.query.get(field_name),
+                .form => self.form.get(field_name),
+                .header => self.headers.get(field_name),
             };
 
             if (value_str) |v| {
-                @field(req, field.name) = try parseValue(field.type, v);
+                @field(req, field_name) = try parseValue(FieldType, v);
             } else {
                 // If field is optional, leave as null
-                if (@typeInfo(field.type) == .optional) {
-                    @field(req, field.name) = null;
+                if (@typeInfo(FieldType) == .optional) {
+                    @field(req, field_name) = null;
                 } else {
                     return error.MissingParameter;
                 }

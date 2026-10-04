@@ -11,7 +11,7 @@ Thank you for your interest in contributing to ZigZero!
    cd zigzero
    ```
 3. **Install dependencies**:
-   - Zig 0.15.2+
+   - Zig 0.17.0+
    - For `sqlx` module: `libsqlite3`, `libpq`, `libmysqlclient`
 4. **Build and test**:
    ```bash

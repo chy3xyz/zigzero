@@ -190,9 +190,9 @@ pub const Server = struct {
         try self.services.put(service_name, instance);
 
         // Auto-register RPC methods
-        inline for (@typeInfo(ServiceType).@"struct".decls) |decl| {
-            if (comptime std.mem.startsWith(u8, decl.name, "rpc_")) {
-                const method_name = decl.name[4..]; // Remove "rpc_" prefix
+        inline for (@typeInfo(ServiceType).@"struct".decl_names) |decl_name| {
+            if (comptime std.mem.startsWith(u8, decl_name, "rpc_")) {
+                const method_name = decl_name[4..]; // Remove "rpc_" prefix
                 const full_name = try std.fmt.allocPrint(self.allocator, "{s}.{s}", .{ service_name, method_name });
 
                 const handler = struct {
@@ -352,9 +352,9 @@ pub fn Service(comptime T: type) type {
 
         pub fn getMethods() []const []const u8 {
             comptime var methods: []const []const u8 = &.{};
-            inline for (@typeInfo(T).@"struct".decls) |decl| {
-                if (comptime std.mem.startsWith(u8, decl.name, "rpc_")) {
-                    methods = methods ++ .{decl.name[4..]};
+            inline for (@typeInfo(T).@"struct".decl_names) |decl_name| {
+                if (comptime std.mem.startsWith(u8, decl_name, "rpc_")) {
+                    methods = methods ++ .{decl_name[4..]};
                 }
             }
             return methods;

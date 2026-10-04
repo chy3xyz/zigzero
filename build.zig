@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 1, .patch = 0 };
+pub const version = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 2 };
 pub const name = "zigzero";
 pub const description = "Zero-cost microservice framework for Zig, aligned with go-zero patterns";
 

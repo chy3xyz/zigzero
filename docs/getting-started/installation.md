@@ -4,7 +4,7 @@
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| **Zig** | 0.15.2+ | Install via [ziglang.org](https://ziglang.org/download.html) or Homebrew |
+| **Zig** | 0.17.0+ | Install via [ziglang.org](https://ziglang.org/download.html) or Homebrew |
 | **OS** | macOS, Linux, Windows (WSL) | Primary targets |
 | **C libs** | Optional | Only needed for `sqlx` module |
 
@@ -19,8 +19,8 @@ brew install zig
 ### Linux (二进制压缩包)
 
 ```bash
-curl -L https://ziglang.org/download/0.15.2/zig-linux-x86_64-0.15.2.tar.xz | tar xJ
-export PATH=$PWD/zig-linux-x86_64-0.15.2:$PATH
+curl -L https://ziglang.org/download/0.17.0/zig-linux-x86_64-0.17.0.tar.xz | tar xJ
+export PATH=$PWD/zig-linux-x86_64-0.17.0:$PATH
 ```
 
 ### 其他包管理器
@@ -40,7 +40,7 @@ pacman -S zig
 
 ```bash
 zig version
-# 0.15.2
+# 0.17.0
 ```
 
 ## System Dependencies (sqlx 模块)
@@ -145,7 +145,7 @@ DB=mysql zig build test
 
 ```bash
 cd your-project
-zig fetch https://github.com/knot3bot/zigzero/archive/refs/tags/v0.1.0.tar.gz
+zig fetch https://github.com/knot3bot/zigzero/archive/refs/tags/v0.2.2.tar.gz
 ```
 
 Then add to `build.zig.zon`:
@@ -154,7 +154,7 @@ Then add to `build.zig.zon`:
 .{
     .dependencies = .{
         .zigzero = .{
-            .url = "https://github.com/knot3bot/zigzero/archive/refs/tags/v0.1.0.tar.gz",
+            .url = "https://github.com/knot3bot/zigzero/archive/refs/tags/v0.2.2.tar.gz",
             .hash = "1220...",  # zig fetch will fill this in
         },
     },
