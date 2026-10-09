@@ -8,19 +8,48 @@ on:
 
 jobs:
   test:
+    name: Build & test (${{ matrix.os }}, sqlite)
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        db: [sqlite]
-        include:
-          - os: ubuntu-latest
-            db: postgres
-          - os: ubuntu-latest
-            db: mysql
     runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libpq-dev default-libmysqlclient-dev
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libpq mariadb-connector-c sqlite3
+
+      - name: Build
+        run: zig build
+
+      - name: Test
+        run: zig build test
+
+  test-db:
+    name: DB tests (${{ matrix.db }})
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [postgres, mysql]
+    runs-on: ubuntu-latest
+
     services:
       postgres:
-        if: matrix.db == 'postgres'
         image: postgres:15
         env:
           POSTGRES_USER: zigzero
@@ -35,7 +64,6 @@ jobs:
           --health-retries 5
 
       mysql:
-        if: matrix.db == 'mysql'
         image: mysql:8
         env:
           MYSQL_ROOT_PASSWORD: root
@@ -58,28 +86,16 @@ jobs:
         with:
           version: 0.17.0
 
-      - name: Install system dependencies (Ubuntu)
-        if: runner.os == 'Linux'
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libsqlite3-dev libpq-dev libmysqlclient-dev
-
-      - name: Install system dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install libpq mariadb-connector-c sqlite3
+          sudo apt-get install -y libsqlite3-dev libpq-dev default-libmysqlclient-dev
 
       - name: Setup PostgreSQL environment
         if: matrix.db == 'postgres'
         run: |
           echo "DB=postgres" >> $GITHUB_ENV
-          echo "PQ_HOST=localhost" >> $GITHUB_ENV
-          echo "PQ_PORT=5432" >> $GITHUB_ENV
-          echo "PGHOST=localhost" >> $GITHUB_ENV
-          echo "PGPORT=5432" >> $GITHUB_ENV
-          echo "PGUSER=zigzero" >> $GITHUB_ENV
-          echo "PGPASSWORD=zigzero" >> $GITHUB_ENV
-          echo "PGDATABASE=zigzero_test" >> $GITHUB_ENV
+          echo "PGconninfo=host=localhost port=5432 dbname=zigzero_test user=zigzero password=zigzero" >> $GITHUB_ENV
 
       - name: Setup MySQL environment
         if: matrix.db == 'mysql'
