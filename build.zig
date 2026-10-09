@@ -94,6 +94,8 @@ fn dirExists(b: *std.Build, path: []const u8) bool {
 fn linkDbLibs(mod: *std.Build.Module, b: *std.Build) void {
     const allocator = b.allocator;
 
+    mod.link_libc = true;
+
     const pq = detectPqPaths(b, allocator);
     if (pq.include) |inc| {
         mod.addSystemIncludePath(.{ .cwd_relative = inc });
