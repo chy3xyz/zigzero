@@ -462,6 +462,7 @@ pub const PostgresConn = struct {
         if (conn == null) return error.DatabaseError;
         const status = libpq_c.PQstatus(conn);
         if (status != .CONNECTION_OK) {
+            std.log.err("postgres connect failed: {s}", .{std.mem.span(libpq_c.PQerrorMessage(conn))});
             libpq_c.PQfinish(conn);
             return error.DatabaseError;
         }
@@ -689,10 +690,17 @@ pub const MySqlConn = struct {
         const password_cstr: [*c]const u8 = if (password.len > 0) @ptrCast(password.ptr) else @ptrCast("\x00");
         // Use Unix socket for localhost connections (avoids TCP auth issues with
         // caching_sha2_password which MariaDB Connector/C doesn't support with MySQL 8).
-        const use_socket = std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "127.0.0.1");
-        const socket_path: [*c]const u8 = if (use_socket) @ptrCast("/tmp/mysql.sock") else @ptrCast("\x00");
-        const conn = libmysql_c.mysql_real_connect(mysql, @ptrCast(host.ptr), @ptrCast(user.ptr), password_cstr, @ptrCast(db.ptr), @intCast(port), socket_path, 0);
+        // Only when the socket actually exists; otherwise fall back to TCP (e.g. in CI).
+        const socket_path = "/tmp/mysql.sock";
+        const socket_exists = blk: {
+            std.Io.Dir.accessAbsolute(compat.io(), socket_path, .{}) catch break :blk false;
+            break :blk true;
+        };
+        const use_socket = (std.mem.eql(u8, host, "localhost") or std.mem.eql(u8, host, "127.0.0.1")) and socket_exists;
+        const socket_cstr: [*c]const u8 = if (use_socket) @ptrCast(socket_path) else @ptrCast("\x00");
+        const conn = libmysql_c.mysql_real_connect(mysql, @ptrCast(host.ptr), @ptrCast(user.ptr), password_cstr, @ptrCast(db.ptr), @intCast(port), socket_cstr, 0);
         if (conn == null) {
+            std.log.err("mysql connect failed: {s}", .{std.mem.span(libmysql_c.mysql_error(mysql))});
             libmysql_c.mysql_close(mysql);
             return error.DatabaseError;
         }
@@ -2905,10 +2913,7 @@ test "postgres live connection" {
         error.EnvironmentVariableMissing => conninfo_default,
         else => return err,
     };
-    const conninfo_owned = conninfo.ptr != conninfo_default.ptr;
-    if (conninfo_owned) {
-        defer allocator.free(conninfo);
-    }
+    defer if (conninfo.ptr != conninfo_default.ptr) allocator.free(conninfo);
 
     var client = Client.init(allocator, .{
         .driver = .postgres,
@@ -2948,33 +2953,25 @@ test "mysql live connection" {
         error.EnvironmentVariableMissing => host_default,
         else => return err,
     };
-    if (host.ptr != host_default.ptr) {
-        defer allocator.free(host);
-    }
+    defer if (host.ptr != host_default.ptr) allocator.free(host);
     const user_default = "root";
     const user = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_USER") catch |err| switch (err) {
         error.EnvironmentVariableMissing => user_default,
         else => return err,
     };
-    if (user.ptr != user_default.ptr) {
-        defer allocator.free(user);
-    }
+    defer if (user.ptr != user_default.ptr) allocator.free(user);
     const pass_default = "";
     const pass = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_PASSWORD") catch |err| switch (err) {
         error.EnvironmentVariableMissing => pass_default,
         else => return err,
     };
-    if (pass.ptr != pass_default.ptr) {
-        defer allocator.free(pass);
-    }
+    defer if (pass.ptr != pass_default.ptr) allocator.free(pass);
     const db_default = "zigzero_test";
     const db = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_DATABASE") catch |err| switch (err) {
         error.EnvironmentVariableMissing => db_default,
         else => return err,
     };
-    if (db.ptr != db_default.ptr) {
-        defer allocator.free(db);
-    }
+    defer if (db.ptr != db_default.ptr) allocator.free(db);
 
     var client = Client.init(allocator, .{
         .driver = .mysql,
