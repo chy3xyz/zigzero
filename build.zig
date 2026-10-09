@@ -96,6 +96,8 @@ fn linkDbLibs(mod: *std.Build.Module, b: *std.Build) void {
 
     mod.link_libc = true;
 
+    const no_pkg: std.Build.Module.LinkSystemLibraryOptions = .{ .use_pkg_config = .no };
+
     const pq = detectPqPaths(b, allocator);
     if (pq.include) |inc| {
         mod.addSystemIncludePath(.{ .cwd_relative = inc });
@@ -103,7 +105,7 @@ fn linkDbLibs(mod: *std.Build.Module, b: *std.Build) void {
     if (pq.lib) |lib| {
         mod.addLibraryPath(.{ .cwd_relative = lib });
     }
-    mod.linkSystemLibrary("pq", .{});
+    mod.linkSystemLibrary("pq", no_pkg);
 
     const mysql = detectMysqlPaths(b, allocator);
     if (mysql.include) |inc| {
@@ -112,9 +114,9 @@ fn linkDbLibs(mod: *std.Build.Module, b: *std.Build) void {
     if (mysql.lib) |lib| {
         mod.addLibraryPath(.{ .cwd_relative = lib });
     }
-    mod.linkSystemLibrary("mysqlclient", .{});
+    mod.linkSystemLibrary("mysqlclient", no_pkg);
 
-    mod.linkSystemLibrary("sqlite3", .{});
+    mod.linkSystemLibrary("sqlite3", no_pkg);
 }
 
 pub fn build(b: *std.Build) void {

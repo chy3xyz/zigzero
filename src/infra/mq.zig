@@ -290,7 +290,7 @@ pub const PersistentQueue = struct {
     }
 
     fn loadOffsets(self: *PersistentQueue) !void {
-        var dir = compat.cwd().openDir(compat.io(), self.data_dir, .{}) catch return;
+        var dir = compat.cwd().openDir(compat.io(), self.data_dir, .{ .iterate = true }) catch return;
         defer dir.close(compat.io());
 
         var iter = dir.iterate();
