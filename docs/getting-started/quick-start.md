@@ -16,7 +16,7 @@ GET  /metrics        → Prometheus 指标
 ## 步骤 1: 创建项目
 
 ```bash
-git clone https://github.com/knot3bot/zigzero.git
+git clone https://github.com/chy3xyz/zigzero.git
 cd zigzero
 zig build
 ```

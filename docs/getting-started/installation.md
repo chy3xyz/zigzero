@@ -82,7 +82,7 @@ zig build
 ## Clone and Build
 
 ```bash
-git clone https://github.com/knot3bot/zigzero.git
+git clone https://github.com/chy3xyz/zigzero.git
 cd zigzero
 zig build
 ```
@@ -145,7 +145,7 @@ DB=mysql zig build test
 
 ```bash
 cd your-project
-zig fetch https://github.com/knot3bot/zigzero/archive/refs/tags/v0.2.2.tar.gz
+zig fetch https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz
 ```
 
 Then add to `build.zig.zon`:
@@ -154,7 +154,7 @@ Then add to `build.zig.zon`:
 .{
     .dependencies = .{
         .zigzero = .{
-            .url = "https://github.com/knot3bot/zigzero/archive/refs/tags/v0.2.2.tar.gz",
+            .url = "https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz",
             .hash = "1220...",  # zig fetch will fill this in
         },
     },
@@ -165,7 +165,7 @@ Then add to `build.zig.zon`:
 
 ```bash
 cd your-project
-git submodule add https://github.com/knot3bot/zigzero.git vendor/zigzero
+git submodule add https://github.com/chy3xyz/zigzero.git vendor/zigzero
 ```
 
 ```zig

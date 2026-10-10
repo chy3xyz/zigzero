@@ -2,7 +2,7 @@
 
 **Zero-cost microservice framework for Zig, aligned with go-zero patterns.**
 
-[![CI](https://github.com/knot3bot/zigzero/actions/workflows/ci.yml/badge.svg)](https://github.com/knot3bot/zigzero/actions)
+[![CI](https://github.com/chy3xyz/zigzero/actions/workflows/ci.yml/badge.svg)](https://github.com/chy3xyz/zigzero/actions)
 [![Zig](https://img.shields.io/badge/Zig-0.17.0+-blue.svg)](https://ziglang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
@@ -35,7 +35,7 @@ See [Module Reference](#module-reference) for complete list.
 ### 1. Create a project
 
 ```bash
-git clone https://github.com/knot3bot/zigzero.git
+git clone https://github.com/chy3xyz/zigzero.git
 cd zigzero
 zig build
 ```
@@ -56,7 +56,7 @@ zig build
 .{
     .dependencies = .{
         .zigzero = .{
-            .url = "https://github.com/knot3bot/zigzero/archive/refs/tags/v0.2.2.tar.gz",
+            .url = "https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz",
             .hash = "<zig will print the expected hash after first fetch>",
         },
     },
