@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **`net/api` request parser buffer lifetime bug**: `path`/`raw_path` pointed into a stack buffer that the header loop overwrote, so every request matched routes against garbage (all real requests 404'd); paths are now copied before headers are parsed
+- **`net/api` header termination bug**: `readUntilDelimiterOrEof` returns lines including `'\n'`, so the CRLF terminator was never detected and parsing hung; lines are now stripped of `'\n'`/`'\r'` before the empty-line check
+- **`compat` stream I/O on 0.17.0**: `streamWrite`/`fileWrite` now flush (buffered writers never emitted short responses); `streamRead` performs a single read instead of filling the whole buffer (incremental protocol parsing hung)
+- **`infra/cache`**: rewritten for 0.17's un-parameterized `std.DoublyLinkedList` (intrusive nodes) — now a real LRU via intrusive list + hash map
+- **`infra/lock`**: distributed lock `renew` sent an unterminated command
+- **`infra/retry`**: `retryWithBreaker` actually routes through the circuit breaker
+- **`net/rpc`**: server now dispatches incoming frames to registered handlers (was accepted-but-never-executed); adds `boundPort()` and reliable `stop()` via self-connect wakeup
+- **`tools/zigzeroctl`**: generated routes use the real `addRoute` API with `{id}` param syntax; fixed `new` template project (builds on 0.17.0); fixed malformed usage text; `delCache` is now public so generated model code compiles; OpenAPI output is valid JSON
+
+### Added
+- Route params support both `{id}` and `:id` syntax
+- End-to-end RPC roundtrip test (replaces the previously skipped stub)
+- `examples/hello` minimal server example, wired into `zig build`
+- zigzeroctl unit tests wired into `zig build test`
+- CI: `codegen-smoke` job exercising all four `zigzeroctl` subcommands (api/openapi/model/new + template build)
+
+### Changed
+- README module reference now marks `net/tls` (certificate loading only) and `data/orm` (no real DB driver) as experimental/placeholder
+- SECURITY.md supported-versions table updated to 0.2.x
+
 ## [0.2.2] - 2026-10-05
 
 ### Fixed

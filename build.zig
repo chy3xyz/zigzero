@@ -157,6 +157,19 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(api_server);
 
+    // hello — minimal usage example
+    const hello_module = b.createModule(.{
+        .root_source_file = b.path("examples/hello/main.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    hello_module.addImport("zigzero", zigzero_mod);
+    const hello = b.addExecutable(.{
+        .name = "hello",
+        .root_module = hello_module,
+    });
+    b.installArtifact(hello);
+
     // chy3 — Creator Metaverse Platform example (multi-file layout)
     const chy3_module = b.createModule(.{
         .root_source_file = b.path("examples/chy3/src/main.zig"),
@@ -188,4 +201,11 @@ pub fn build(b: *std.Build) void {
     });
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
+
+    // zigzeroctl code generator tests
+    const ctl_tests = b.addTest(.{
+        .root_module = ctl_module,
+    });
+    const run_ctl_tests = b.addRunArtifact(ctl_tests);
+    test_step.dependOn(&run_ctl_tests.step);
 }

@@ -7,6 +7,9 @@ const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 const redis = @import("redis.zig");
 
+/// RESP wire format for the renew command (EXPIRE key ttl). Uses real CRLF line endings.
+const renew_cmd_fmt = "*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n";
+
 /// Distributed lock interface
 pub const Lock = struct {
     /// Acquire the lock
@@ -51,7 +54,7 @@ pub const RedisLock = struct {
     pub fn renew(self: *RedisLock, key: []const u8, value: []const u8, ttl_seconds: u32) errors.ResultT(bool) {
         _ = value;
         if (self.client.stream) |stream| {
-            const cmd = std.fmt.allocPrint(self.client.allocator, "*3\\r\\n$6\\r\\nEXPIRE\\r\\n${d}\\r\\n{s}\\r\\n${d}\\r\\n{d}\\r\\n", .{ key.len, key, std.fmt.count("{d}", .{ttl_seconds}), ttl_seconds }) catch return error.RedisError;
+            const cmd = std.fmt.allocPrint(self.client.allocator, renew_cmd_fmt, .{ key.len, key, std.fmt.count("{d}", .{ttl_seconds}), ttl_seconds }) catch return error.RedisError;
             defer self.client.allocator.free(cmd);
             compat.net.streamWrite(stream, cmd) catch return error.RedisError;
             var buf: [256]u8 = undefined;
@@ -114,4 +117,11 @@ test "local lock" {
     try std.testing.expect(!acquired2);
 
     try lock.release("my_key", "owner1");
+}
+
+test "renew command uses crlf" {
+    const ttl_digits = std.fmt.count("{d}", .{@as(u32, 10)});
+    const cmd = try std.fmt.allocPrint(std.testing.allocator, renew_cmd_fmt, .{ 3, "key", ttl_digits, 10 });
+    defer std.testing.allocator.free(cmd);
+    try std.testing.expectEqualStrings("*3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n", cmd);
 }

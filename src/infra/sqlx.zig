@@ -2184,7 +2184,9 @@ pub const CachedConn = struct {
         }
     }
 
-    fn delCache(self: *CachedConn, key: []const u8) !void {
+    /// Delete a cached entry by key. Used by generated model code after
+    /// mutations so stale cached rows/listings are invalidated.
+    pub fn delCache(self: *CachedConn, key: []const u8) !void {
         if (self.local_cache) |lc| {
             lc.del(key);
             return;
@@ -2313,14 +2315,14 @@ pub const Builder = struct {
                 if (i > 0) try w.writeAll(", ");
                 try w.writeAll(col);
             }
-            try w.print( " FROM {s}", .{self.table});
+            try w.print(" FROM {s}", .{self.table});
         } else {
-            try w.print( "SELECT * FROM {s}", .{self.table});
+            try w.print("SELECT * FROM {s}", .{self.table});
         }
 
         if (self.join_clauses) |joins| {
             for (joins) |clause| {
-                try w.print( " {s}", .{clause});
+                try w.print(" {s}", .{clause});
             }
         }
 
@@ -2333,23 +2335,23 @@ pub const Builder = struct {
         }
 
         if (self.group_by_clause) |g| {
-            try w.print( " GROUP BY {s}", .{g});
+            try w.print(" GROUP BY {s}", .{g});
         }
 
         if (self.having_clause) |h| {
-            try w.print( " HAVING {s}", .{h});
+            try w.print(" HAVING {s}", .{h});
         }
 
         if (self.order_by_clause) |o| {
-            try w.print( " ORDER BY {s}", .{o});
+            try w.print(" ORDER BY {s}", .{o});
         }
 
         if (self.limit_val) |n| {
-            try w.print( " LIMIT {d}", .{n});
+            try w.print(" LIMIT {d}", .{n});
         }
 
         if (self.offset_val) |n| {
-            try w.print( " OFFSET {d}", .{n});
+            try w.print(" OFFSET {d}", .{n});
         }
 
         return self.allocator.dupe(u8, buf.items);
@@ -2412,10 +2414,10 @@ pub const Builder = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
         const w = compat.arrayListWriter(&buf, self.allocator);
-        try w.print( "UPDATE {s} SET ", .{self.table});
+        try w.print("UPDATE {s} SET ", .{self.table});
         for (columns, 0..) |col, i| {
             if (i > 0) try w.writeAll(", ");
-            try w.print( "{s} = ?{d}", .{ col, i + 1 });
+            try w.print("{s} = ?{d}", .{ col, i + 1 });
         }
         return self.allocator.dupe(u8, buf.items);
     }

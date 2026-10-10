@@ -5,6 +5,7 @@
 const std = @import("std");
 const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
+const circuit = @import("breaker.zig");
 
 /// Retry policy configuration
 pub const Policy = struct {
@@ -75,8 +76,36 @@ pub fn retryVoid(policy: Policy, operation: *const fn () errors.Result) errors.R
 
 /// Circuit breaker + retry combo
 pub fn retryWithBreaker(comptime T: type, policy: Policy, breaker: *anyopaque, operation: *const fn () errors.ResultT(T)) errors.ResultT(T) {
-    _ = breaker;
-    return retry(T, policy, operation);
+    const cb: *circuit.CircuitBreaker = @ptrCast(@alignCast(breaker));
+    var delay_ms: u64 = policy.initial_delay_ms;
+
+    var attempt: u32 = 0;
+    while (attempt < policy.max_attempts) : (attempt += 1) {
+        if (!cb.allow()) {
+            return error.CircuitBreakerOpen;
+        }
+
+        const result = operation();
+        if (result) |value| {
+            cb.recordSuccess();
+            return value;
+        } else |_| {
+            cb.recordFailure();
+            if (attempt == policy.max_attempts - 1) {
+                return result;
+            }
+
+            const jitter_amount = @as(f64, @floatFromInt(delay_ms)) * policy.jitter;
+            const random_jitter = compat.randomInt(u32) % @as(u32, @intFromFloat(jitter_amount * 2));
+            const actual_delay = delay_ms + random_jitter - @as(u64, @intFromFloat(jitter_amount));
+
+            compat.sleep(actual_delay * std.time.ns_per_ms);
+
+            delay_ms = @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
+        }
+    }
+
+    return error.ServerError;
 }
 
 test "retry success" {
@@ -104,4 +133,57 @@ test "retry failure" {
 
     const result = retry(u32, .{ .max_attempts = 2, .initial_delay_ms = 10 }, op);
     try std.testing.expectError(error.ServerError, result);
+}
+
+test "retryWithBreaker rejects when breaker open" {
+    var cb = circuit.CircuitBreaker.withConfig(.{
+        .request_threshold = 1,
+        .failure_rate_threshold = 50,
+        .sleep_duration_sec = 3600,
+        .half_open_success_threshold = 1,
+    });
+
+    var calls: u32 = 0;
+    const Op = struct {
+        var c: *u32 = undefined;
+        fn operation() errors.ResultT(u32) {
+            c.* += 1;
+            return error.ServerError;
+        }
+    };
+    Op.c = &calls;
+
+    // A single failure trips the breaker (request_threshold = 1)
+    cb.recordFailure();
+    try std.testing.expect(cb.getState() == .open);
+
+    const result = retryWithBreaker(u32, .{ .max_attempts = 3, .initial_delay_ms = 10 }, &cb, Op.operation);
+    try std.testing.expectError(error.CircuitBreakerOpen, result);
+    try std.testing.expectEqual(@as(u32, 0), calls);
+}
+
+test "retryWithBreaker records outcomes" {
+    var cb = circuit.CircuitBreaker.withConfig(.{
+        .request_threshold = 5,
+        .failure_rate_threshold = 50,
+        .sleep_duration_sec = 3600,
+        .half_open_success_threshold = 1,
+    });
+
+    var calls: u32 = 0;
+    const Op = struct {
+        var c: *u32 = undefined;
+        fn operation() errors.ResultT(u32) {
+            c.* += 1;
+            if (c.* < 2) return error.ServerError;
+            return c.*;
+        }
+    };
+    Op.c = &calls;
+
+    // First attempt fails and is recorded, retry succeeds
+    const result = retryWithBreaker(u32, .{ .max_attempts = 3, .initial_delay_ms = 10 }, &cb, Op.operation);
+    try std.testing.expectEqual(@as(u32, 2), result);
+    try std.testing.expectEqual(@as(u32, 1), cb.failed_requests);
+    try std.testing.expectEqual(@as(u32, 1), cb.successful_requests);
 }

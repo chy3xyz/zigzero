@@ -5,12 +5,14 @@ const dsl = @import("dsl.zig");
 
 const usage =
     \\zigzeroctl - Code generation tool for zigzero
-    \\n    \\Usage:
+    \\
+    \\Usage:
     \\  zigzeroctl new <project-name>      Create a new zigzero service project
     \\  zigzeroctl api <spec.(json|api)>   Generate API routes and handlers from spec
     \\  zigzeroctl openapi <spec.api>      Generate OpenAPI 3.0 JSON from .api DSL
     \\  zigzeroctl model <ddl.sql>         Generate ORM models from SQL DDL
-    \\n    \\Examples:
+    \\
+    \\Examples:
     \\  zigzeroctl new my-service
     \\  zigzeroctl api api-spec.json -o ./gen
     \\  zigzeroctl api api-spec.api -o ./gen
@@ -26,6 +28,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var args_iter = compat.argsIterator(init);
     defer args_iter.deinit();
+    compat.initIo(allocator);
+    defer compat.deinitIo();
     var args_list = std.ArrayList([:0]u8).empty;
     defer {
         for (args_list.items) |arg| allocator.free(arg);

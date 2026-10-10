@@ -49,7 +49,7 @@ pub const TypeDef = struct {
     name: []const u8,
     fields: []const StructField,
 
-    pub fn deinit(self: *TypeDef, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: TypeDef, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         for (self.fields) |f| {
             allocator.free(f.name);
@@ -65,7 +65,7 @@ pub const RouteDef = struct {
     resp_type: ?[]const u8,
     handler: []const u8,
 
-    pub fn deinit(self: *RouteDef, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: RouteDef, allocator: std.mem.Allocator) void {
         allocator.free(self.method);
         allocator.free(self.path);
         if (self.req_type) |r| allocator.free(r);
@@ -76,14 +76,14 @@ pub const RouteDef = struct {
 
 pub const ApiDef = struct {
     name: []const u8,
-    types: []TypeDef,
-    routes: []RouteDef,
+    types: []const TypeDef,
+    routes: []const RouteDef,
 
-    pub fn deinit(self: *ApiDef, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: ApiDef, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
-        for (self.types) |*t| t.deinit(allocator);
+        for (self.types) |t| t.deinit(allocator);
         allocator.free(self.types);
-        for (self.routes) |*r| r.deinit(allocator);
+        for (self.routes) |r| r.deinit(allocator);
         allocator.free(self.routes);
     }
 };
@@ -169,6 +169,28 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ApiDef {
                 .name = try allocator.dupe(u8, type_name),
                 .fields = try fields.toOwnedSlice(allocator),
             });
+        } else if (isHttpMethod(keyword)) {
+            if (tokens.items.len == 3) {
+                // method path handler
+                try routes.append(allocator, .{
+                    .method = try allocator.dupe(u8, keyword),
+                    .path = try allocator.dupe(u8, tokens.items[1]),
+                    .req_type = null,
+                    .resp_type = null,
+                    .handler = try allocator.dupe(u8, tokens.items[2]),
+                });
+            } else if (tokens.items.len == 5) {
+                // method path ReqType RespType handler
+                try routes.append(allocator, .{
+                    .method = try allocator.dupe(u8, keyword),
+                    .path = try allocator.dupe(u8, tokens.items[1]),
+                    .req_type = try allocator.dupe(u8, tokens.items[2]),
+                    .resp_type = try allocator.dupe(u8, tokens.items[3]),
+                    .handler = try allocator.dupe(u8, tokens.items[4]),
+                });
+            } else {
+                return error.InvalidSyntax;
+            }
         }
     }
 
@@ -177,6 +199,17 @@ pub fn parse(allocator: std.mem.Allocator, source: []const u8) !ApiDef {
         .types = try types.toOwnedSlice(allocator),
         .routes = try routes.toOwnedSlice(allocator),
     };
+}
+
+fn isHttpMethod(s: []const u8) bool {
+    if (std.mem.eql(u8, s, "get")) return true;
+    if (std.mem.eql(u8, s, "post")) return true;
+    if (std.mem.eql(u8, s, "put")) return true;
+    if (std.mem.eql(u8, s, "delete")) return true;
+    if (std.mem.eql(u8, s, "patch")) return true;
+    if (std.mem.eql(u8, s, "head")) return true;
+    if (std.mem.eql(u8, s, "options")) return true;
+    return false;
 }
 
 test "parse dsl" {

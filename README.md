@@ -259,7 +259,7 @@ post /users/login LoginReq LoginResp login
 | RPC | `net/rpc` | ✅ |
 | WebSocket | `net/websocket` | ✅ |
 | Gateway | `net/gateway` | ✅ |
-| TLS | `net/tls` | ✅ |
+| TLS | `net/tls` | 🚧 Experimental (certificate loading only) |
 | Middleware | `server/middleware` | ✅ |
 | Static Files | `server/static` | ✅ |
 | Configuration | `config` | ✅ |
@@ -281,7 +281,7 @@ post /users/login LoginReq LoginResp login
 | Load Balancer | `infra/loadbalancer` | ✅ |
 | Circuit Breaker | `infra/breaker` | ✅ |
 | Rate Limiter | `infra/limiter` | ✅ |
-| ORM | `data/orm` | ✅ |
+| ORM | `data/orm` | 🚧 Placeholder (no real DB driver yet) |
 | Validation | `data/validate` | ✅ |
 | SQL Client | `infra/sqlx` | ✅ |
 | zigzeroctl | `tools/zigzeroctl` | ✅ |

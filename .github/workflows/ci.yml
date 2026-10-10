@@ -40,7 +40,43 @@ jobs:
       - name: Test
         run: zig build test
 
-  test-db:
+  codegen-smoke:
+    name: zigzeroctl smoke (ubuntu)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev libpq-dev default-libmysqlclient-dev
+
+      - name: Build
+        run: zig build
+
+      - name: zigzeroctl api (DSL spec)
+        run: zig-out/bin/zigzeroctl api examples/user.api -o /tmp/ctl-smoke/api
+
+      - name: zigzeroctl openapi + validate JSON
+        run: |
+          zig-out/bin/zigzeroctl openapi examples/user.api -o /tmp/ctl-smoke/docs
+          python3 -m json.tool /tmp/ctl-smoke/docs/openapi.json > /dev/null
+
+      - name: zigzeroctl model
+        run: |
+          printf 'CREATE TABLE users (\n  id SERIAL PRIMARY KEY,\n  name VARCHAR(255) NOT NULL,\n  email TEXT\n);\n' > /tmp/ctl-smoke/schema.sql
+          zig-out/bin/zigzeroctl model /tmp/ctl-smoke/schema.sql -o /tmp/ctl-smoke/models
+
+      - name: zigzeroctl new + build template project
+        run: |
+          zig-out/bin/zigzeroctl new smoke-app .tmp-smoke/smoke-app
+          sed -i 's|\.url = ".*",|.path = "../..",|' .tmp-smoke/smoke-app/build.zig.zon          cd .tmp-smoke/smoke-app && zig build
     name: DB tests (${{ matrix.db }})
     strategy:
       fail-fast: false

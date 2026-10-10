@@ -12,43 +12,50 @@ pub const project_build_zig =
     \\        .optimize = optimize,
     \\    }});
     \\
-    \\    const exe = b.addExecutable(.{{
-    \\        .name = "{s}",
+    \\    const exe_module = b.createModule(.{{
     \\        .root_source_file = b.path("src/main.zig"),
     \\        .target = target,
     \\        .optimize = optimize,
     \\    }});
-    \\    exe.root_module.addImport("zigzero", zigzero.module("zigzero"));
+    \\    exe_module.addImport("zigzero", zigzero.module("zigzero"));
+    \\
+    \\    const exe = b.addExecutable(.{{
+    \\        .name = "{s}",
+    \\        .root_module = exe_module,
+    \\    }});
     \\    b.installArtifact(exe);
     \\
     \\    const run_cmd = b.addRunArtifact(exe);
     \\    run_cmd.step.dependOn(b.getInstallStep());
-    \\    if (b.args) |args| {{
-    \\        run_cmd.addArgs(args);
-    \\    }}
+    \\    run_cmd.addPassthruArgs();
     \\    const run_step = b.step("run", "Run the app");
-    \\    run_step.dependOn(\u0026run_cmd.step);
+    \\    run_step.dependOn(&run_cmd.step);
     \\
     \\    const test_step = b.step("test", "Run unit tests");
-    \\    const tests = b.addTest(.{{
+    \\    const test_module = b.createModule(.{{
     \\        .root_source_file = b.path("src/main.zig"),
     \\        .target = target,
     \\        .optimize = optimize,
     \\    }});
-    \\    tests.root_module.addImport("zigzero", zigzero.module("zigzero"));
+    \\    test_module.addImport("zigzero", zigzero.module("zigzero"));
+    \\    const tests = b.addTest(.{{
+    \\        .root_module = test_module,
+    \\    }});
     \\    const run_tests = b.addRunArtifact(tests);
-    \\    test_step.dependOn(\u0026run_tests.step);
+    \\    test_step.dependOn(&run_tests.step);
     \\}}
     \\
 ;
 
 pub const build_zon =
     \\.{{
-    \\    .name = "{s}",
+    \\    .name = .{s},
+    \\    .fingerprint = 0x{x:0>16},
     \\    .version = "0.1.0",
+    \\    .minimum_zig_version = "0.17.0",
     \\    .dependencies = .{{
     \\        .zigzero = .{{
-    \\            .url = "https://github.com/knot3bot/zigzero/archive/refs/heads/main.tar.gz",
+    \\            .url = "https://github.com/chy3xyz/zigzero/archive/refs/heads/main.tar.gz",
     \\        }},
     \\    }},
     \\    .paths = .{{
@@ -64,82 +71,44 @@ pub const main_zig =
     \\const std = @import("std");
     \\const zigzero = @import("zigzero");
     \\const api = zigzero.api;
+    \\const compat = zigzero.compat;
     \\const log = zigzero.log;
     \\const health = zigzero.health;
+    \\
+    \\fn aliveCheck(allocator: std.mem.Allocator) !health.Result {{
+    \\    _ = allocator;
+    \\    return health.Result.init("alive", .healthy);
+    \\}}
     \\
     \\pub fn main() !void {{
     \\    var gpa: std.heap.DebugAllocator(.{{}}) = .init;
     \\    defer _ = gpa.deinit();
     \\    const allocator = gpa.allocator();
     \\
+    \\    compat.initIo(allocator);
+    \\    defer compat.deinitIo();
+    \\
     \\    const logger = log.Logger.new(.info, "{s}");
+    \\
+    \\    var health_registry = health.Registry.init(allocator);
+    \\    defer health_registry.deinit();
+    \\    try health_registry.register("alive", aliveCheck);
+    \\
     \\    var server = api.Server.init(allocator, 8080, logger);
     \\    defer server.deinit();
     \\
-    \\    var registry = health.Registry.init(allocator);
-    \\    defer registry.deinit();
-    \\    try registry.addProbe("alive", struct {{ fn check() health.Status {{ return .healthy; }} }}.check);
-    \\
-    \\    // Health check endpoint
-    \\    try server.get("/health", struct {{
-    \\        fn handle(ctx: *api.Context) !void {{
-    \\            try ctx.json(200, "{{\"status\":\"ok\"}}");
-    \\        }}
-    \\    }}.handle);
+    \\    try server.addRoute(.{{
+    \\        .method = .GET,
+    \\        .path = "/health",
+    \\        .handler = struct {{
+    \\            fn handle(ctx: *api.Context) !void {{
+    \\                try ctx.json(200, "{{\"status\":\"ok\"}}");
+    \\            }}
+    \\        }}.handle,
+    \\    }});
     \\
     \\    logger.info("Starting {s} on port 8080");
     \\    try server.start();
     \\}}
-    \\
-;
-
-pub const handler_zig =
-    \\const std = @import("std");
-    \\const zigzero = @import("zigzero");
-    \\const api = zigzero.api;
-    \\
-    \\pub fn {s}Handler(ctx: *api.Context) !void {{
-    \\    try ctx.json(200, "{{\"message\":\"ok\"}}");
-    \\}}
-    \\
-;
-
-pub const routes_zig =
-    \\const std = @import("std");
-    \\const zigzero = @import("zigzero");
-    \\const api = zigzero.api;
-    \\const handlers = @import("handlers.zig");
-    \\
-    \\pub fn registerRoutes(server: *api.Server) !void {{
-    \\{s}
-    \\}}
-    \\
-;
-
-pub const route_line =
-    \\    try server.{s}("{s}", handlers.{s}Handler);
-    \\
-;
-
-pub const model_zig =
-    \\const std = @import("std");
-    \\const zigzero = @import("zigzero");
-    \\const orm = zigzero.orm;
-    \\
-    \\pub const {s} = struct {{
-    \\    pub const table_name = "{s}";
-    \\    pub const primary_key = "{s}";
-    \\
-    \\{s}
-    \\
-    \\    pub fn query() orm.QueryBuilder(@This()) {{
-    \\        return orm.QueryBuilder(@This()).new(table_name);
-    \\    }}
-    \\}};
-    \\
-;
-
-pub const model_field =
-    \\    {s}: {s},
     \\
 ;

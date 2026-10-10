@@ -1,60 +1,33 @@
 const std = @import("std");
 const zigzero = @import("zigzero");
 const api = zigzero.api;
-const log = zigzero.log;
 const compat = zigzero.compat;
+const log = zigzero.log;
 
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-    compat.initIo(gpa.allocator());
+    const allocator = gpa.allocator();
+
+    compat.initIo(allocator);
     defer compat.deinitIo();
 
-    // Initialize logger
-    log.initFromConfig(.{
-        .service_name = "hello-api",
-        .level = "info",
-    });
+    const logger = log.Logger.new(.info, "hello");
 
-    // Create server
-    var server = api.Server.new(8080);
+    var server = api.Server.init(allocator, 8080, logger);
+    defer server.deinit();
 
-    // Add health check endpoint
-    server.addRoute(.{
+    // Hello endpoint
+    try server.addRoute(.{
         .method = .GET,
-        .path = "/health",
-        .handler = struct {
-            fn handle(_: *api.Context) !void {
-                std.debug.print("Health check called\n", .{});
-            }
-        }.handle,
-    });
-
-    // Add hello endpoint
-    server.addRoute(.{
-        .method = .GET,
-        .path = "/hello/:name",
+        .path = "/hello",
         .handler = struct {
             fn handle(ctx: *api.Context) !void {
-                const name = ctx.param("name") orelse "World";
-                std.debug.print("Hello, {s}!\n", .{name});
+                try ctx.text(200, "Hello from zigzero!");
             }
         }.handle,
     });
 
-    // Add JSON POST endpoint
-    server.addRoute(.{
-        .method = .POST,
-        .path = "/echo",
-        .handler = struct {
-            fn handle(ctx: *api.Context) !void {
-                if (ctx.body) |body| {
-                    std.debug.print("Received: {s}\n", .{body});
-                }
-            }
-        }.handle,
-    });
-
-    log.default().info("Starting server on port 8080");
+    logger.info("Starting hello server on port 8080");
     try server.start();
 }

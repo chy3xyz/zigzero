@@ -16,6 +16,34 @@ const compat = @import("zigzero").compat;
 const template = @import("template.zig");
 const dsl = @import("dsl.zig");
 
+/// Convert a DSL path like "/users/:id" into the router syntax "/users/{id}".
+fn toRouterPath(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    var parts = std.mem.splitScalar(u8, path, '/');
+    var first = true;
+    while (parts.next()) |part| {
+        if (!first) try out.append(allocator, '/');
+        first = false;
+        if (part.len > 1 and part[0] == ':') {
+            try out.append(allocator, '{');
+            try out.appendSlice(allocator, part[1..]);
+            try out.append(allocator, '}');
+        } else {
+            try out.appendSlice(allocator, part);
+        }
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn writeRouteRegistration(w: ListWriter, method: []const u8, path: []const u8, handler: []const u8, allocator: std.mem.Allocator) !void {
+    const method_upper = std.ascii.upperString(try allocator.alloc(u8, method.len), method);
+    defer allocator.free(method_upper);
+    const router_path = try toRouterPath(allocator, path);
+    defer allocator.free(router_path);
+    try w.print("    try server.addRoute(.{{ .method = .{s}, .path = \"{s}\", .handler = handlers.{s}Handler }});\n", .{ method_upper, router_path, handler });
+}
+
 /// Generate API from DSL definition
 pub fn generateApiFromDsl(allocator: std.mem.Allocator, def: dsl.ApiDef, output_dir: []const u8) !void {
     const cwd = compat.cwd();
@@ -54,10 +82,10 @@ pub fn generateApiFromDsl(allocator: std.mem.Allocator, def: dsl.ApiDef, output_
         try hw.print("pub fn {s}Handler(ctx: *api.Context) !void {{\n", .{route.handler});
         if (route.req_type) |req| {
             try hw.print("    const req = try ctx.bindJson(types.{s});\n", .{req});
+            try hw.writeAll("    _ = req;\n");
         }
         if (route.resp_type) |resp| {
-            try hw.print("    var resp: types.{s} = undefined;\n", .{resp});
-            try hw.writeAll("    _ = resp;\n");
+            try hw.print("    const resp: types.{s} = std.mem.zeroes(types.{s});\n", .{ resp, resp });
             try hw.writeAll("    // TODO: implement handler logic\n");
             try hw.writeAll("    try ctx.jsonStruct(200, resp);\n");
         } else {
@@ -79,9 +107,7 @@ pub fn generateApiFromDsl(allocator: std.mem.Allocator, def: dsl.ApiDef, output_
     try rw.writeAll("pub fn registerRoutes(server: *api.Server) !void {\n");
 
     for (def.routes) |route| {
-        const method = std.ascii.lowerString(try allocator.alloc(u8, route.method.len), route.method);
-        defer allocator.free(method);
-        try rw.print("    try server.{s}(\"{s}\", handlers.{s}Handler);\n", .{ method, route.path, route.handler });
+        try writeRouteRegistration(rw, route.method, route.path, route.handler, allocator);
     }
 
     try rw.writeAll("}\n");
@@ -106,9 +132,22 @@ pub fn generateOpenApi(allocator: std.mem.Allocator, def: dsl.ApiDef, output_dir
     for (def.routes, 0..) |route, i| {
         const method_lower = std.ascii.lowerString(try allocator.alloc(u8, route.method.len), route.method);
         defer allocator.free(method_lower);
-        try w.print("    \"{s}\": {{\n", .{route.path});
+        const router_path = try toRouterPath(allocator, route.path);
+        defer allocator.free(router_path);
+        try w.print("    \"{s}\": {{\n", .{router_path});
         try w.print("      \"{s}\": {{\n", .{method_lower});
         try w.print("        \"operationId\": \"{s}\",\n", .{route.handler});
+        if (route.req_type) |req| {
+            try w.writeAll("        \"requestBody\": {\n");
+            try w.writeAll("          \"content\": {\n");
+            try w.writeAll("            \"application/json\": {\n");
+            try w.writeAll("              \"schema\": {\n");
+            try w.print("                \"$ref\": \"#/components/schemas/{s}\"\n", .{req});
+            try w.writeAll("              }\n");
+            try w.writeAll("            }\n");
+            try w.writeAll("          }\n");
+            try w.writeAll("        },\n");
+        }
         try w.writeAll("        \"responses\": {\n");
         try w.writeAll("          \"200\": {\n");
         try w.writeAll("            \"description\": \"OK\",\n");
@@ -125,21 +164,6 @@ pub fn generateOpenApi(allocator: std.mem.Allocator, def: dsl.ApiDef, output_dir
         try w.writeAll("            }\n");
         try w.writeAll("          }\n");
         try w.writeAll("        }\n");
-        if (route.req_type) |_| {
-            try w.writeAll(
-                \\"        \"requestBody\": {\\n"
-                \\"          \"content\": {\\n"
-                \\"            \"application/json\": {\\n"
-                \\"              \"schema\": {\\n"
-            );
-            try w.print("                \"$ref\": \"#/components/schemas/{s}\"\\n", .{route.req_type.?});
-            try w.writeAll(
-                \\"              }\\n"
-                \\"            }\\n"
-                \\"          }\\n"
-                \\"        },\\n"
-            );
-        }
         try w.writeAll("      }\n");
         try w.writeAll("    }");
         if (i < def.routes.len - 1) try w.writeAll(",");
@@ -192,8 +216,17 @@ pub fn newProject(allocator: std.mem.Allocator, project_name: []const u8, output
     defer allocator.free(build_content);
     try project_dir.writeFile(compat.io(), .{ .sub_path = "build.zig", .data = build_content });
 
-    // Write build.zig.zon
-    const zon_content = try std.fmt.allocPrint(allocator, template.build_zon, .{project_name});
+    // Write build.zig.zon (package name must be a valid enum literal, and the
+    // fingerprint embeds a CRC32 of that name alongside a random id)
+    const pkg_name = try zonPackageName(allocator, project_name);
+    defer allocator.free(pkg_name);
+    const id = blk: {
+        var bytes: [4]u8 = undefined;
+        compat.io().random(&bytes);
+        break :blk @max(1, std.mem.readInt(u32, &bytes, .little) % 0xfffffffe);
+    };
+    const fingerprint = zonFingerprint(pkg_name, id);
+    const zon_content = try std.fmt.allocPrint(allocator, template.build_zon, .{ pkg_name, fingerprint });
     defer allocator.free(zon_content);
     try project_dir.writeFile(compat.io(), .{ .sub_path = "build.zig.zon", .data = zon_content });
 
@@ -258,9 +291,7 @@ pub fn generateApi(allocator: std.mem.Allocator, spec: ApiSpec, output_dir: []co
     try rw.writeAll("pub fn registerRoutes(server: *api.Server) !void {\n");
 
     for (spec.routes) |route| {
-        const method = std.ascii.lowerString(try allocator.alloc(u8, route.method.len), route.method);
-        defer allocator.free(method);
-        try rw.print("    try server.{s}(\"{s}\", handlers.{s}Handler);\n", .{ method, route.path, route.handler });
+        try writeRouteRegistration(rw, route.method, route.path, route.handler, allocator);
     }
 
     try rw.writeAll("}\n");
@@ -377,7 +408,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     // insert
     try w.writeAll("    pub fn insert(client: *sqlx.Client, data: *const ");
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
-    try w.writeAll("        var b = sqlx.Builder.init(client.allocator, table_name);\n");
+    try w.writeAll("        const b = sqlx.Builder.init(client.allocator, table_name);\n");
     try w.writeAll("        const sql = try b.insert(&.{ ");
     for (columns, 0..) |col, i| {
         if (i > 0) try w.writeAll(", ");
@@ -396,7 +427,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     // insertCtx
     try w.writeAll("    pub fn insertCtx(client: *sqlx.Client, ctx: sqlx.SqlContext, data: *const ");
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
-    try w.writeAll("        var b = sqlx.Builder.init(client.allocator, table_name);\n");
+    try w.writeAll("        const b = sqlx.Builder.init(client.allocator, table_name);\n");
     try w.writeAll("        const sql = try b.insert(&.{ ");
     for (columns, 0..) |col, i| {
         if (i > 0) try w.writeAll(", ");
@@ -431,7 +462,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     // update
     try w.writeAll("    pub fn update(client: *sqlx.Client, data: *const ");
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
-    try w.writeAll("        var b = sqlx.Builder.init(client.allocator, table_name);\n");
+    try w.writeAll("        const b = sqlx.Builder.init(client.allocator, table_name);\n");
     try w.writeAll("        const set_sql = try b.update(&.{ ");
     for (columns, 0..) |col, i| {
         if (i > 0) try w.writeAll(", ");
@@ -453,7 +484,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     // updateCtx
     try w.writeAll("    pub fn updateCtx(client: *sqlx.Client, ctx: sqlx.SqlContext, data: *const ");
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
-    try w.writeAll("        var b = sqlx.Builder.init(client.allocator, table_name);\n");
+    try w.writeAll("        const b = sqlx.Builder.init(client.allocator, table_name);\n");
     try w.writeAll("        const set_sql = try b.update(&.{ ");
     for (columns, 0..) |col, i| {
         if (i > 0) try w.writeAll(", ");
@@ -477,7 +508,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
     try w.writeAll("        const result = try update(cached.client, data);\n");
     try w.print("        _ = cached.delCache(\"{s}:all\") catch {{}};\n", .{table_name});
-    try w.print("        _ = cached.delCache(\"{s}:\" ++ std.fmt.allocPrint(cached.allocator, \"{{d}}\", .{{data.{s}}}) catch return result) catch {{}};\n", .{ table_name, primary_key });
+    try w.print("        delCacheById(cached, data.{s});\n", .{primary_key});
     try w.writeAll("        return result;\n");
     try w.writeAll("    }\n\n");
 
@@ -486,7 +517,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.print("{s}) !sqlx.ExecResult {{\n", .{struct_name});
     try w.writeAll("        const result = try updateCtx(cached.client, ctx, data);\n");
     try w.print("        _ = cached.delCache(\"{s}:all\") catch {{}};\n", .{table_name});
-    try w.print("        _ = cached.delCache(\"{s}:\" ++ std.fmt.allocPrint(cached.allocator, \"{{d}}\", .{{data.{s}}}) catch return result) catch {{}};\n", .{ table_name, primary_key });
+    try w.print("        delCacheById(cached, data.{s});\n", .{primary_key});
     try w.writeAll("        return result;\n");
     try w.writeAll("    }\n\n");
 
@@ -508,7 +539,7 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.print("    pub fn deleteCache(cached: *sqlx.CachedConn, id: {s}) !sqlx.ExecResult {{\n", .{pk_type});
     try w.writeAll("        const result = try delete(cached.client, id);\n");
     try w.print("        _ = cached.delCache(\"{s}:all\") catch {{}};\n", .{table_name});
-    try w.print("        _ = cached.delCache(\"{s}:\" ++ std.fmt.allocPrint(cached.allocator, \"{{d}}\", .{{id}}) catch return result) catch {{}};\n", .{table_name});
+    try w.writeAll("        delCacheById(cached, id);\n");
     try w.writeAll("        return result;\n");
     try w.writeAll("    }\n\n");
 
@@ -516,8 +547,15 @@ pub fn generateModel(allocator: std.mem.Allocator, table_name: []const u8, colum
     try w.print("    pub fn deleteCacheCtx(cached: *sqlx.CachedConn, ctx: sqlx.SqlContext, id: {s}) !sqlx.ExecResult {{\n", .{pk_type});
     try w.writeAll("        const result = try deleteCtx(cached.client, ctx, id);\n");
     try w.print("        _ = cached.delCache(\"{s}:all\") catch {{}};\n", .{table_name});
-    try w.print("        _ = cached.delCache(\"{s}:\" ++ std.fmt.allocPrint(cached.allocator, \"{{d}}\", .{{id}}) catch return result) catch {{}};\n", .{table_name});
+    try w.writeAll("        delCacheById(cached, id);\n");
     try w.writeAll("        return result;\n");
+    try w.writeAll("    }\n\n");
+
+    // delCacheById helper
+    try w.print("    fn delCacheById(cached: *sqlx.CachedConn, id: {s}) void {{\n", .{pk_type});
+    try w.print("        const key = std.fmt.allocPrint(cached.allocator, \"{s}:{s}\", .{{ table_name, id }}) catch return;\n", .{ "{s}", pkFmtSpec(pk_type) });
+    try w.writeAll("        defer cached.allocator.free(key);\n");
+    try w.writeAll("        _ = cached.delCache(key) catch {};\n");
     try w.writeAll("    }\n");
 
     try w.writeAll("};\n");
@@ -552,6 +590,35 @@ fn zigFieldTypeLiteral(zig_type: []const u8) []const u8 {
     if (std.mem.eql(u8, zig_type, "bool")) return "bool";
     if (std.mem.eql(u8, zig_type, "[]const u8")) return "string";
     return "string";
+}
+
+/// Format specifier used to build "<table>:<id>" cache keys in generated code.
+fn pkFmtSpec(zig_type: []const u8) []const u8 {
+    if (std.mem.eql(u8, zig_type, "[]const u8")) return "{s}";
+    if (std.mem.eql(u8, zig_type, "bool")) return "{}";
+    return "{d}";
+}
+
+/// Convert a project name into a valid build.zig.zon package name (enum literal text):
+/// lowercase, and any character outside [a-z0-9_] becomes '_'.
+fn zonPackageName(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (name) |c| {
+        const lower = std.ascii.toLower(c);
+        const ok = (lower >= 'a' and lower <= 'z') or (lower >= '0' and lower <= '9') or lower == '_';
+        try out.append(allocator, if (ok) lower else '_');
+    }
+    if (out.items.len == 0) try out.append(allocator, '_');
+    const first = out.items[0];
+    if (first >= '0' and first <= '9') try out.insert(allocator, 0, '_');
+    return out.toOwnedSlice(allocator);
+}
+
+/// 0.17 requires the fingerprint to embed a CRC32 of the package name
+/// in the high 32 bits and a random id in the low 32 bits.
+fn zonFingerprint(pkg_name: []const u8, id: u32) u64 {
+    return (@as(u64, std.hash.Crc32.hash(pkg_name)) << 32) | id;
 }
 
 /// Parse simple CREATE TABLE SQL
@@ -684,13 +751,142 @@ test "generate openapi from dsl" {
     };
 
     try generateOpenApi(allocator, def, ".test-openapi");
-    defer compat.cwd().deleteTree(".test-openapi") catch {};
+    defer compat.cwd().deleteTree(compat.io(), ".test-openapi") catch {};
 
     const content = try compat.cwd().readFileAlloc(compat.io(), ".test-openapi/openapi.json", allocator, .limited(1024 * 1024));
     defer allocator.free(content);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"/users/:id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"/users/{id}\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"getUser\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"Req\"") != null);
+}
+
+test "openapi output for user.api is valid json" {
+    const allocator = std.testing.allocator;
+    // Same DSL as examples/user.api
+    const source =
+        \\name user-api
+        \\
+        \\type LoginReq {
+        \\    username string
+        \\    password string
+        \\}
+        \\
+        \\type LoginResp {
+        \\    token string
+        \\}
+        \\
+        \\type GetUserReq {
+        \\    id int
+        \\}
+        \\
+        \\type GetUserResp {
+        \\    id int
+        \\    username string
+        \\    email string
+        \\}
+        \\
+        \\get /users/:id getUser
+        \\post /users/login LoginReq LoginResp login
+    ;
+    var def = try dsl.parse(allocator, source);
+    defer def.deinit(allocator);
+
+    try generateOpenApi(allocator, def, ".test-openapi-user");
+    defer compat.cwd().deleteTree(compat.io(), ".test-openapi-user") catch {};
+
+    const content = try compat.cwd().readFileAlloc(compat.io(), ".test-openapi-user/openapi.json", allocator, .limited(1024 * 1024));
+    defer allocator.free(content);
+
+    // Must be parseable JSON with the expected paths, methods and schemas.
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const paths = parsed.value.object.get("paths").?.object;
+    const get_user = paths.get("/users/{id}").?.object;
+    try std.testing.expect(get_user.contains("get"));
+    try std.testing.expectEqualStrings("getUser", get_user.get("get").?.object.get("operationId").?.string);
+
+    const login = paths.get("/users/login").?.object;
+    const login_op = login.get("post").?.object;
+    try std.testing.expectEqualStrings("login", login_op.get("operationId").?.string);
+    const request_body = login_op.get("requestBody").?.object;
+    const ref = request_body.get("content").?.object.get("application/json").?.object.get("schema").?.object.get("$ref").?.string;
+    try std.testing.expectEqualStrings("#/components/schemas/LoginReq", ref);
+    try std.testing.expect(login_op.contains("responses"));
+
+    const schemas = parsed.value.object.get("components").?.object.get("schemas").?.object;
+    try std.testing.expect(schemas.contains("LoginReq"));
+    try std.testing.expect(schemas.contains("LoginResp"));
+}
+
+test "generate api from dsl uses addRoute" {
+    const allocator = std.testing.allocator;
+    const source =
+        \\name user-api
+        \\
+        \\type LoginReq {
+        \\    username string
+        \\    password string
+        \\}
+        \\
+        \\get /users/:id getUser
+        \\post /users/login LoginReq LoginResp login
+    ;
+    var def = try dsl.parse(allocator, source);
+    defer def.deinit(allocator);
+
+    try generateApiFromDsl(allocator, def, ".test-api-gen");
+    defer compat.cwd().deleteTree(compat.io(), ".test-api-gen") catch {};
+
+    const routes = try compat.cwd().readFileAlloc(compat.io(), ".test-api-gen/routes.zig", allocator, .limited(1024 * 1024));
+    defer allocator.free(routes);
+    try std.testing.expect(std.mem.indexOf(u8, routes, "try server.addRoute(.{ .method = .GET, .path = \"/users/{id}\", .handler = handlers.getUserHandler });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routes, "try server.addRoute(.{ .method = .POST, .path = \"/users/login\", .handler = handlers.loginHandler });") != null);
+    try std.testing.expect(std.mem.indexOf(u8, routes, "server.get(") == null);
+
+    const handlers = try compat.cwd().readFileAlloc(compat.io(), ".test-api-gen/handlers.zig", allocator, .limited(1024 * 1024));
+    defer allocator.free(handlers);
+    try std.testing.expect(std.mem.indexOf(u8, handlers, "try ctx.bindJson(types.LoginReq);") != null);
+}
+
+test "generate model uses public sqlx api" {
+    const allocator = std.testing.allocator;
+    const sql = "CREATE TABLE users ( id INT PRIMARY KEY, name VARCHAR(255), age INT )";
+    const result = try parseCreateTable(allocator, sql);
+    defer {
+        allocator.free(result.table_name);
+        allocator.free(result.primary_key);
+        for (result.columns) |col| {
+            allocator.free(col.name);
+        }
+        allocator.free(result.columns);
+    }
+
+    try generateModel(allocator, result.table_name, result.columns, result.primary_key, ".test-model-gen");
+    defer compat.cwd().deleteTree(compat.io(), ".test-model-gen") catch {};
+
+    const model = try compat.cwd().readFileAlloc(compat.io(), ".test-model-gen/users.zig", allocator, .limited(1024 * 1024));
+    defer allocator.free(model);
+    try std.testing.expect(std.mem.indexOf(u8, model, "pub fn findOne(client: *sqlx.Client, id: i64) !User") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model, "pub fn findAll(client: *sqlx.Client) ![]User") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model, "cached.delCache(key)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, model, "++ std.fmt.allocPrint") == null);
+    try std.testing.expect(std.mem.indexOf(u8, model, "var b = sqlx.Builder") == null);
+}
+
+test "zon package name is sanitized" {
+    const allocator = std.testing.allocator;
+    const name = try zonPackageName(allocator, "My-Service.v2");
+    defer allocator.free(name);
+    try std.testing.expectEqualStrings("my_service_v2", name);
+}
+
+test "zon fingerprint embeds crc32 of package name" {
+    const allocator = std.testing.allocator;
+    const name = try zonPackageName(allocator, "myapp");
+    defer allocator.free(name);
+    const fingerprint = zonFingerprint(name, 0x12345678);
+    try std.testing.expectEqual((@as(u64, std.hash.Crc32.hash("myapp")) << 32) | 0x12345678, fingerprint);
 }
 
 test "parse api spec" {
@@ -706,6 +902,12 @@ test "parse api spec" {
     ;
     const spec = try parseApiSpec(allocator, spec_json);
     defer {
+        allocator.free(spec.name);
+        for (spec.routes) |route| {
+            allocator.free(route.method);
+            allocator.free(route.path);
+            allocator.free(route.handler);
+        }
         allocator.free(spec.routes);
     }
     try std.testing.expectEqualStrings("user-api", spec.name);

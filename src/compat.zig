@@ -209,6 +209,7 @@ pub fn fileWrite(file: std.Io.File, data: []const u8) !void {
     var buf: [4096]u8 = undefined;
     var writer = file.writer(io(), &buf);
     try writer.interface.writeAll(data);
+    try writer.interface.flush();
 }
 
 pub fn fileRead(file: std.Io.File, buf: []u8) !usize {
@@ -352,12 +353,19 @@ pub const net = struct {
         var buf: [4096]u8 = undefined;
         var writer = stream.writer(io(), &buf);
         try writer.interface.writeAll(data);
+        try writer.interface.flush();
     }
 
+    /// Single read operation: returns however many bytes are currently
+    /// available (short read), or 0 on end-of-stream. Does NOT fill the
+    /// whole buffer — protocols that parse incrementally depend on this.
     pub fn streamRead(stream: Stream, buf: []u8) !usize {
-        var read_buf: [4096]u8 = undefined;
-        var reader = stream.reader(io(), &read_buf);
-        return reader.interface.readSliceShort(buf);
+        var data: [1][]u8 = .{buf};
+        // readWithControl with empty control: Stream.read's no-control tuple
+        // destructuring is broken in 0.17.0 std, readWithControl returns the
+        // named ReadResult struct instead.
+        const result = try stream.readWithControl(io(), &data, &[_]u8{});
+        return result.data_len;
     }
 
     pub fn streamReadAll(stream: Stream, buf: []u8) !usize {

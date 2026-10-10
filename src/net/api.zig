@@ -425,13 +425,22 @@ const RequestParser = struct {
             }
         }
 
+        // `path` and `raw_path` point into `buffer`, which the header loop
+        // below reuses; copy them out before headers overwrite the buffer.
+        const owned_path = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(owned_path);
+        const owned_raw_path = try self.allocator.dupe(u8, raw_path);
+        errdefer self.allocator.free(owned_raw_path);
+
         // Parse headers
         var headers = std.StringHashMap([]const u8).init(self.allocator);
         while (true) {
-            const line = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
-            if (line.len == 0 or (line.len == 1 and line[0] == '\r')) break;
-
+            const raw = try reader.readUntilDelimiterOrEof(&buffer, '\n') orelse return error.InvalidRequest;
+            // The returned line includes the '\n' delimiter unless EOF cut it
+            // short; strip it, then strip a trailing CR for CRLF line endings.
+            const line = if (raw.len > 0 and raw[raw.len - 1] == '\n') raw[0 .. raw.len - 1] else raw;
             const header_line = if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
+            if (header_line.len == 0) break; // empty line terminates headers
 
             if (std.mem.indexOf(u8, header_line, ": ")) |colon_pos| {
                 const key = try self.allocator.dupe(u8, header_line[0..colon_pos]);
@@ -458,8 +467,8 @@ const RequestParser = struct {
 
         return ParsedRequest{
             .method = method,
-            .path = try self.allocator.dupe(u8, path),
-            .raw_path = try self.allocator.dupe(u8, raw_path),
+            .path = owned_path,
+            .raw_path = owned_raw_path,
             .query = query_map,
             .headers = headers,
             .body = body,
@@ -497,6 +506,23 @@ const ParsedRequest = struct {
     }
 };
 
+/// Extract the parameter name from a path segment written as `{name}` or `:name`.
+fn parseParamName(segment: []const u8) ?[]const u8 {
+    if (segment.len >= 2) {
+        if (std.mem.startsWith(u8, segment, "{")) {
+            // Tolerate a missing closing brace, e.g. "{id"
+            return if (std.mem.endsWith(u8, segment, "}"))
+                segment[1 .. segment.len - 1]
+            else
+                segment[1..];
+        }
+        if (std.mem.startsWith(u8, segment, ":")) {
+            return segment[1..];
+        }
+    }
+    return null;
+}
+
 /// Trie node for the router
 const TrieNode = struct {
     segment: []const u8,
@@ -507,18 +533,15 @@ const TrieNode = struct {
 
     pub fn init(allocator: std.mem.Allocator, segment: []const u8) !*TrieNode {
         const node = try allocator.create(TrieNode);
-        node.* = .{
-            .segment = try allocator.dupe(u8, segment),
-            .is_param = std.mem.startsWith(u8, segment, "{"),
-            .param_name = null,
-            .route = null,
-            .children = .empty,
-        };
-        if (node.is_param) {
-            const name = if (std.mem.endsWith(u8, segment, "}"))
-                segment[1 .. segment.len - 1]
-            else
-                segment[1..];
+        errdefer allocator.destroy(node);
+        node.segment = try allocator.dupe(u8, segment);
+        errdefer allocator.free(node.segment);
+        node.is_param = false;
+        node.param_name = null;
+        node.route = null;
+        node.children = .empty;
+        if (parseParamName(segment)) |name| {
+            node.is_param = true;
             node.param_name = try allocator.dupe(u8, name);
         }
         return node;
@@ -1194,6 +1217,60 @@ test "path matching" {
     try std.testing.expect(no_match == null);
 }
 
+test "path params both syntaxes" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/users/{id}",
+        .handler = struct {
+            fn handle(ctx: *Context) anyerror!void {
+                _ = ctx;
+            }
+        }.handle,
+    });
+    try router.addRoute(.{
+        .method = .GET,
+        .path = "/posts/:id",
+        .handler = struct {
+            fn handle(ctx: *Context) anyerror!void {
+                _ = ctx;
+            }
+        }.handle,
+    });
+
+    var brace_match = router.match(.GET, "/users/123");
+    if (brace_match) |*m| {
+        defer {
+            var iter = m.params.iterator();
+            while (iter.next()) |entry| {
+                std.testing.allocator.free(entry.key_ptr.*);
+                std.testing.allocator.free(entry.value_ptr.*);
+            }
+            m.params.deinit();
+        }
+        try std.testing.expectEqualStrings("123", m.params.get("id").?);
+    } else {
+        try std.testing.expect(false);
+    }
+
+    var colon_match = router.match(.GET, "/posts/456");
+    if (colon_match) |*m| {
+        defer {
+            var iter = m.params.iterator();
+            while (iter.next()) |entry| {
+                std.testing.allocator.free(entry.key_ptr.*);
+                std.testing.allocator.free(entry.value_ptr.*);
+            }
+            m.params.deinit();
+        }
+        try std.testing.expectEqualStrings("456", m.params.get("id").?);
+    } else {
+        try std.testing.expect(false);
+    }
+}
+
 test "http methods" {
     try std.testing.expectEqual(Method.GET, Method.fromString("GET"));
     try std.testing.expectEqualStrings("POST", Method.POST.toString());
@@ -1235,7 +1312,6 @@ test "route group" {
     const matched = server.router.match(.GET, "/api/v1/users");
     try std.testing.expect(matched != null);
 }
-
 
 test "worker pool queue limits" {
     const allocator = std.testing.allocator;
