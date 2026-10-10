@@ -18,7 +18,7 @@ my-service/
 ## 步骤 1: 初始化项目
 
 ```bash
-./zig-out/bin/zigzeroctl new my-service
+./zig-out/bin/zgctl new my-service
 cd my-service
 zig build
 ```

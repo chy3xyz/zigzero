@@ -104,7 +104,7 @@ zig build -Drelease-fast
 
 ```bash
 zig build
-./zig-out/bin/zigzeroctl --version
+./zig-out/bin/zgctl --version
 ```
 
 ## 数据库初始化 (for testing)

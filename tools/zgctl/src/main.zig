@@ -4,20 +4,20 @@ const generate = @import("generate.zig");
 const dsl = @import("dsl.zig");
 
 const usage =
-    \\zigzeroctl - Code generation tool for zigzero
+    \\zgctl - Code generation tool for zigzero
     \\
     \\Usage:
-    \\  zigzeroctl new <project-name>      Create a new zigzero service project
-    \\  zigzeroctl api <spec.(json|api)>   Generate API routes and handlers from spec
-    \\  zigzeroctl openapi <spec.api>      Generate OpenAPI 3.0 JSON from .api DSL
-    \\  zigzeroctl model <ddl.sql>         Generate ORM models from SQL DDL
+    \\  zgctl new <project-name>      Create a new zigzero service project
+    \\  zgctl api <spec.(json|api)>   Generate API routes and handlers from spec
+    \\  zgctl openapi <spec.api>      Generate OpenAPI 3.0 JSON from .api DSL
+    \\  zgctl model <ddl.sql>         Generate ORM models from SQL DDL
     \\
     \\Examples:
-    \\  zigzeroctl new my-service
-    \\  zigzeroctl api api-spec.json -o ./gen
-    \\  zigzeroctl api api-spec.api -o ./gen
-    \\  zigzeroctl openapi api-spec.api -o ./gen/docs
-    \\  zigzeroctl model schema.sql -o ./gen/models
+    \\  zgctl new my-service
+    \\  zgctl api api-spec.json -o ./gen
+    \\  zgctl api api-spec.api -o ./gen
+    \\  zgctl openapi api-spec.api -o ./gen/docs
+    \\  zgctl model schema.sql -o ./gen/models
     \\
 ;
 
@@ -49,7 +49,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     if (std.mem.eql(u8, cmd, "new")) {
         if (args.len < 3) {
-            std.debug.print("Usage: zigzeroctl new <project-name>\n", .{});
+            std.debug.print("Usage: zgctl new <project-name>\n", .{});
             return;
         }
         const project_name = args[2];
@@ -58,7 +58,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("Created project '{s}' in {s}/\n", .{ project_name, output_dir });
     } else if (std.mem.eql(u8, cmd, "api")) {
         if (args.len < 3) {
-            std.debug.print("Usage: zigzeroctl api <spec.(json|api)> [-o <output-dir>]\n", .{});
+            std.debug.print("Usage: zgctl api <spec.(json|api)> [-o <output-dir>]\n", .{});
             return;
         }
         const spec_file = args[2];
@@ -87,7 +87,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("Generated API code in {s}/\n", .{output_dir});
     } else if (std.mem.eql(u8, cmd, "openapi")) {
         if (args.len < 3) {
-            std.debug.print("Usage: zigzeroctl openapi <spec.api> [-o <output-dir>]\n", .{});
+            std.debug.print("Usage: zgctl openapi <spec.api> [-o <output-dir>]\n", .{});
             return;
         }
         const spec_file = args[2];
@@ -103,7 +103,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("Generated OpenAPI spec in {s}/\n", .{output_dir});
     } else if (std.mem.eql(u8, cmd, "model")) {
         if (args.len < 3) {
-            std.debug.print("Usage: zigzeroctl model <ddl.sql> [-o <output-dir>]\n", .{});
+            std.debug.print("Usage: zgctl model <ddl.sql> [-o <output-dir>]\n", .{});
             return;
         }
         const sql_file = args[2];

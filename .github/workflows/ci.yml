@@ -41,7 +41,7 @@ jobs:
         run: zig build test
 
   codegen-smoke:
-    name: zigzeroctl smoke (ubuntu)
+    name: zgctl smoke (ubuntu)
     runs-on: ubuntu-latest
 
     steps:
@@ -60,22 +60,22 @@ jobs:
       - name: Build
         run: zig build
 
-      - name: zigzeroctl api (DSL spec)
-        run: zig-out/bin/zigzeroctl api examples/user.api -o /tmp/ctl-smoke/api
+      - name: zgctl api (DSL spec)
+        run: zig-out/bin/zgctl api examples/user.api -o /tmp/ctl-smoke/api
 
-      - name: zigzeroctl openapi + validate JSON
+      - name: zgctl openapi + validate JSON
         run: |
-          zig-out/bin/zigzeroctl openapi examples/user.api -o /tmp/ctl-smoke/docs
+          zig-out/bin/zgctl openapi examples/user.api -o /tmp/ctl-smoke/docs
           python3 -m json.tool /tmp/ctl-smoke/docs/openapi.json > /dev/null
 
-      - name: zigzeroctl model
+      - name: zgctl model
         run: |
           printf 'CREATE TABLE users (\n  id SERIAL PRIMARY KEY,\n  name VARCHAR(255) NOT NULL,\n  email TEXT\n);\n' > /tmp/ctl-smoke/schema.sql
-          zig-out/bin/zigzeroctl model /tmp/ctl-smoke/schema.sql -o /tmp/ctl-smoke/models
+          zig-out/bin/zgctl model /tmp/ctl-smoke/schema.sql -o /tmp/ctl-smoke/models
 
-      - name: zigzeroctl new + build template project
+      - name: zgctl new + build template project
         run: |
-          zig-out/bin/zigzeroctl new smoke-app .tmp-smoke/smoke-app
+          zig-out/bin/zgctl new smoke-app .tmp-smoke/smoke-app
           sed -i 's|\.url = ".*",|.path = "../..",|' .tmp-smoke/smoke-app/build.zig.zon          cd .tmp-smoke/smoke-app && zig build
     name: DB tests (${{ matrix.db }})
     strategy:

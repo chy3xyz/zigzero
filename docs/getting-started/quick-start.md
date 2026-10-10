@@ -21,10 +21,10 @@ cd zigzero
 zig build
 ```
 
-## 步骤 2: 使用 zigzeroctl 脚手架
+## 步骤 2: 使用 zgctl 脚手架
 
 ```bash
-./zig-out/bin/zigzeroctl new hello-service
+./zig-out/bin/zgctl new hello-service
 cd hello-service
 zig build
 ./zig-out/bin/hello-service

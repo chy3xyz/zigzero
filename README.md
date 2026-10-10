@@ -26,7 +26,7 @@ ZigZero is a high-performance microservice framework written in pure Zig, inspir
 | **Infrastructure** | `log`, `config`, `trace`, `metric`, `health` | Structured logging, config loading, tracing, metrics |
 | **Async** | `pool`, `fx`, `mapreduce`, `threading` | Connection pooling, streams, map/reduce, goroutine-style threading |
 | **Reliability** | `retry`, `lock`, `lifecycle`, `mq`, `cron` | Retry, distributed locks, graceful shutdown, message queue, scheduling |
-| **Code Gen** | `zigzeroctl` | Project scaffolding, API codegen, ORM model generation |
+| **Code Gen** | `zgctl` | Project scaffolding, API codegen, ORM model generation |
 
 See [Module Reference](#module-reference) for complete list.
 
@@ -43,7 +43,7 @@ zig build
 ### 2. Run the example
 
 ```bash
-./zig-out/bin/zigzeroctl new my-service
+./zig-out/bin/zgctl new my-service
 cd my-service
 zig build
 ./zig-out/bin/my-service
@@ -199,20 +199,20 @@ For database setup, use the initialization script:
 ./scripts/init-db.sh --clean     # Clean up test databases
 ```
 
-## Code Generation (zigzeroctl)
+## Code Generation (zgctl)
 
 ```bash
 # Build the CLI
 zig build
 
 # Scaffold new service
-./zig-out/bin/zigzeroctl new my-service
+./zig-out/bin/zgctl new my-service
 
 # Generate API from .api DSL
-./zig-out/bin/zigzeroctl api api-spec.api -o gen/api
+./zig-out/bin/zgctl api api-spec.api -o gen/api
 
 # Generate ORM models from SQL
-./zig-out/bin/zigzeroctl model schema.sql -o gen/models
+./zig-out/bin/zgctl model schema.sql -o gen/models
 ```
 
 ### API DSL Format
@@ -284,7 +284,7 @@ post /users/login LoginReq LoginResp login
 | ORM | `data/orm` | 🚧 Placeholder (no real DB driver yet) |
 | Validation | `data/validate` | ✅ |
 | SQL Client | `infra/sqlx` | ✅ |
-| zigzeroctl | `tools/zigzeroctl` | ✅ |
+| zgctl | `tools/zgctl` | ✅ |
 
 ## Documentation
 

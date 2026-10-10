@@ -131,15 +131,15 @@ pub fn build(b: *std.Build) void {
 
     linkDbLibs(zigzero_mod, b);
 
-    // zigzeroctl code generation tool
+    // zgctl code generation tool
     const ctl_module = b.createModule(.{
-        .root_source_file = b.path("tools/zigzeroctl/src/main.zig"),
+        .root_source_file = b.path("tools/zgctl/src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
     ctl_module.addImport("zigzero", zigzero_mod);
     const ctl = b.addExecutable(.{
-        .name = "zigzeroctl",
+        .name = "zgctl",
         .root_module = ctl_module,
     });
     b.installArtifact(ctl);
@@ -202,7 +202,7 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     test_step.dependOn(&run_tests.step);
 
-    // zigzeroctl code generator tests
+    // zgctl code generator tests
     const ctl_tests = b.addTest(.{
         .root_module = ctl_module,
     });

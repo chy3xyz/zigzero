@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "zigzeroctl",
+        .name = "zgctl",
         .root_module = root_module,
     });
 
@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run zigzeroctl");
+    const run_step = b.step("run", "Run zgctl");
     run_step.dependOn(&run_cmd.step);
 
     const test_step = b.step("test", "Run unit tests");

@@ -1,4 +1,4 @@
-//! .api DSL parser for zigzeroctl
+//! .api DSL parser for zgctl
 //!
 //! Supports a simplified go-zero-style API DSL:
 //!

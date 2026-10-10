@@ -15,16 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`infra/lock`**: distributed lock `renew` sent an unterminated command
 - **`infra/retry`**: `retryWithBreaker` actually routes through the circuit breaker
 - **`net/rpc`**: server now dispatches incoming frames to registered handlers (was accepted-but-never-executed); adds `boundPort()` and reliable `stop()` via self-connect wakeup
-- **`tools/zigzeroctl`**: generated routes use the real `addRoute` API with `{id}` param syntax; fixed `new` template project (builds on 0.17.0); fixed malformed usage text; `delCache` is now public so generated model code compiles; OpenAPI output is valid JSON
+- **`tools/zgctl`**: generated routes use the real `addRoute` API with `{id}` param syntax; fixed `new` template project (builds on 0.17.0); fixed malformed usage text; `delCache` is now public so generated model code compiles; OpenAPI output is valid JSON
 
 ### Added
 - Route params support both `{id}` and `:id` syntax
 - End-to-end RPC roundtrip test (replaces the previously skipped stub)
 - `examples/hello` minimal server example, wired into `zig build`
-- zigzeroctl unit tests wired into `zig build test`
-- CI: `codegen-smoke` job exercising all four `zigzeroctl` subcommands (api/openapi/model/new + template build)
+- zgctl unit tests wired into `zig build test`
+- CI: `codegen-smoke` job exercising all four `zgctl` subcommands (api/openapi/model/new + template build)
 
 ### Changed
+- **Renamed the CLI from `zigzeroctl` to `zgctl`** — shorter to type; the binary, `tools/zgctl` directory, docs, and CI all use the new name
 - README module reference now marks `net/tls` (certificate loading only) and `data/orm` (no real DB driver) as experimental/placeholder
 - SECURITY.md supported-versions table updated to 0.2.x
 
@@ -119,5 +120,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Stream/Parallel** (`core/fx`): Map, Parallel, Stream utilities
 - **MapReduce** (`core/mapreduce`): Concurrent map/reduce pipelines
 - **Validation** (`data/validate`): Input validation utilities
-- **Code Generation** (`tools/zigzeroctl`): CLI for scaffolding, API codegen, and ORM models
+- **Code Generation** ( `tools/zgctl`): CLI for scaffolding, API codegen, and ORM models
 - **CI/CD**: GitHub Actions workflow for macOS and Ubuntu with SQLite/PostgreSQL/MySQL testing
