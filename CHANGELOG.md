@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+- **`server/middleware` response cache served authenticated responses to anonymous callers**: entries are keyed by path and query alone and are replayed *before* a route's auth middleware runs, so one authorized `GET /admin` made that body public until the TTL expired. Requests carrying `Authorization`, `Proxy-Authorization` or `Cookie` (case-insensitive) are no longer cached, and are never served from cache
+- **`server/middleware` JWT `exp` was never checked**: a token stayed valid forever regardless of its expiry; expired tokens are now rejected with `error.TokenExpired` inside `verifyJwt`, so every caller inherits the check
+- **`server/middleware` malformed JWT signature crashed the server**: comparing `sig_decoded[0..32]` panicked (out-of-bounds) for any signature shorter than 32 bytes; wrong-length signatures are now rejected as `error.InvalidToken`
+- **`infra/sqlx` MySQL argument injection**: `.string` arguments were interpolated into the SQL with no escaping, so quotes, backslashes and control characters in a value escaped their literal. They now go through `appendEscapedString`, mirroring `mysql_real_escape_string`
+
+### Fixed
+- **`infra/lock` and `infra/redis` sent malformed RESP frames**: the release command declared `*4` with five elements and a `$45` length prefix for a 93-byte Lua script, and `Redis.lock` declared `*5` for a six-element `SET ... NX PX`. Verified against a live Redis: the old frames answer `-ERR Protocol error` / `-ERR syntax error`, the new ones `+OK` and `:1`. Frames are now built by `redis.respCommand`, which derives the count and every length prefix from the payload
+- **`core/codec` `JsonCodec.decode` returned dangling slices**: the parse arena was freed before the value was returned, so any `T` with slice fields pointed at freed memory; it now uses the leaky parse so the caller's allocator owns the result
+- **`infra/cache` leaked every value it dropped**: eviction, expiry, `delete`, `clear` and `deinit` freed the node but not the value, so a `ResponseCache` grew without bound. `Cache` now takes an optional `on_evict` hook and calls it on every drop path, and `ResponseCache` frees bodies through it
+- **`net/websocket` `writeClose` overflowed its stack buffer**: the reason was copied into a 125-byte payload with no bounds check; it is now truncated to the RFC 6455 control-frame limit
+- **`infra/retry` divided by zero at `jitter = 0`** (and could panic on conversion for extreme jitter values); the jitter term is skipped when its span is zero and the floor saturates
+- **`server/middleware` request-ID middleware returned a slice into a dead block**, so `X-Request-ID` read freed stack memory; the buffer now outlives the call
+- **`tools/zgctl` test step ran zero tests**: `zig build test` compiled a binary containing no tests because `main.zig` never referenced `dsl.zig` / `generate.zig` declarations; an aggregating `test` block now pulls in all 11
+
+### Added
+- Tests for every fix above (escaping, expiry, wrong-length signature, cache credential isolation, cache eviction hook, close-frame truncation, jitter edge cases, RESP frame bytes)
+
 ## [0.2.3] - 2026-10-10
 
 ### Fixed

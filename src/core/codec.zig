@@ -12,7 +12,12 @@ pub fn Codec(comptime T: type) type {
     };
 }
 
-/// JSON codec
+/// JSON codec.
+///
+/// `decode` hands the parsed value to the caller's allocator — a `T` containing
+/// slices keeps them in one allocation, so the conventional caller allocator is
+/// an arena that is released as a unit. The previous `parseFromSlice` variant
+/// freed its arena before returning and left every slice dangling.
 pub fn JsonCodec(comptime T: type) Codec(T) {
     return .{
         .encode = struct {
@@ -22,9 +27,10 @@ pub fn JsonCodec(comptime T: type) Codec(T) {
         }.encode,
         .decode = struct {
             fn decode(allocator: std.mem.Allocator, data: []const u8) anyerror!T {
-                var parsed = try std.json.parseFromSlice(T, allocator, data, .{});
-                defer parsed.deinit();
-                return parsed.value;
+                // The leaky variant keeps the parse arena in the caller's
+                // allocator; `parseFromSlice` would tear it down on return and
+                // leave every slice inside T dangling.
+                return std.json.parseFromSliceLeaky(T, allocator, data, .{});
             }
         }.decode,
     };
@@ -148,6 +154,17 @@ test "json codec" {
 
     const decoded = try codec.decode(allocator, "42");
     try std.testing.expectEqual(@as(u32, 42), decoded);
+}
+
+test "json codec decode keeps slice fields alive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const codec = JsonCodec(struct { name: []const u8 });
+
+    const decoded = try codec.decode(arena.allocator(), "{\"name\":\"zigzero\"}");
+
+    // Used to read freed memory: the parse arena was torn down on return.
+    try std.testing.expectEqualStrings("zigzero", decoded.name);
 }
 
 test "base64" {

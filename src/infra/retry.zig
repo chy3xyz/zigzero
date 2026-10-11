@@ -21,6 +21,30 @@ pub const Policy = struct {
     jitter: f64 = 0.1,
 };
 
+/// Delay before the next attempt: the current backoff base, jittered by up to
+/// `policy.jitter`.
+///
+/// The random term is drawn modulo twice the jitter amount, so a zero (or
+/// sub-1) span would be a division by zero — it is skipped instead. Clamping
+/// keeps a pathological caller-supplied `jitter` from tripping the panics on
+/// float→int conversion, and the subtraction saturates so a jitter factor above
+/// 1.0 yields 0 rather than wrapping.
+fn jitteredDelay(delay_ms: u64, policy: Policy) u64 {
+    const base: f64 = @floatFromInt(delay_ms);
+    const jitter_amount = base * policy.jitter;
+
+    const span_f = jitter_amount * 2;
+    const span: u32 = if (span_f < 1.0) 0 else @intFromFloat(@min(span_f, @as(f64, @floatFromInt(std.math.maxInt(u32)))));
+    const random_jitter = if (span > 0) compat.randomInt(u32) % span else 0;
+
+    const floor: u64 = if (jitter_amount >= base) delay_ms else @intFromFloat(jitter_amount);
+    return (delay_ms + random_jitter) -| floor;
+}
+
+fn nextBackoff(delay_ms: u64, policy: Policy) u64 {
+    return @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
+}
+
 /// Retry function with generic return type
 pub fn retry(comptime T: type, policy: Policy, operation: *const fn () errors.ResultT(T)) errors.ResultT(T) {
     var delay_ms: u64 = policy.initial_delay_ms;
@@ -35,14 +59,10 @@ pub fn retry(comptime T: type, policy: Policy, operation: *const fn () errors.Re
                 return result;
             }
 
-            // Calculate delay with exponential backoff and jitter
-            const jitter_amount = @as(f64, @floatFromInt(delay_ms)) * policy.jitter;
-            const random_jitter = compat.randomInt(u32) % @as(u32, @intFromFloat(jitter_amount * 2));
-            const actual_delay = delay_ms + random_jitter - @as(u64, @intFromFloat(jitter_amount));
-
+            const actual_delay = jitteredDelay(delay_ms, policy);
             compat.sleep(actual_delay * std.time.ns_per_ms);
 
-            delay_ms = @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
+            delay_ms = nextBackoff(delay_ms, policy);
         }
     }
 
@@ -60,13 +80,10 @@ pub fn retryVoid(policy: Policy, operation: *const fn () errors.Result) errors.R
                 return err;
             }
 
-            const jitter_amount = @as(f64, @floatFromInt(delay_ms)) * policy.jitter;
-            const random_jitter = compat.randomInt(u32) % @as(u32, @intFromFloat(jitter_amount * 2));
-            const actual_delay = delay_ms + random_jitter - @as(u64, @intFromFloat(jitter_amount));
-
+            const actual_delay = jitteredDelay(delay_ms, policy);
             compat.sleep(actual_delay * std.time.ns_per_ms);
 
-            delay_ms = @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
+            delay_ms = nextBackoff(delay_ms, policy);
         };
         return;
     }
@@ -95,17 +112,25 @@ pub fn retryWithBreaker(comptime T: type, policy: Policy, breaker: *anyopaque, o
                 return result;
             }
 
-            const jitter_amount = @as(f64, @floatFromInt(delay_ms)) * policy.jitter;
-            const random_jitter = compat.randomInt(u32) % @as(u32, @intFromFloat(jitter_amount * 2));
-            const actual_delay = delay_ms + random_jitter - @as(u64, @intFromFloat(jitter_amount));
-
+            const actual_delay = jitteredDelay(delay_ms, policy);
             compat.sleep(actual_delay * std.time.ns_per_ms);
 
-            delay_ms = @min(policy.max_delay_ms, @as(u64, @intFromFloat(@as(f64, @floatFromInt(delay_ms)) * policy.multiplier)));
+            delay_ms = nextBackoff(delay_ms, policy);
         }
     }
 
     return error.ServerError;
+}
+
+test "jitteredDelay handles zero and pathological jitter" {
+    // Used to divide by zero: jitter 0 makes the random span 0.
+    try std.testing.expectEqual(@as(u64, 100), jitteredDelay(100, .{ .jitter = 0.0 }));
+    // Sub-1 span (100 * 0.001 * 2 = 0.2) is skipped rather than truncated to 0.
+    try std.testing.expectEqual(@as(u64, 100), jitteredDelay(100, .{ .jitter = 0.001 }));
+    // Jitter above 1.0 must not wrap below zero on the subtraction.
+    try std.testing.expect(jitteredDelay(100, .{ .jitter = 5.0 }) <= 1000);
+    // An absurd jitter must not trap on the float→int conversions.
+    _ = jitteredDelay(100, .{ .jitter = 1e12 });
 }
 
 test "retry success" {

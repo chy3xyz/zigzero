@@ -7,8 +7,9 @@ const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 const redis = @import("redis.zig");
 
-/// RESP wire format for the renew command (EXPIRE key ttl). Uses real CRLF line endings.
-const renew_cmd_fmt = "*3\r\n$6\r\nEXPIRE\r\n${d}\r\n{s}\r\n${d}\r\n{d}\r\n";
+/// Lua script for an atomic compare-and-delete release.
+const release_script =
+    "if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end";
 
 /// Distributed lock interface
 pub const Lock = struct {
@@ -35,15 +36,11 @@ pub const RedisLock = struct {
 
     /// Release lock (only if value matches)
     pub fn release(self: *RedisLock, key: []const u8, value: []const u8) errors.Result {
-        // Use Lua script for atomic release: if value matches, delete key
-        const script_fmt = "*4\r\n$6\r\nEVAL\r\n$45\r\nif redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end\r\n$1\r\n1\r\n";
+        // Atomic compare-and-delete: EVAL <script> 1 <key> <value>
         if (self.client.stream) |stream| {
-            var cmd_builder: std.ArrayList(u8) = .empty;
-            defer cmd_builder.deinit(self.client.allocator);
-            cmd_builder.appendSlice(self.client.allocator, script_fmt) catch return error.RedisError;
-            cmd_builder.print(self.client.allocator, "${d}\r\n{s}\r\n", .{ key.len, key }) catch return error.RedisError;
-            cmd_builder.print(self.client.allocator, "${d}\r\n{s}\r\n", .{ value.len, value }) catch return error.RedisError;
-            compat.net.streamWrite(stream, cmd_builder.items) catch return error.RedisError;
+            const cmd = redis.respCommand(self.client.allocator, .{ "EVAL", release_script, 1, key, value }) catch return error.RedisError;
+            defer self.client.allocator.free(cmd);
+            compat.net.streamWrite(stream, cmd) catch return error.RedisError;
             var buf: [256]u8 = undefined;
             _ = compat.net.streamRead(stream, &buf) catch return error.RedisError;
         }
@@ -54,7 +51,7 @@ pub const RedisLock = struct {
     pub fn renew(self: *RedisLock, key: []const u8, value: []const u8, ttl_seconds: u32) errors.ResultT(bool) {
         _ = value;
         if (self.client.stream) |stream| {
-            const cmd = std.fmt.allocPrint(self.client.allocator, renew_cmd_fmt, .{ key.len, key, std.fmt.count("{d}", .{ttl_seconds}), ttl_seconds }) catch return error.RedisError;
+            const cmd = redis.respCommand(self.client.allocator, .{ "EXPIRE", key, ttl_seconds }) catch return error.RedisError;
             defer self.client.allocator.free(cmd);
             compat.net.streamWrite(stream, cmd) catch return error.RedisError;
             var buf: [256]u8 = undefined;
@@ -119,9 +116,27 @@ test "local lock" {
     try lock.release("my_key", "owner1");
 }
 
+test "release command frame matches its payload" {
+    // The old hand-written frame declared *4 with five elements and $45 for a
+    // 93-byte script; both mismatches made real Redis reject the command.
+    const cmd = try redis.respCommand(std.testing.allocator, .{ "EVAL", release_script, 1, "key", "val" });
+    defer std.testing.allocator.free(cmd);
+
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(std.testing.allocator);
+    try expected.print(std.testing.allocator, "*5\r\n$4\r\nEVAL\r\n${d}\r\n{s}\r\n$1\r\n1\r\n$3\r\nkey\r\n$3\r\nval\r\n", .{ release_script.len, release_script });
+    try std.testing.expectEqualStrings(expected.items, cmd);
+}
+
 test "renew command uses crlf" {
-    const ttl_digits = std.fmt.count("{d}", .{@as(u32, 10)});
-    const cmd = try std.fmt.allocPrint(std.testing.allocator, renew_cmd_fmt, .{ 3, "key", ttl_digits, 10 });
+    const cmd = try redis.respCommand(std.testing.allocator, .{ "EXPIRE", "key", @as(u32, 10) });
     defer std.testing.allocator.free(cmd);
     try std.testing.expectEqualStrings("*3\r\n$6\r\nEXPIRE\r\n$3\r\nkey\r\n$2\r\n10\r\n", cmd);
+}
+
+test "lock command frame declares every element" {
+    // SET key value NX PX <ms> is six elements; the frame used to say *5.
+    const cmd = try redis.respCommand(std.testing.allocator, .{ "SET", "key", "val", "NX", "PX", @as(u32, 1000) });
+    defer std.testing.allocator.free(cmd);
+    try std.testing.expectEqualStrings("*6\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n$2\r\nNX\r\n$2\r\nPX\r\n$4\r\n1000\r\n", cmd);
 }

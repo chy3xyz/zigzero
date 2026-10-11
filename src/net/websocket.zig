@@ -49,7 +49,7 @@ pub const Conn = struct {
         _ = try compat.net.streamReadAll(self.stream, &header);
 
         const fin = (header[0] & 0x80) != 0;
-        const opcode: Opcode = @enumFromInt(header[0] & 0x0F);
+        const opcode: Opcode = @fromBackingInt(@intCast(header[0] & 0x0F));
         const masked = (header[1] & 0x80) != 0;
         var payload_len: u64 = @as(u64, header[1] & 0x7F);
 
@@ -103,10 +103,8 @@ pub const Conn = struct {
 
     /// Write a close frame
     pub fn writeClose(self: *Conn, code: u16, reason: []const u8) !void {
-        var payload: [128]u8 = undefined;
-        std.mem.writeInt(u16, payload[0..2], code, .big);
-        @memcpy(payload[2..][0..reason.len], reason);
-        return self.writeFrame(.close, payload[0 .. 2 + reason.len]);
+        var payload: [125]u8 = undefined;
+        return self.writeFrame(.close, closePayload(code, reason, &payload));
     }
 
     fn writeFrame(self: *Conn, opcode: Opcode, payload: []const u8) !void {
@@ -115,7 +113,7 @@ pub const Conn = struct {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.allocator);
 
-        const first_byte: u8 = 0x80 | @as(u8, @intFromEnum(opcode));
+        const first_byte: u8 = 0x80 | @as(u8, @backingInt(opcode));
         try buf.append(self.allocator, first_byte);
 
         if (payload.len < 126) {
@@ -145,6 +143,18 @@ pub const Conn = struct {
         }
     }
 };
+
+/// Build a close-frame payload.
+///
+/// RFC 6455 §5.5 caps a control frame's payload at 125 bytes and two of those
+/// carry the status code, so a longer reason is truncated — copying it whole
+/// would run past `out`.
+fn closePayload(code: u16, reason: []const u8, out: *[125]u8) []u8 {
+    const reason_len = @min(reason.len, 123);
+    std.mem.writeInt(u16, out[0..2], code, .big);
+    @memcpy(out[2..][0..reason_len], reason[0..reason_len]);
+    return out[0 .. 2 + reason_len];
+}
 
 /// Compute WebSocket accept key from Sec-WebSocket-Key
 pub fn computeAcceptKey(allocator: std.mem.Allocator, key: []const u8) ![]const u8 {
@@ -301,6 +311,21 @@ test "websocket accept key" {
     const accept = try computeAcceptKey(allocator, key);
     defer allocator.free(accept);
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accept);
+}
+
+test "websocket close payload truncates oversized reason" {
+    var out: [125]u8 = undefined;
+
+    const normal = closePayload(1000, "normal", &out);
+    try std.testing.expectEqual(@as(usize, 8), normal.len);
+    try std.testing.expectEqual(@as(u16, 1000), std.mem.readInt(u16, normal[0..2], .big));
+    try std.testing.expectEqualStrings("normal", normal[2..]);
+
+    // A reason longer than 123 bytes must be clamped, not written past `out`.
+    const long_reason = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    const truncated = closePayload(1000, long_reason, &out);
+    try std.testing.expectEqual(@as(usize, 125), truncated.len);
+    try std.testing.expectEqual(@as(usize, 123), truncated[2..].len);
 }
 
 test "websocket room" {

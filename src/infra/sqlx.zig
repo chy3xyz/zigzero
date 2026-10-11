@@ -651,6 +651,27 @@ fn appendFmtToBuf(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, comptim
     try buf.appendSlice(allocator, s);
 }
 
+/// Escape a string body for a single-quoted MySQL literal.
+///
+/// MySQL strips backslashes from string literals unless `NO_BACKSLASH_ESCAPES`
+/// is enabled, so both `\` and `'` must be escaped; the remaining control
+/// characters below are the ones MySQL's own `mysql_real_escape_string` handles.
+fn appendEscapedString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: []const u8) !void {
+    try buf.append(allocator, '\'');
+    for (v) |c| {
+        switch (c) {
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\'' => try buf.appendSlice(allocator, "''"),
+            0x00 => try buf.appendSlice(allocator, "\\0"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            0x1a => try buf.appendSlice(allocator, "\\Z"),
+            else => try buf.append(allocator, c),
+        }
+    }
+    try buf.append(allocator, '\'');
+}
+
 fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Value) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
@@ -664,11 +685,7 @@ fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Valu
                 .null => try buf.appendSlice(allocator, "NULL"),
                 .int => |v| try appendFmtToBuf(&buf, allocator, "{d}", .{v}),
                 .float => |v| try appendFmtToBuf(&buf, allocator, "{d}", .{v}),
-                .string => |v| {
-                    try buf.append(allocator, '\'');
-                    try buf.appendSlice(allocator, v);
-                    try buf.append(allocator, '\'');
-                },
+                .string => |v| try appendEscapedString(&buf, allocator, v),
                 .bool => |v| try buf.appendSlice(allocator, if (v) "1" else "0"),
             }
         } else {
@@ -2877,6 +2894,26 @@ test "sqlite prepared statement" {
 test "sqlx value" {
     const v = Value{ .int = 42 };
     try std.testing.expectEqual(@as(i64, 42), v.int);
+}
+
+test "mysql formatQuery escapes string literals" {
+    const allocator = std.testing.allocator;
+
+    const injected = try formatQuery(allocator, "SELECT * FROM users WHERE name = ?", &.{Value{ .string = "a' OR '1'='1" }});
+    defer allocator.free(injected);
+    try std.testing.expectEqualStrings("SELECT * FROM users WHERE name = 'a'' OR ''1''=''1'", injected);
+
+    const backslash = try formatQuery(allocator, "SELECT ?", &.{Value{ .string = "C:\\tmp\\x" }});
+    defer allocator.free(backslash);
+    try std.testing.expectEqualStrings("SELECT 'C:\\\\tmp\\\\x'", backslash);
+
+    const controls = try formatQuery(allocator, "SELECT ?", &.{Value{ .string = "line\n\r\x00\x1a" }});
+    defer allocator.free(controls);
+    try std.testing.expectEqualStrings("SELECT 'line\\n\\r\\0\\Z'", controls);
+
+    const nul_byte = try formatQuery(allocator, "SELECT ?", &.{Value{ .null = {} }});
+    defer allocator.free(nul_byte);
+    try std.testing.expectEqualStrings("SELECT NULL", nul_byte);
 }
 
 test "postgres config init" {

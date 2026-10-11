@@ -7,6 +7,25 @@ const compat = @import("../compat.zig");
 const errors = @import("../core/errors.zig");
 const config = @import("../config.zig");
 
+/// Build a RESP array command. Arguments may be strings or integers; integers
+/// are formatted with `{d}`.
+///
+/// Hand-written frames are how the array length and the `$len` prefixes drift
+/// out of sync with the payload they describe, so anything written from scratch
+/// should go through here.
+pub fn respCommand(allocator: std.mem.Allocator, args: anytype) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    try buf.print(allocator, "*{d}\r\n", .{args.len});
+    inline for (args) |arg| {
+        switch (@typeInfo(@TypeOf(arg))) {
+            .int, .comptime_int => try buf.print(allocator, "${d}\r\n{d}\r\n", .{ std.fmt.count("{d}", .{arg}), arg }),
+            else => try buf.print(allocator, "${d}\r\n{s}\r\n", .{ arg.len, arg }),
+        }
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Redis client for zigzero
 pub const Redis = struct {
     allocator: std.mem.Allocator,
@@ -267,9 +286,7 @@ pub const Redis = struct {
         defer self.mutex.unlock();
         if (self.stream) |stream| {
             const px = ttl_seconds * 1000;
-            const cmd = std.fmt.allocPrint(self.allocator, "*5\r\n$3\r\nSET\r\n${d}\r\n{s}\r\n${d}\r\n{s}\r\n$2\r\nNX\r\n$2\r\nPX\r\n${d}\r\n{d}\r\n", .{
-                key.len, key, value.len, value, std.fmt.count("{d}", .{px}), px,
-            }) catch return error.RedisError;
+            const cmd = respCommand(self.allocator, .{ "SET", key, value, "NX", "PX", px }) catch return error.RedisError;
             defer self.allocator.free(cmd);
 
             compat.net.streamWrite(stream, cmd) catch return error.RedisError;
@@ -773,7 +790,6 @@ test "redis cluster init" {
     const node2 = cluster.selectNode("mykey");
     try std.testing.expectEqual(node1, node2);
 }
-
 
 test "redis pool init and acquire/release" {
     const allocator = std.testing.allocator;

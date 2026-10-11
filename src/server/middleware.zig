@@ -49,6 +49,10 @@ fn base64UrlEncode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 }
 
 /// Verify a JWT token using HMAC-SHA256. Returns decoded payload on success.
+///
+/// Fails closed on an expired `exp` claim (seconds since epoch, wall clock) so
+/// every caller inherits the check; a token without `exp` is accepted, matching
+/// the signer's optional-claim shape.
 fn verifyJwt(allocator: std.mem.Allocator, token: []const u8, secret: []const u8) !std.json.Parsed(std.json.Value) {
     var parts_iter = std.mem.splitScalar(u8, token, '.');
     const header_b64 = parts_iter.next() orelse return error.InvalidToken;
@@ -67,6 +71,9 @@ fn verifyJwt(allocator: std.mem.Allocator, token: []const u8, secret: []const u8
     const sig_decoded = try base64UrlDecode(allocator, sig_b64);
     defer allocator.free(sig_decoded);
 
+    // A wrong-length signature is simply invalid — slicing the first 32 bytes of
+    // a shorter one would read out of bounds (and panic in safe builds).
+    if (sig_decoded.len != expected_sig.len) return error.InvalidToken;
     if (!std.crypto.timing_safe.eql([32]u8, expected_sig, sig_decoded[0..32].*)) {
         return error.InvalidToken;
     }
@@ -74,7 +81,17 @@ fn verifyJwt(allocator: std.mem.Allocator, token: []const u8, secret: []const u8
     const payload_json = try base64UrlDecode(allocator, payload_b64);
     defer allocator.free(payload_json);
 
-    return std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    errdefer parsed.deinit();
+
+    if (parsed.value.object.get("exp")) |exp| {
+        if (exp == .integer and compat.timestamp() > exp.integer) {
+            return error.TokenExpired;
+        }
+        if (exp != .integer) return error.InvalidToken;
+    }
+
+    return parsed;
 }
 
 /// Sign a JWT token using HMAC-SHA256. Caller owns returned memory.
@@ -188,13 +205,14 @@ pub fn requestId() api.Middleware {
         .func = struct {
             fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
                 _ = data;
+                // The buffer must outlive the block that formats into it: a
+                // slice into a block-local array is dead by the time setHeader
+                // reads it.
+                var id_buf: [64]u8 = undefined;
                 const request_id = ctx.header("X-Request-ID") orelse blk: {
-                    // Stack buffer avoids page_allocator allocation + leak.
-                    var buf: [64]u8 = undefined;
                     const timestamp = compat.timestamp();
                     const random = compat.randomInt(u32);
-                    const id = std.fmt.bufPrint(&buf, "{d}-{x}", .{ timestamp, random }) catch "";
-                    break :blk id;
+                    break :blk std.fmt.bufPrint(&id_buf, "{d}-{x}", .{ timestamp, random }) catch "request-id";
                 };
                 try ctx.setHeader("X-Request-ID", request_id);
                 try next(ctx);
@@ -349,6 +367,7 @@ pub const ResponseCache = struct {
     allocator: std.mem.Allocator,
     cache: cache_mod.Cache(u64, CacheEntry),
     ttl_ms: i64,
+    hooks_installed: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, max_size: usize, ttl_ms: i64) ResponseCache {
         return .{
@@ -359,7 +378,25 @@ pub const ResponseCache = struct {
     }
 
     pub fn deinit(self: *ResponseCache) void {
+        // deinit runs the eviction hook for every remaining entry, releasing
+        // the bodies the cache would otherwise leak.
         self.cache.deinit();
+    }
+
+    /// Give the cache a way to free entries it drops on eviction, expiry,
+    /// delete, clear and deinit. Must be called through a pointer to the final
+    /// address of this struct — the hook stores that pointer.
+    pub fn installEvictHooks(self: *ResponseCache) void {
+        if (self.hooks_installed) return;
+        self.cache.evict_ctx = self;
+        self.cache.on_evict = freeEntry;
+        self.hooks_installed = true;
+    }
+
+    fn freeEntry(ctx: ?*anyopaque, _: u64, entry: CacheEntry) void {
+        const self: *ResponseCache = @ptrCast(@alignCast(ctx.?));
+        self.allocator.free(entry.body);
+        if (entry.content_type) |ct| self.allocator.free(ct);
     }
 
     fn hashKey(path: []const u8, query: []const u8) u64 {
@@ -370,13 +407,37 @@ pub const ResponseCache = struct {
     }
 };
 
+/// True when the request carries credentials. The cache is keyed by path and
+/// query alone, so such a response can never be shared with another client.
+fn hasCredentials(ctx: *api.Context) bool {
+    var it = ctx.headers.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (std.ascii.eqlIgnoreCase(name, "authorization") or
+            std.ascii.eqlIgnoreCase(name, "proxy-authorization") or
+            std.ascii.eqlIgnoreCase(name, "cookie"))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 /// Response caching middleware for GET requests
+///
+/// Responses are keyed by path and query alone, so anything a client
+/// authenticates — or anything whose body depends on who is asking — must not
+/// be cached: a cached entry is served before the route's own auth middleware
+/// runs, which would hand a logged-in response to the next anonymous caller.
 pub fn cacheResponses(cache: *ResponseCache) api.Middleware {
     return .{
         .func = struct {
             fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
                 const c = @as(*ResponseCache, @ptrCast(@alignCast(data.?)));
-                if (ctx.method == .GET) {
+                c.installEvictHooks();
+                const cacheable = ctx.method == .GET and !hasCredentials(ctx);
+
+                if (cacheable) {
                     const key = ResponseCache.hashKey(ctx.path, ctx.raw_path);
                     if (c.cache.get(key)) |entry| {
                         if (entry.content_type) |ct| {
@@ -390,7 +451,7 @@ pub fn cacheResponses(cache: *ResponseCache) api.Middleware {
 
                 try next(ctx);
 
-                if (ctx.method == .GET and ctx.status_code == 200 and ctx.responded) {
+                if (cacheable and ctx.status_code == 200 and ctx.responded) {
                     const key = ResponseCache.hashKey(ctx.path, ctx.raw_path);
                     const body_copy = c.allocator.dupe(u8, ctx.response_body.items) catch return;
                     const ct = ctx.response_headers.get("Content-Type");
@@ -599,6 +660,105 @@ test "jwt generate and verify" {
 
     try std.testing.expectEqualStrings("user123", parsed.value.object.get("sub").?.string);
     try std.testing.expectEqualStrings("alice", parsed.value.object.get("username").?.string);
+}
+
+test "jwt rejects expired token" {
+    const allocator = std.testing.allocator;
+    const secret = "my-secret";
+
+    const token = try generateToken(allocator, .{ .sub = "user123", .exp = compat.timestamp() - 60 }, secret);
+    defer allocator.free(token);
+
+    try std.testing.expectError(error.TokenExpired, verifyJwt(allocator, token, secret));
+}
+
+test "jwt rejects wrong-length signature without panicking" {
+    const allocator = std.testing.allocator;
+    const secret = "my-secret";
+
+    // A valid base64url 16-byte signature decodes cleanly, so the rejection
+    // comes from the length check — slicing the first 32 bytes used to read
+    // out of bounds.
+    var short_sig: [16]u8 = @splat(0);
+    var sig_buf: [24]u8 = undefined;
+    const sig_b64 = std.base64.url_safe_no_pad.Encoder.encode(&sig_buf, &short_sig);
+
+    const token = try std.fmt.allocPrint(allocator, "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ1c2VyMTIzIn0.{s}", .{sig_b64});
+    defer allocator.free(token);
+
+    try std.testing.expectError(error.InvalidToken, verifyJwt(allocator, token, secret));
+}
+
+test "response cache never serves an authenticated response to an anonymous caller" {
+    const allocator = std.testing.allocator;
+    var rc = ResponseCache.init(allocator, 16, 60_000);
+    defer rc.deinit();
+    const mw = cacheResponses(&rc);
+    const logger = @import("../infra/log.zig").Logger.new(.err, "test");
+
+    const secret_handler = struct {
+        fn h(ctx: *api.Context) anyerror!void {
+            try ctx.json(200, "{\"secret\":1}");
+        }
+    }.h;
+
+    // An authenticated request must not populate the shared cache...
+    var authed = try api.Context.init(allocator, .GET, "/admin", logger);
+    defer authed.deinit();
+    // ctx.headers holds the *request* headers; setHeader writes the response.
+    try authed.headers.put(try allocator.dupe(u8, "Authorization"), try allocator.dupe(u8, "Bearer token"));
+    try mw.func(&authed, secret_handler, mw.user_data);
+
+    // ...so the next anonymous request reaches its handler instead of reading
+    // a body that was produced for someone else.
+    var anon = try api.Context.init(allocator, .GET, "/admin", logger);
+    defer anon.deinit();
+    const Probe = struct {
+        var reached: bool = false;
+        fn h(ctx: *api.Context) anyerror!void {
+            reached = true;
+            try ctx.sendError(401, "unauthorized");
+        }
+    };
+    try mw.func(&anon, Probe.h, mw.user_data);
+    try std.testing.expect(Probe.reached);
+    try std.testing.expectEqual(@as(u16, 401), anon.status_code);
+}
+
+test "response cache does serve anonymous GETs" {
+    const allocator = std.testing.allocator;
+    var rc = ResponseCache.init(allocator, 16, 60_000);
+    defer rc.deinit();
+    const mw = cacheResponses(&rc);
+    const logger = @import("../infra/log.zig").Logger.new(.err, "test");
+
+    const handler = struct {
+        var calls: u32 = 0;
+        fn h(ctx: *api.Context) anyerror!void {
+            calls += 1;
+            try ctx.json(200, "{\"public\":1}");
+        }
+    };
+
+    var first = try api.Context.init(allocator, .GET, "/public", logger);
+    defer first.deinit();
+    try mw.func(&first, handler.h, mw.user_data);
+
+    var second = try api.Context.init(allocator, .GET, "/public", logger);
+    defer second.deinit();
+    var reached = false;
+    const Probe = struct {
+        var r: *bool = undefined;
+        fn h(ctx: *api.Context) anyerror!void {
+            r.* = true;
+            try ctx.json(200, "{\"public\":1}");
+        }
+    };
+    Probe.r = &reached;
+    try mw.func(&second, Probe.h, mw.user_data);
+
+    try std.testing.expect(!reached);
+    try std.testing.expectEqualStrings("{\"public\":1}", second.response_body.items);
 }
 
 test "middleware" {

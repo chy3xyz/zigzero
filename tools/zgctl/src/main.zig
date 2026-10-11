@@ -140,3 +140,11 @@ fn parseOutputDir(args: []const [:0]u8) ?[]const u8 {
     }
     return null;
 }
+
+test {
+    // `main` only calls into these files; a test run that never references
+    // their declarations collects zero of their tests.
+    _ = @import("dsl.zig");
+    _ = @import("generate.zig");
+    _ = @import("template.zig");
+}
