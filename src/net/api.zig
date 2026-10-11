@@ -94,6 +94,9 @@ pub const Context = struct {
     validation_error_message: ?[]const u8 = null,
     stream: ?compat.net.Stream = null,
     upgraded: bool = false,
+    /// Wall-clock millisecond deadline set by `middleware.requestTimeout`, for
+    /// handlers that want to stop early. Nothing preempts a running handler.
+    deadline_ms: ?i64 = null,
 
     // Middleware chain fields
     chain_middlewares: []const Middleware = &.{},
@@ -1098,11 +1101,17 @@ pub const Server = struct {
             ctx.sendError(404, "Not Found") catch {};
         }
 
-        // Check request timeout
+        // Request timeout: the handler has already run by now, so this can only
+        // report the overrun. Answer 408 unless a response is already prepared.
         const elapsed = compat.milliTimestamp() - start_time;
         if (elapsed > self.request_timeout_ms) {
             const timeout_msg = std.fmt.allocPrint(arena_alloc, "Request timeout: {s} {s} took {d}ms", .{ request.method.toString(), request.path, elapsed }) catch "Request timeout";
             self.logger.warn(timeout_msg);
+            if (!ctx.responded) {
+                ctx.response_body.clearRetainingCapacity();
+                ctx.status_code = 408;
+                ctx.responded = true;
+            }
         }
 
         if (ctx.upgraded) {

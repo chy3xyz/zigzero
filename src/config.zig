@@ -246,7 +246,7 @@ pub const Loader = struct {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
         defer parsed.deinit();
 
-        var cfg: T = undefined;
+        var cfg: T = defaultConfig(T);
         const json = parsed.value;
 
         const s_info = @typeInfo(T).@"struct";
@@ -276,7 +276,7 @@ pub const Loader = struct {
 
     /// Load configuration from environment variables
     pub fn loadEnv(self: Loader, comptime T: type, prefix: []const u8) !T {
-        var cfg: T = undefined;
+        var cfg: T = defaultConfig(T);
         var buf: [256]u8 = undefined;
 
         const s_info = @typeInfo(T).@"struct";
@@ -311,6 +311,23 @@ pub const Loader = struct {
         };
     }
 };
+
+/// Base value for a config struct: each field's declared default where it has
+/// one, zeroes elsewhere.
+///
+/// Parsing starts from this instead of `undefined` so a key that is absent from
+/// the JSON or the environment keeps a defined value — previously such a field
+/// stayed `undefined`, and reading it was undefined behavior.
+fn defaultConfig(comptime T: type) T {
+    var cfg: T = std.mem.zeroInit(T, .{});
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, info.field_attrs) |name, FieldType, attr| {
+        if (attr.defaultValue(FieldType)) |default| {
+            @field(cfg, name) = default;
+        }
+    }
+    return cfg;
+}
 
 /// Convert a simplified YAML subset to JSON string.
 /// Supports: key: value, nested objects, arrays with '- ', strings, numbers, bools.
@@ -592,17 +609,36 @@ test "config yaml parsing" {
     try std.testing.expectEqual(@as(u16, 6379), cfg.redis.port);
 }
 
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 test "config env parsing" {
     const allocator = std.testing.allocator;
-    // This test requires env vars to be set, skip in normal runs
-    if (true) return error.SkipZigTest;
-    _ = allocator;
+    // Only PORT is set: the unset keys must keep their declared defaults rather
+    // than staying undefined.
+    _ = setenv("ZIGZERO_TEST_PORT", "9000", 1);
+
+    const cfg = try Loader.init(allocator).loadEnv(RedisConfig, "ZIGZERO_TEST");
+    try std.testing.expectEqual(@as(u16, 9000), cfg.port);
+    try std.testing.expectEqualStrings("localhost", cfg.host);
+    try std.testing.expectEqual(@as(u32, 0), cfg.db);
+    try std.testing.expectEqual(@as(u32, 100), cfg.pool_size);
+}
+
+test "missing json keys keep declared defaults" {
+    const allocator = std.testing.allocator;
+    const cfg = try Loader.init(allocator).parseJson(RedisConfig, "{\"host\":\"cache.internal\"}");
+    defer allocator.free(cfg.host);
+
+    try std.testing.expectEqualStrings("cache.internal", cfg.host);
+    // Absent from the JSON: these used to be `undefined` after parsing.
+    try std.testing.expectEqual(@as(u16, 6379), cfg.port);
+    try std.testing.expectEqual(@as(u32, 100), cfg.pool_size);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.password);
 }
 
 test "config module" {
     try std.testing.expect(true);
 }
-
 
 test "redis config defaults" {
     const cfg = RedisConfig{};

@@ -14,6 +14,10 @@ pub const Level = enum(u8) {
     warn = 2,
     err = 3,
     fatal = 4,
+    /// Suppresses every message. Also the level to use in tests: the console
+    /// sink writes to stdout, and under `zig build test` stdout is the test
+    /// runner's IPC channel — a log line there deadlocks the build.
+    off = 5,
 
     pub fn fromString(s: []const u8) Level {
         return std.meta.stringToEnum(Level, s) orelse .info;
@@ -26,6 +30,7 @@ pub const Level = enum(u8) {
             .warn => "WARN",
             .err => "ERROR",
             .fatal => "FATAL",
+            .off => "OFF",
         };
     }
 };
@@ -163,28 +168,28 @@ pub const Logger = struct {
 
     /// Log a message at debug level
     pub fn debug(self: *const Logger, msg: []const u8) void {
-        if (@intFromEnum(self.level) <= @intFromEnum(Level.debug)) {
+        if (@backingInt(self.level) <= @backingInt(Level.debug)) {
             self.log(.debug, msg);
         }
     }
 
     /// Log a message at info level
     pub fn info(self: *const Logger, msg: []const u8) void {
-        if (@intFromEnum(self.level) <= @intFromEnum(Level.info)) {
+        if (@backingInt(self.level) <= @backingInt(Level.info)) {
             self.log(.info, msg);
         }
     }
 
     /// Log a message at warn level
     pub fn warn(self: *const Logger, msg: []const u8) void {
-        if (@intFromEnum(self.level) <= @intFromEnum(Level.warn)) {
+        if (@backingInt(self.level) <= @backingInt(Level.warn)) {
             self.log(.warn, msg);
         }
     }
 
     /// Log a message at error level
     pub fn err(self: *const Logger, msg: []const u8) void {
-        if (@intFromEnum(self.level) <= @intFromEnum(Level.err)) {
+        if (@backingInt(self.level) <= @backingInt(Level.err)) {
             self.log(.err, msg);
         }
     }

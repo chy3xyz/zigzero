@@ -21,9 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`infra/retry` divided by zero at `jitter = 0`** (and could panic on conversion for extreme jitter values); the jitter term is skipped when its span is zero and the floor saturates
 - **`server/middleware` request-ID middleware returned a slice into a dead block**, so `X-Request-ID` read freed stack memory; the buffer now outlives the call
 - **`tools/zgctl` test step ran zero tests**: `zig build test` compiled a binary containing no tests because `main.zig` never referenced `dsl.zig` / `generate.zig` declarations; an aggregating `test` block now pulls in all 11
+- **`config` left keys that were absent from the source `undefined`**: `parseJson` and `loadEnv` both started from `var cfg: T = undefined`, so any field without a JSON key or environment variable was undefined memory the moment a caller read it. Both now start from each field's declared default (`defaultConfig`), zeroed where a field declares none. The environment test that unconditionally skipped now runs
+- **`server/middleware` `recovery()` never recovered anything**: it tested `@errorReturnTrace()` *before* calling the handler, so it never saw an error, while `try next(ctx)` let handler errors travel up the chain. It now catches, logs and answers 500 — the code documents that Zig has no panic recovery, so `panic`/`unreachable` still aborts
+- **`server/middleware` `requestTimeout()` could not time anything out**: it replaced the response *after* the handler had already run and been sent, and `requestTimeout(0)` panicked on unwrapping a null `user_data`. It now publishes `ctx.deadline_ms` for handlers that want to stop early, only replaces a response that has not been sent yet, treats `0` as "no deadline", and logs the case where the overrun happened after responding. The server-level `request_timeout_ms` — which only logged a warning — now answers 408 when nothing has been written
+- **`infra/log`**: added `Level.off`. A log line written during `zig build test` deadlocks the build (the console sink writes to stdout, which is the test runner's IPC channel in `--listen=-` mode); this is now documented at the sink, and tests use `.off`
 
 ### Added
-- Tests for every fix above (escaping, expiry, wrong-length signature, cache credential isolation, cache eviction hook, close-frame truncation, jitter edge cases, RESP frame bytes)
+- Tests for every fix above (escaping, expiry, wrong-length signature, cache credential isolation, cache eviction hook, close-frame truncation, jitter edge cases, RESP frame bytes, config defaults, recovery, request timeout)
 
 ## [0.2.3] - 2026-10-10
 

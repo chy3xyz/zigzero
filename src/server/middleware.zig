@@ -326,10 +326,20 @@ pub fn recovery() api.Middleware {
         .func = struct {
             fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
                 _ = data;
-                if (@errorReturnTrace()) |_| {
-                    ctx.sendError(500, "internal server error") catch {};
-                }
-                try next(ctx);
+                next(ctx) catch |err| {
+                    // Zig has no panic recovery — a `panic`/`unreachable` in a
+                    // handler still aborts the process. What this contains is a
+                    // returned error: log it and answer 500 instead of letting
+                    // it travel further up the chain. The error-return trace
+                    // stays out of the message (it is a different type from
+                    // std.debug.StackTrace); debug builds still break on it.
+                    var buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&buf, "handler failed: {s}", .{@errorName(err)}) catch "handler failed";
+                    ctx.logger.err(msg);
+                    if (!ctx.responded) {
+                        ctx.sendError(500, "internal server error") catch {};
+                    }
+                };
             }
         }.middleware,
     };
@@ -561,21 +571,38 @@ pub fn loadShedding(shedder: *load.AdaptiveShedder) api.Middleware {
 
 /// Request timeout middleware
 /// Aborts the request with 408 if handler execution exceeds timeout_ms.
+/// Reject a request whose handler overran `timeout_ms`.
+///
+/// The server cannot preempt a running handler and Zig has no cancellation, so
+/// this is a post-hoc guard: the handler runs to completion and the response is
+/// replaced with 408 only when it overran and had not sent anything yet. A
+/// handler that wants to stop early polls `ctx.deadline_ms`.
 pub fn requestTimeout(timeout_ms: u32) api.Middleware {
     return .{
         .func = struct {
             fn middleware(ctx: *api.Context, next: api.HandlerFn, data: ?*anyopaque) anyerror!void {
-                const timeout = @as(u32, @intCast(@intFromPtr(data.?) & 0xFFFFFFFF));
-                const start = compat.milliTimestamp();
+                if (data == null) {
+                    // A zero timeout used to round-trip through a null pointer
+                    // and panic on unwrap; treat it as "no deadline".
+                    try next(ctx);
+                    return;
+                }
+                const timeout: i64 = @intCast(@intFromPtr(data.?));
+                const deadline = compat.milliTimestamp() + timeout;
+                ctx.deadline_ms = deadline;
                 try next(ctx);
-                const elapsed = compat.milliTimestamp() - start;
-                if (@as(i64, @intCast(timeout)) < elapsed) {
-                    ctx.status_code = 408;
-                    ctx.responded = true;
+
+                if (compat.milliTimestamp() > deadline) {
+                    if (!ctx.responded) {
+                        ctx.status_code = 408;
+                        ctx.responded = true;
+                    } else {
+                        ctx.logger.warn("handler exceeded its request timeout after responding");
+                    }
                 }
             }
         }.middleware,
-        .user_data = @ptrFromInt(@as(usize, timeout_ms)),
+        .user_data = if (timeout_ms == 0) null else @ptrFromInt(@as(usize, timeout_ms)),
     };
 }
 
@@ -694,7 +721,7 @@ test "response cache never serves an authenticated response to an anonymous call
     var rc = ResponseCache.init(allocator, 16, 60_000);
     defer rc.deinit();
     const mw = cacheResponses(&rc);
-    const logger = @import("../infra/log.zig").Logger.new(.err, "test");
+    const logger = @import("../infra/log.zig").Logger.new(.off, "test");
 
     const secret_handler = struct {
         fn h(ctx: *api.Context) anyerror!void {
@@ -730,7 +757,7 @@ test "response cache does serve anonymous GETs" {
     var rc = ResponseCache.init(allocator, 16, 60_000);
     defer rc.deinit();
     const mw = cacheResponses(&rc);
-    const logger = @import("../infra/log.zig").Logger.new(.err, "test");
+    const logger = @import("../infra/log.zig").Logger.new(.off, "test");
 
     const handler = struct {
         var calls: u32 = 0;
@@ -759,6 +786,63 @@ test "response cache does serve anonymous GETs" {
 
     try std.testing.expect(!reached);
     try std.testing.expectEqualStrings("{\"public\":1}", second.response_body.items);
+}
+
+test "recovery turns a handler error into a 500" {
+    const allocator = std.testing.allocator;
+    const logger = @import("../infra/log.zig").Logger.new(.off, "test");
+
+    var ctx = try api.Context.init(allocator, .GET, "/boom", logger);
+    defer ctx.deinit();
+
+    const mw = recovery();
+    const failing = struct {
+        fn h(_: *api.Context) anyerror!void {
+            return error.HandlerBlewUp;
+        }
+    }.h;
+
+    // The error must be contained: it used to be checked for *before* calling
+    // the handler and therefore never caught anything.
+    try mw.func(&ctx, failing, mw.user_data);
+    try std.testing.expectEqual(@as(u16, 500), ctx.status_code);
+}
+
+test "requestTimeout treats zero as no deadline without panicking" {
+    const allocator = std.testing.allocator;
+    const logger = @import("../infra/log.zig").Logger.new(.off, "test");
+
+    var ctx = try api.Context.init(allocator, .GET, "/slow", logger);
+    defer ctx.deinit();
+
+    const mw = requestTimeout(0);
+    try std.testing.expect(mw.user_data == null);
+
+    const ok = struct {
+        fn h(c: *api.Context) anyerror!void {
+            try c.text(200, "fine");
+        }
+    }.h;
+    try mw.func(&ctx, ok, mw.user_data);
+    try std.testing.expectEqual(@as(?i64, null), ctx.deadline_ms);
+    try std.testing.expectEqual(@as(u16, 200), ctx.status_code);
+}
+
+test "requestTimeout answers 408 when the handler overruns" {
+    const allocator = std.testing.allocator;
+    const logger = @import("../infra/log.zig").Logger.new(.off, "test");
+
+    var ctx = try api.Context.init(allocator, .GET, "/slow", logger);
+    defer ctx.deinit();
+
+    const mw = requestTimeout(1);
+    _ = mw.func(&ctx, struct {
+        fn h(_: *api.Context) anyerror!void {
+            compat.sleep(5 * std.time.ns_per_ms);
+        }
+    }.h, mw.user_data) catch {};
+
+    try std.testing.expectEqual(@as(u16, 408), ctx.status_code);
 }
 
 test "middleware" {
