@@ -221,6 +221,48 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
     };
 }
 
+/// Which `Value` variant a driver should build for a column.
+///
+/// Derived from driver column metadata (`PQftype` / `MYSQL_FIELD.type`), never
+/// from the SQL text, so expressions and casts are classified by their result
+/// type. `uint` is `int` for unsigned columns, which are parsed as `u64` first
+/// so a value above `i64` max degrades to `.string` instead of failing.
+///
+/// `numeric` / `DECIMAL` map to `.float` because `Value` has no exact-decimal
+/// variant; a money column that needs exactness must be cast to text in the
+/// query and scanned into `[]const u8`.
+const ColKind = enum { int, uint, float, boolean, string };
+
+/// Drivers that speak the text protocol return every non-null column as text.
+/// `kind` says which variant is wanted; if the text does not parse as that kind
+/// the raw text is kept as `.string`, so a mis-detected column degrades to the
+/// pre-typing behaviour rather than failing the query.
+fn valueFromText(allocator: std.mem.Allocator, text: []const u8, kind: ColKind) !Value {
+    switch (kind) {
+        .int => {
+            if (std.fmt.parseInt(i64, text, 10)) |v| return .{ .int = v } else |_| {}
+        },
+        .uint => {
+            if (std.fmt.parseInt(u64, text, 10)) |v| {
+                if (v <= std.math.maxInt(i64)) return .{ .int = @intCast(v) };
+            } else |_| {}
+        },
+        .float => {
+            if (std.fmt.parseFloat(f64, text)) |v| return .{ .float = v } else |_| {}
+        },
+        .boolean => switch (text.len) {
+            1 => switch (text[0]) {
+                't', 'T', '1' => return .{ .bool = true },
+                'f', 'F', '0' => return .{ .bool = false },
+                else => {},
+            },
+            else => {},
+        },
+        .string => {},
+    }
+    return .{ .string = try allocator.dupe(u8, text) };
+}
+
 pub fn freeScanned(allocator: std.mem.Allocator, comptime T: type, val: T) void {
     const info = @typeInfo(T);
     if (info != .@"struct") return;
@@ -418,6 +460,43 @@ fn readSQLiteValue(allocator: std.mem.Allocator, stmt: ?*sqlite3_c.sqlite3_stmt,
 
 // ==================== PostgreSQL Implementation ====================
 
+/// `PQftype` is not declared in `libpq_c.zig`; the symbol comes from the same
+/// linked libpq and reports each result column's type OID.
+extern "c" fn PQftype(res: ?*const libpq_c.PGresult, column_index: c_int) c_uint;
+
+/// PostgreSQL type OIDs (`pg_type.oid`) this driver decodes. Everything else
+/// (timestamp, uuid, json, bytea, arrays, ...) stays `.string`.
+const pg_oid_bool = 16;
+const pg_oid_int8 = 20;
+const pg_oid_int2 = 21;
+const pg_oid_int4 = 23;
+const pg_oid_text = 25;
+const pg_oid_float4 = 700;
+const pg_oid_float8 = 701;
+const pg_oid_bpchar = 1042;
+const pg_oid_varchar = 1043;
+const pg_oid_numeric = 1700;
+
+fn pgValueKind(oid: c_uint) ColKind {
+    return switch (oid) {
+        pg_oid_bool => .boolean,
+        pg_oid_int2, pg_oid_int4, pg_oid_int8 => .int,
+        pg_oid_float4, pg_oid_float8, pg_oid_numeric => .float,
+        pg_oid_text, pg_oid_varchar, pg_oid_bpchar => .string,
+        else => .string,
+    };
+}
+
+/// Copy a slice built at runtime into a NUL-terminated buffer.
+///
+/// libpq's entry points take C strings: handing them `slice.ptr` alone lets the
+/// library read past the end of the allocation, which is why SQL assembled at
+/// runtime (the ORM and the generated models) failed while string literals —
+/// which are already sentinel-terminated — worked.
+fn cString(allocator: std.mem.Allocator, s: []const u8) ?[:0]u8 {
+    return allocator.dupeSentinel(u8, s, 0) catch null;
+}
+
 pub const PostgresConn = struct {
     conn: ?*libpq_c.PGconn,
     allocator: std.mem.Allocator,
@@ -511,8 +590,9 @@ pub const PostgresConn = struct {
                 if (libpq_c.PQgetisnull(res, @intCast(r), @intCast(c)) == 1) {
                     values[c] = null;
                 } else {
-                    const val = std.mem.span(libpq_c.PQgetvalue(res, @intCast(r), @intCast(c)));
-                    values[c] = .{ .string = allocator.dupe(u8, val) catch return error.DatabaseError };
+                    const text = std.mem.span(libpq_c.PQgetvalue(res, @intCast(r), @intCast(c)));
+                    const kind = pgValueKind(PQftype(res, @intCast(c)));
+                    values[c] = valueFromText(allocator, text, kind) catch return error.DatabaseError;
                 }
             }
             rows_list.append(allocator, .{ .allocator = allocator, .columns = columns, .values = values }) catch return error.DatabaseError;
@@ -540,29 +620,37 @@ pub const PostgresConn = struct {
     fn execParams(self: *PostgresConn, sql_str: []const u8, args: []const Value) ?*libpq_c.PGresult {
         if (self.conn == null) return null;
         const paramValues = self.allocator.alloc(?[*]const u8, args.len) catch return null;
-        const paramLengths = self.allocator.alloc(c_int, args.len) catch {
-            self.allocator.free(paramValues);
-            return null;
-        };
-        // Note: allocated strings (int/float) may leak in this simplified implementation.
+        defer self.allocator.free(paramValues);
+        const paramLengths = self.allocator.alloc(c_int, args.len) catch return null;
+        defer self.allocator.free(paramLengths);
+        // int/float args are rendered to text; `owned` tracks those buffers so
+        // they can be freed once libpq has consumed the parameters.
+        const owned = self.allocator.alloc(?[]u8, args.len) catch return null;
+        defer {
+            for (owned) |o| {
+                if (o) |s| self.allocator.free(s);
+            }
+            self.allocator.free(owned);
+        }
+        @memset(owned, null);
+
+        // libpq needs a C string, so a runtime-built statement is copied into a
+        // NUL-terminated buffer first.
+        const sql_z = cString(self.allocator, sql_str) orelse return null;
+        defer self.allocator.free(sql_z);
+
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
                 .null => null,
                 .int => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch {
-                        self.allocator.free(paramValues);
-                        self.allocator.free(paramLengths);
-                        return null;
-                    };
+                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
+                    owned[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .float => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch {
-                        self.allocator.free(paramValues);
-                        self.allocator.free(paramLengths);
-                        return null;
-                    };
+                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
+                    owned[i] = s;
                     paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
@@ -577,10 +665,7 @@ pub const PostgresConn = struct {
                 },
             };
         }
-        const res = libpq_c.PQexecParams(self.conn, @ptrCast(sql_str.ptr), @intCast(args.len), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
-        self.allocator.free(paramValues);
-        self.allocator.free(paramLengths);
-        return res;
+        return libpq_c.PQexecParams(self.conn, sql_z.ptr, @intCast(args.len), null, @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
     }
 
     fn closeFn(ptr: *anyopaque) void {
@@ -695,6 +780,37 @@ fn formatQuery(allocator: std.mem.Allocator, sql: []const u8, args: []const Valu
     return allocator.dupe(u8, buf.items);
 }
 
+/// `enum_field_types` values the `libmysql_c` bindings do not declare.
+const mysql_type_decimal: c_int = 0;
+const mysql_type_int24: c_int = 9;
+const mysql_type_newdecimal: c_int = 246;
+
+/// `MYSQL_FIELD.flags` bit set when a numeric column is `UNSIGNED`.
+const mysql_unsigned_flag: c_uint = 32;
+
+fn mysqlValueKind(field_type: c_int, flags: c_uint) ColKind {
+    const unsigned = (flags & mysql_unsigned_flag) != 0;
+    return switch (field_type) {
+        libmysql_c.MYSQL_TYPE_TINY,
+        libmysql_c.MYSQL_TYPE_SHORT,
+        libmysql_c.MYSQL_TYPE_LONG,
+        mysql_type_int24,
+        libmysql_c.MYSQL_TYPE_LONGLONG,
+        => if (unsigned) .uint else .int,
+        libmysql_c.MYSQL_TYPE_FLOAT,
+        libmysql_c.MYSQL_TYPE_DOUBLE,
+        mysql_type_newdecimal,
+        mysql_type_decimal,
+        => .float,
+        libmysql_c.MYSQL_TYPE_STRING,
+        libmysql_c.MYSQL_TYPE_VAR_STRING,
+        libmysql_c.MYSQL_TYPE_VARCHAR,
+        libmysql_c.MYSQL_TYPE_BLOB,
+        => .string,
+        else => .string,
+    };
+}
+
 pub const MySqlConn = struct {
     mysql: ?*libmysql_c.MYSQL,
     allocator: std.mem.Allocator,
@@ -742,10 +858,13 @@ pub const MySqlConn = struct {
             for (field_names) |f| allocator.free(f);
             allocator.free(field_names);
         }
+        const field_kinds = allocator.alloc(ColKind, n_cols) catch return error.DatabaseError;
+        defer allocator.free(field_kinds);
         for (0..n_cols) |c| {
             const field = libmysql_c.mysql_fetch_field(res) orelse return error.DatabaseError;
             const name = std.mem.span(field.name);
             field_names[c] = allocator.dupe(u8, name) catch return error.DatabaseError;
+            field_kinds[c] = mysqlValueKind(field.type, field.flags);
         }
 
         var rows_list: std.ArrayList(Row) = .empty;
@@ -782,8 +901,8 @@ pub const MySqlConn = struct {
                     values[c] = null;
                 } else {
                     const len = lengths[c];
-                    const val = row_data.?[c].?[0..len];
-                    values[c] = .{ .string = allocator.dupe(u8, val) catch return error.DatabaseError };
+                    const text = row_data.?[c].?[0..len];
+                    values[c] = valueFromText(allocator, text, field_kinds[c]) catch return error.DatabaseError;
                 }
             }
             rows_list.append(allocator, .{ .allocator = allocator, .columns = columns, .values = values }) catch return error.DatabaseError;
@@ -997,8 +1116,14 @@ pub const PostgresStmt = struct {
     pub fn prepare(conn: ?*libpq_c.PGconn, allocator: std.mem.Allocator, sql: []const u8) !PostgresStmt {
         var name_buf: [32]u8 = undefined;
         const stmt_name = try std.fmt.bufPrint(&name_buf, "stmt_{x}", .{@intFromPtr(sql.ptr)});
-        const name_copy = try allocator.dupe(u8, stmt_name);
-        const res = libpq_c.PQprepare(conn, @ptrCast(name_copy.ptr), @ptrCast(sql.ptr), 0, null);
+        // Both the statement name and the SQL are C strings to libpq, and both
+        // are kept NUL-terminated for the statement's lifetime.
+        const name_copy = try allocator.dupeSentinel(u8, stmt_name, 0);
+        errdefer allocator.free(name_copy);
+        const sql_z = try allocator.dupeSentinel(u8, sql, 0);
+        defer allocator.free(sql_z);
+
+        const res = libpq_c.PQprepare(conn, name_copy.ptr, sql_z.ptr, 0, null);
         if (res == null) return error.DatabaseError;
         defer libpq_c.PQclear(res);
         if (libpq_c.PQresultStatus(res) != libpq_c.ExecStatusType.PGRES_COMMAND_OK) return error.DatabaseError;
@@ -1029,7 +1154,8 @@ pub const PostgresStmt = struct {
                 .bool => |v| if (v) @ptrCast("t") else @ptrCast("f"),
             };
         }
-        const res = libpq_c.PQexecPrepared(self.conn, @ptrCast(self.name.ptr), @intCast(args.len), @ptrCast(paramValues.ptr), null, null, 0);
+        // `self.name` is stored NUL-terminated by `prepare`.
+        const res = libpq_c.PQexecPrepared(self.conn, self.name.ptr, @intCast(args.len), @ptrCast(paramValues.ptr), null, null, 0);
         self.allocator.free(paramValues);
         return res;
     }
@@ -1096,12 +1222,12 @@ pub const PostgresStmt = struct {
 
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*PostgresStmt, @ptrCast(@alignCast(ptr)));
-        const dealloc_sql = std.fmt.allocPrint(self.allocator, "DEALLOCATE {s}", .{self.name}) catch {
+        const dealloc_sql = std.fmt.allocPrintSentinel(self.allocator, "DEALLOCATE {s}", .{self.name}, 0) catch {
             self.allocator.free(self.name);
             self.allocator.destroy(self);
             return;
         };
-        const res = libpq_c.PQexec(self.conn, @ptrCast(dealloc_sql.ptr));
+        const res = libpq_c.PQexec(self.conn, dealloc_sql.ptr);
         if (res) |r| libpq_c.PQclear(r);
         self.allocator.free(dealloc_sql);
         self.allocator.free(self.name);
@@ -3042,4 +3168,240 @@ test "mysql live connection" {
     } else return error.TestUnexpectedResult;
 
     _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_users", &.{});
+}
+
+test "postgres live typed column scan" {
+    try skipUnlessDb("postgres");
+    const allocator = std.testing.allocator;
+
+    const conninfo_default = "host=localhost port=5432 dbname=postgres user=cborli";
+    const conninfo = std.process.Environ.getAlloc(std.testing.environ, allocator, "PGconninfo") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => conninfo_default,
+        else => return err,
+    };
+    defer if (conninfo.ptr != conninfo_default.ptr) allocator.free(conninfo);
+
+    var client = Client.init(allocator, .{
+        .driver = .postgres,
+        .postgres_conninfo = conninfo,
+    });
+    defer client.deinit();
+
+    try client.connect();
+    try client.ping();
+
+    _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_types", &.{});
+    _ = try client.exec(
+        "CREATE TABLE zigzero_test_types (" ++
+            "id BIGINT PRIMARY KEY, hits INTEGER, small SMALLINT, " ++
+            "score DOUBLE PRECISION, ratio REAL, amount NUMERIC(10,2), " ++
+            "active BOOLEAN, name TEXT, tag VARCHAR(32), code CHAR(2), " ++
+            "created TIMESTAMPTZ)",
+        &.{},
+    );
+
+    // id -> int8, hits -> int4, small -> int2, score -> float8, ratio -> float4,
+    // amount -> numeric, active -> bool, name/tag/code -> text, created -> timestamptz.
+    const Typed = struct {
+        id: i64,
+        hits: i64,
+        small: i64,
+        score: f64,
+        ratio: f64,
+        amount: f64,
+        active: bool,
+        name: []const u8,
+        tag: []const u8,
+        code: []const u8,
+        created: []const u8,
+    };
+
+    const insert_sql =
+        "INSERT INTO zigzero_test_types " ++
+        "(id, hits, small, score, ratio, amount, active, name, tag, code, created) " ++
+        "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())";
+    _ = try client.exec(insert_sql, &.{
+        .{ .int = 7 },       .{ .int = 42 },         .{ .int = 3 },
+        .{ .float = 1.5 },   .{ .float = 0.25 },     .{ .float = 12.5 },
+        .{ .bool = true },   .{ .string = "Alice" }, .{ .string = "beta" },
+        .{ .string = "xy" },
+    });
+    _ = try client.exec(insert_sql, &.{
+        .{ .int = 8 },       .{ .int = 0 },        .{ .int = -5 },
+        .{ .float = -2.75 }, .{ .float = 0.5 },    .{ .float = 0.01 },
+        .{ .bool = false },  .{ .string = "Bob" }, .{ .string = "gamma" },
+        .{ .string = "zz" },
+    });
+
+    const one = try client.queryRow(
+        Typed,
+        "SELECT id, hits, small, score, ratio, amount, active, name, tag, code, created " ++
+            "FROM zigzero_test_types WHERE id = $1",
+        &.{.{ .int = 7 }},
+    );
+    defer freeScanned(allocator, Typed, one);
+    try std.testing.expectEqual(@as(i64, 7), one.id);
+    try std.testing.expectEqual(@as(i64, 42), one.hits);
+    try std.testing.expectEqual(@as(i64, 3), one.small);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), one.score, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), one.ratio, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 12.5), one.amount, 0.000001);
+    try std.testing.expect(one.active);
+    try std.testing.expectEqualStrings("Alice", one.name);
+    try std.testing.expectEqualStrings("beta", one.tag);
+    try std.testing.expectEqualStrings("xy", one.code);
+    // timestamptz has no dedicated variant and must keep scanning as text.
+    try std.testing.expect(one.created.len > 0);
+
+    const rows = try client.queryRows(
+        Typed,
+        "SELECT id, hits, small, score, ratio, amount, active, name, tag, code, created " ++
+            "FROM zigzero_test_types ORDER BY id",
+        &.{},
+    );
+    defer client.deinitQueryRows(Typed, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 7), rows[0].id);
+    try std.testing.expectEqualStrings("Alice", rows[0].name);
+    try std.testing.expectEqual(@as(i64, 8), rows[1].id);
+    try std.testing.expectEqual(@as(i64, 0), rows[1].hits);
+    try std.testing.expectEqual(@as(i64, -5), rows[1].small);
+    try std.testing.expectApproxEqAbs(@as(f64, -2.75), rows[1].score, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.01), rows[1].amount, 0.000001);
+    try std.testing.expect(!rows[1].active);
+    try std.testing.expectEqualStrings("Bob", rows[1].name);
+    try std.testing.expectEqualStrings("gamma", rows[1].tag);
+
+    _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_types", &.{});
+}
+
+test "mysql live typed column scan" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+
+    const host_default = "127.0.0.1";
+    const host = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_HOST") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => host_default,
+        else => return err,
+    };
+    defer if (host.ptr != host_default.ptr) allocator.free(host);
+    const user_default = "root";
+    const user = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_USER") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => user_default,
+        else => return err,
+    };
+    defer if (user.ptr != user_default.ptr) allocator.free(user);
+    const pass_default = "";
+    const pass = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_PASSWORD") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => pass_default,
+        else => return err,
+    };
+    defer if (pass.ptr != pass_default.ptr) allocator.free(pass);
+    const db_default = "zigzero_test";
+    const db = std.process.Environ.getAlloc(std.testing.environ, allocator, "MYSQL_DATABASE") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => db_default,
+        else => return err,
+    };
+    defer if (db.ptr != db_default.ptr) allocator.free(db);
+
+    var client = Client.init(allocator, .{
+        .driver = .mysql,
+        .host = host,
+        .port = 3306,
+        .database = db,
+        .username = user,
+        .password = pass,
+    });
+    defer client.deinit();
+
+    try client.connect();
+    try client.ping();
+
+    _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_types", &.{});
+    _ = try client.exec(
+        "CREATE TABLE zigzero_test_types (" ++
+            "id BIGINT PRIMARY KEY, hits INT, small SMALLINT, tiny TINYINT, " ++
+            "uval INT UNSIGNED, ubig BIGINT UNSIGNED, " ++
+            "score DOUBLE, ratio FLOAT, amount DECIMAL(10,2), active TINYINT(1), " ++
+            "name VARCHAR(32), tag TEXT, code CHAR(2))",
+        &.{},
+    );
+
+    // Both rows of `ubig` exceed i64 max, so the driver must fall back to text
+    // for that column: `Value` has no unsigned-64 variant.
+    const Typed = struct {
+        id: i64,
+        hits: i64,
+        small: i64,
+        tiny: i64,
+        uval: i64,
+        ubig: []const u8,
+        score: f64,
+        ratio: f64,
+        amount: f64,
+        active: bool,
+        name: []const u8,
+        tag: []const u8,
+        code: []const u8,
+    };
+
+    const insert_sql =
+        "INSERT INTO zigzero_test_types " ++
+        "(id, hits, small, tiny, uval, ubig, score, ratio, amount, active, name, tag, code) " ++
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    _ = try client.exec(insert_sql, &.{
+        .{ .int = 7 },          .{ .int = 42 },                        .{ .int = 3 },          .{ .int = 1 },
+        .{ .int = 4000000000 }, .{ .string = "18446744073709551615" }, .{ .float = 1.5 },      .{ .float = 0.25 },
+        .{ .float = 12.5 },     .{ .bool = true },                     .{ .string = "Alice" }, .{ .string = "beta" },
+        .{ .string = "xy" },
+    });
+    _ = try client.exec(insert_sql, &.{
+        .{ .int = 8 },       .{ .int = 0 },                        .{ .int = -5 },       .{ .int = 0 },
+        .{ .int = 1 },       .{ .string = "9223372036854775808" }, .{ .float = -2.75 },  .{ .float = 0.5 },
+        .{ .float = 0.01 },  .{ .bool = false },                   .{ .string = "Bob" }, .{ .string = "gamma" },
+        .{ .string = "zz" },
+    });
+
+    const one = try client.queryRow(
+        Typed,
+        "SELECT id, hits, small, tiny, uval, ubig, score, ratio, amount, active, name, tag, code " ++
+            "FROM zigzero_test_types WHERE id = ?",
+        &.{.{ .int = 7 }},
+    );
+    defer freeScanned(allocator, Typed, one);
+    try std.testing.expectEqual(@as(i64, 7), one.id);
+    try std.testing.expectEqual(@as(i64, 42), one.hits);
+    try std.testing.expectEqual(@as(i64, 3), one.small);
+    try std.testing.expectEqual(@as(i64, 1), one.tiny);
+    try std.testing.expectEqual(@as(i64, 4000000000), one.uval);
+    try std.testing.expectEqualStrings("18446744073709551615", one.ubig);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), one.score, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), one.ratio, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 12.5), one.amount, 0.000001);
+    try std.testing.expect(one.active);
+    try std.testing.expectEqualStrings("Alice", one.name);
+    try std.testing.expectEqualStrings("beta", one.tag);
+    try std.testing.expectEqualStrings("xy", one.code);
+
+    const rows = try client.queryRows(
+        Typed,
+        "SELECT id, hits, small, tiny, uval, ubig, score, ratio, amount, active, name, tag, code " ++
+            "FROM zigzero_test_types ORDER BY id",
+        &.{},
+    );
+    defer client.deinitQueryRows(Typed, rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 7), rows[0].id);
+    try std.testing.expectEqualStrings("Alice", rows[0].name);
+    try std.testing.expectEqual(@as(i64, 8), rows[1].id);
+    try std.testing.expectEqual(@as(i64, 0), rows[1].hits);
+    try std.testing.expectEqual(@as(i64, -5), rows[1].small);
+    try std.testing.expectApproxEqAbs(@as(f64, -2.75), rows[1].score, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.01), rows[1].amount, 0.000001);
+    try std.testing.expect(!rows[1].active);
+    try std.testing.expectEqualStrings("Bob", rows[1].name);
+    try std.testing.expectEqualStrings("gamma", rows[1].tag);
+    try std.testing.expectEqualStrings("9223372036854775808", rows[1].ubig);
+
+    _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_types", &.{});
 }

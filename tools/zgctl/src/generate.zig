@@ -669,7 +669,14 @@ pub fn parseCreateTable(allocator: std.mem.Allocator, sql: []const u8) !struct {
         const col_type = std.mem.trim(u8, raw_type, " \t\n");
         if (col_type.len == 0) continue;
 
-        const zig_type = sqlTypeToZig(col_type);
+        // DDL is usually uppercase; the mapping below compares lowercase names.
+        var type_buf: [64]u8 = undefined;
+        const lower_type = if (col_type.len <= type_buf.len)
+            std.ascii.lowerString(&type_buf, col_type)
+        else
+            col_type;
+
+        const zig_type = sqlTypeToZig(lower_type);
         try columns.append(allocator, .{ .name = try allocator.dupe(u8, col_name), .zig_type = zig_type });
 
         if (std.mem.indexOf(u8, col, "primary key") != null and primary_key.len == 0) {
@@ -689,17 +696,39 @@ pub fn parseCreateTable(allocator: std.mem.Allocator, sql: []const u8) !struct {
 }
 
 fn sqlTypeToZig(sql_type: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, sql_type, "int") or std.mem.eql(u8, sql_type, "integer") or std.mem.eql(u8, sql_type, "bigint") or std.mem.eql(u8, sql_type, "smallint") or std.mem.eql(u8, sql_type, "tinyint")) {
-        return "i64";
-    } else if (std.mem.startsWith(u8, sql_type, "varchar") or std.mem.startsWith(u8, sql_type, "char") or std.mem.startsWith(u8, sql_type, "text") or std.mem.eql(u8, sql_type, "string")) {
-        return "[]const u8";
-    } else if (std.mem.startsWith(u8, sql_type, "bool")) {
-        return "bool";
-    } else if (std.mem.startsWith(u8, sql_type, "float") or std.mem.startsWith(u8, sql_type, "double") or std.mem.startsWith(u8, sql_type, "decimal") or std.mem.startsWith(u8, sql_type, "numeric")) {
-        return "f64";
-    } else if (std.mem.startsWith(u8, sql_type, "datetime") or std.mem.startsWith(u8, sql_type, "timestamp") or std.mem.eql(u8, sql_type, "date")) {
-        return "i64";
+    // `sql_type` is lowercase (see the call site) and may carry a length or
+    // precision suffix, e.g. "varchar(255)".
+    const int_names = [_][]const u8{
+        "int",      "integer", "bigint", "smallint", "tinyint",   "mediumint",
+        "int2",     "int4",    "int8",   "serial",   "bigserial", "smallserial",
+        "unsigned", "signed",  "year",   "bit",
+    };
+    for (int_names) |name| {
+        if (std.mem.startsWith(u8, sql_type, name)) return "i64";
     }
+
+    const float_names = [_][]const u8{ "float", "double", "decimal", "numeric", "real", "money" };
+    for (float_names) |name| {
+        if (std.mem.startsWith(u8, sql_type, name)) return "f64";
+    }
+
+    if (std.mem.startsWith(u8, sql_type, "bool")) return "bool";
+
+    const text_names = [_][]const u8{
+        "varchar", "char", "text",   "string",   "uuid",  "json",
+        "xml",     "inet", "cidr",   "macaddr",  "bytea", "blob",
+        "enum",    "set",  "citext", "tsvector",
+    };
+    for (text_names) |name| {
+        if (std.mem.startsWith(u8, sql_type, name)) return "[]const u8";
+    }
+
+    // Date and time types are read back as text by every driver.
+    const time_names = [_][]const u8{ "datetime", "timestamp", "date", "time", "interval" };
+    for (time_names) |name| {
+        if (std.mem.startsWith(u8, sql_type, name)) return "[]const u8";
+    }
+
     return "[]const u8";
 }
 
@@ -929,4 +958,37 @@ test "parse create table" {
     try std.testing.expectEqualStrings("users", result.table_name);
     try std.testing.expectEqualStrings("id", result.primary_key);
     try std.testing.expectEqual(@as(usize, 3), result.columns.len);
+}
+
+test "uppercase ddl types map to real zig types" {
+    const allocator = std.testing.allocator;
+    // DDL is normally uppercase; matching used to be case-sensitive, so every
+    // column fell back to a string.
+    const sql =
+        \\CREATE TABLE users (
+        \\  id SERIAL PRIMARY KEY,
+        \\  name VARCHAR(255) NOT NULL,
+        \\  age INT,
+        \\  score DOUBLE PRECISION,
+        \\  balance NUMERIC(10,2),
+        \\  active BOOLEAN,
+        \\  created_at TIMESTAMP
+        \\)
+    ;
+    const result = try parseCreateTable(allocator, sql);
+    defer {
+        allocator.free(result.table_name);
+        allocator.free(result.primary_key);
+        for (result.columns) |col| allocator.free(col.name);
+        allocator.free(result.columns);
+    }
+
+    try std.testing.expectEqual(@as(usize, 7), result.columns.len);
+    try std.testing.expectEqualStrings("i64", result.columns[0].zig_type); // serial
+    try std.testing.expectEqualStrings("[]const u8", result.columns[1].zig_type); // varchar
+    try std.testing.expectEqualStrings("i64", result.columns[2].zig_type); // int
+    try std.testing.expectEqualStrings("f64", result.columns[3].zig_type); // double precision
+    try std.testing.expectEqualStrings("f64", result.columns[4].zig_type); // numeric
+    try std.testing.expectEqualStrings("bool", result.columns[5].zig_type); // boolean
+    try std.testing.expectEqualStrings("[]const u8", result.columns[6].zig_type); // timestamp
 }

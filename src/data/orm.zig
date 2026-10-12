@@ -26,12 +26,21 @@
 //!
 //! # Driver limitations (inherited from `src/infra/sqlx.zig`)
 //!
-//! * Typed scanning is complete only on sqlite: its driver reports typed column
-//!   values, so `i64` / `f64` / `bool` fields scan correctly. The postgres and
-//!   mysql drivers return every non-null column as `.string`, so
-//!   `sqlx.valueToType` rejects numeric fields with `error.DatabaseError` when
-//!   scanning. String fields scan fine on all three. Making those drivers type
-//!   their values needs a change in `sqlx.zig`.
+//! * Typed scanning works on all three drivers: sqlite reports typed column
+//!   values directly, and the postgres and mysql drivers build `i64` / `f64` /
+//!   `bool` values from their column metadata (`PQftype` OIDs and
+//!   `MYSQL_FIELD.type` / `flags`). Columns outside that set — timestamps, uuid,
+//!   json, bytea, and any numeric text that fails to parse — still arrive as
+//!   `.string` and scan into `[]const u8`. `numeric` / `DECIMAL` are exposed as
+//!   `.float`, so a money column that needs exact decimals must be cast to text
+//!   in the query and scanned into `[]const u8`.
+//! # Mapping
+//!
+//! The table name comes from `pub const table_name` when the type declares one,
+//! otherwise from the type name. The primary key comes from `pub const
+//! primary_key` when declared (this is what `zgctl model` emits), otherwise from
+//! a field named `id`; a type with neither fails with `error.NoPrimaryKey`.
+//!
 //! * `create` can fill a generated primary key only where sqlx reports
 //!   `ExecResult.last_insert_id` — sqlite and mysql do, postgres does not (sqlx
 //!   exposes no `RETURNING`). On postgres the caller must supply the key.
@@ -57,6 +66,9 @@ pub const Config = struct {
     username: []const u8 = "",
     password: []const u8 = "",
     sqlite_path: []const u8 = ":memory:",
+    /// Full libpq connection string. When set it takes precedence over the
+    /// discrete host/port/database/username/password fields above.
+    postgres_conninfo: []const u8 = "",
     max_connections: u32 = 10,
 };
 
@@ -78,6 +90,7 @@ pub const Pool = struct {
                 .username = cfg.username,
                 .password = cfg.password,
                 .sqlite_path = cfg.sqlite_path,
+                .postgres_conninfo = cfg.postgres_conninfo,
                 .max_open_conns = cfg.max_connections,
                 .max_idle_conns = cfg.max_connections,
             }),
@@ -225,7 +238,10 @@ fn getTableName(comptime T: type) []const u8 {
 
 /// Get primary key field
 fn getPrimaryKey(comptime T: type) []const u8 {
-    // Check for 'id' field by convention
+    // An explicit declaration wins — this is what `zgctl model` emits, and it
+    // is the only way to describe a table whose key is not called `id`.
+    if (@hasDecl(T, "primary_key")) return T.primary_key;
+    // Otherwise fall back to the `id` convention.
     inline for (@typeInfo(T).@"struct".field_names) |field_name| {
         if (std.mem.eql(u8, field_name, "id")) {
             return "id";
