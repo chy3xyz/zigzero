@@ -29,10 +29,9 @@ examples/chy3/
     │   └── world.zig      ← 世界域处理器
     └── infra/
         ├── middleware.zig ← 中间件工厂函数（唯一被 main.zig 引用的 infra 文件）
-        └── metrics.zig    ← 未使用：文件中定义了 Metrics 结构，但没有任何模块 import 它
 ```
 
-`src/infra/metrics.zig` 目前是死代码：`main.zig` 只是在自己的文件头注释里提到它，实际并未引用。示例中的指标都直接通过 `metric.Registry` 创建，不要把它当作生效的组件。
+示例的指标直接通过 `AppContext.registry` 创建（`metric.Registry`），没有单独的 metrics 模块。
 
 ## 架构设计原则
 
@@ -260,11 +259,13 @@ curl http://localhost:8080/metrics
 
 chy3 不使用消息队列，也没有引入 `mq.Queue`。
 
-## 已知问题（运行本示例时会遇到）
+## 已知问题
 
-- `POST /api/v1/worlds/:world_id/events` 是在分组上用 `g.post(...)` 注册的，没有 `.user_data`，而处理器 `handleTriggerEvent` 会解引用 `ctx.user_data.?`——调用该端点会 panic 并终止整个进程。
-- `GET /api/v1/worlds/stats` 注册的 `.user_data` 是 `metricsUserData(&registry)`（`*metric.Registry`），处理器却把它当成 `*AppContext` 使用，返回的统计是错乱的整数。
-- `ctx.bindJson` 返回的结构体里，字符串字段指向 `bindJson` 内部临时解析 arena 的内存，该 arena 在函数返回前就被释放，因此响应中会看到被复用的垃圾字节（例如 `name`、`genre`、`category` 字段错位）。这三个问题都出在示例/框架实现里，本文档如实记录，未作代码修改。
+以下问题曾在此示例中真实存在，现已修复，保留说明以免读者按旧行为理解：
+
+- `POST /api/v1/worlds/:world_id/events` 曾用分组 `g.post(...)` 注册而没有 `.user_data`，处理器解引用 `ctx.user_data.?` 会 panic。`RouteGroup` 现在支持 `withUserData(...)`，示例用 `server.group("/api/v1/worlds").withUserData(&app)` 注册分组路由。
+- `GET /api/v1/worlds/stats` 曾被注入 `*metric.Registry`，而处理器按 `*AppContext` 解释 —— 类型错配。现改为注入 `&app`（注册表通过 `app.registry` 访问）。
+- `ctx.bindJson` 曾返回指向已释放解析 arena 的字符串切片。它现在把解析结果放进请求 arena，字段在整个请求周期内有效。
 
 ## 扩展方向
 

@@ -14,7 +14,6 @@
 //!     solution.zig — 解决域 handlers
 //!     world.zig    — 世界域 handlers
 //!   infra/
-//!     metrics.zig   — Prometheus metric initialization
 //!     middleware.zig — Middleware factory functions
 
 const std = @import("std");
