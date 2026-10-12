@@ -1272,18 +1272,238 @@ pub const PostgresStmt = struct {
     }
 };
 
+/// Prepared statement on the MySQL connection.
+///
+/// The statement is really prepared server-side (`mysql_stmt_prepare` with bound
+/// parameters and bound result buffers). When the server refuses to prepare the
+/// text — multi-statement strings, some DDL — the handle stays null and the text
+/// protocol is used instead, which goes through `formatQuery`'s escaping.
 pub const MySqlStmt = struct {
     mysql: ?*libmysql_c.MYSQL,
     sql: []const u8,
     allocator: std.mem.Allocator,
+    handle: ?*libmysql_c.MYSQL_STMT,
 
     pub fn prepare(mysql: ?*libmysql_c.MYSQL, allocator: std.mem.Allocator, sql: []const u8) !MySqlStmt {
         const sql_copy = try allocator.dupe(u8, sql);
-        return .{ .mysql = mysql, .sql = sql_copy, .allocator = allocator };
+        errdefer allocator.free(sql_copy);
+
+        var handle: ?*libmysql_c.MYSQL_STMT = null;
+        if (mysql) |m| {
+            if (libmysql_c.mysql_stmt_init(m)) |stmt| {
+                // `mysql_stmt_prepare` takes an explicit length, so the SQL does
+                // not need to be NUL-terminated.
+                if (libmysql_c.mysql_stmt_prepare(stmt, @ptrCast(sql_copy.ptr), @intCast(sql_copy.len)) == 0) {
+                    handle = stmt;
+                } else {
+                    _ = libmysql_c.mysql_stmt_close(stmt);
+                }
+            }
+        }
+        return .{ .mysql = mysql, .sql = sql_copy, .allocator = allocator, .handle = handle };
+    }
+
+    /// Bind `args` for execution. The buffers come from `scratch`, which must
+    /// outlive the statement's execution.
+    fn bindParams(stmt: *libmysql_c.MYSQL_STMT, scratch: std.mem.Allocator, args: []const Value) !void {
+        if (args.len == 0) return;
+
+        const binds = try scratch.alloc(libmysql_c.MYSQL_BIND, args.len);
+        @memset(binds, .{});
+        const null_flags = try scratch.alloc(libmysql_c.my_bool, args.len);
+        const lengths = try scratch.alloc(c_ulong, args.len);
+        const int_bufs = try scratch.alloc(i64, args.len);
+        const float_bufs = try scratch.alloc(f64, args.len);
+        const bool_bufs = try scratch.alloc(libmysql_c.my_bool, args.len);
+
+        for (args, 0..) |arg, i| {
+            switch (arg) {
+                .null => {
+                    null_flags[i] = 1;
+                    binds[i].buffer_type = libmysql_c.MYSQL_TYPE_NULL;
+                    binds[i].is_null = &null_flags[i];
+                },
+                .int => |v| {
+                    null_flags[i] = 0;
+                    int_bufs[i] = v;
+                    binds[i].buffer_type = libmysql_c.MYSQL_TYPE_LONGLONG;
+                    binds[i].buffer = @ptrCast(&int_bufs[i]);
+                    binds[i].is_null = &null_flags[i];
+                    binds[i].is_unsigned = 0;
+                },
+                .float => |v| {
+                    null_flags[i] = 0;
+                    float_bufs[i] = v;
+                    binds[i].buffer_type = libmysql_c.MYSQL_TYPE_DOUBLE;
+                    binds[i].buffer = @ptrCast(&float_bufs[i]);
+                    binds[i].is_null = &null_flags[i];
+                },
+                .string => |v| {
+                    null_flags[i] = 0;
+                    lengths[i] = @intCast(v.len);
+                    binds[i].buffer_type = libmysql_c.MYSQL_TYPE_STRING;
+                    binds[i].buffer = @ptrCast(@constCast(v.ptr));
+                    binds[i].buffer_length = @intCast(v.len);
+                    binds[i].length = &lengths[i];
+                    binds[i].is_null = &null_flags[i];
+                },
+                .bool => |v| {
+                    null_flags[i] = 0;
+                    bool_bufs[i] = if (v) 1 else 0;
+                    binds[i].buffer_type = libmysql_c.MYSQL_TYPE_TINY;
+                    binds[i].buffer = @ptrCast(&bool_bufs[i]);
+                    binds[i].is_null = &null_flags[i];
+                    binds[i].is_unsigned = 1;
+                },
+            }
+        }
+        if (libmysql_c.mysql_stmt_bind_param(stmt, binds.ptr) != 0) return error.DatabaseError;
+    }
+
+    fn execViaStmt(self: *MySqlStmt, args: []const Value) errors.ResultT(ExecResult) {
+        const stmt = self.handle.?;
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+
+        // A previous execution may have left bound result buffers behind.
+        _ = libmysql_c.mysql_stmt_free_result(stmt);
+        try bindParams(stmt, scratch_arena.allocator(), args);
+        if (libmysql_c.mysql_stmt_execute(stmt) != 0) return error.DatabaseError;
+        if (libmysql_c.mysql_stmt_field_count(stmt) > 0) _ = libmysql_c.mysql_stmt_store_result(stmt);
+
+        return ExecResult{
+            .rows_affected = libmysql_c.mysql_stmt_affected_rows(stmt),
+            .last_insert_id = @intCast(libmysql_c.mysql_stmt_insert_id(stmt)),
+        };
+    }
+
+    fn queryViaStmt(self: *MySqlStmt, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
+        const stmt = self.handle.?;
+        var scratch_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer scratch_arena.deinit();
+        const scratch = scratch_arena.allocator();
+
+        _ = libmysql_c.mysql_stmt_free_result(stmt);
+        try bindParams(stmt, scratch, args);
+        if (libmysql_c.mysql_stmt_execute(stmt) != 0) return error.DatabaseError;
+
+        if (libmysql_c.mysql_stmt_field_count(stmt) == 0) {
+            return Rows{ .allocator = allocator, .rows = try allocator.alloc(Row, 0) };
+        }
+
+        // Metadata *before* store_result: MariaDB Connector/C leaves the
+        // statement's field array unusable afterwards — columns past the first
+        // come back with a null name.
+        const meta = libmysql_c.mysql_stmt_result_metadata(stmt) orelse return error.DatabaseError;
+        defer libmysql_c.mysql_free_result(meta);
+
+        if (libmysql_c.mysql_stmt_store_result(stmt) != 0) return error.DatabaseError;
+
+        const n_cols = libmysql_c.mysql_num_fields(meta);
+        const names = try allocator.alloc([]const u8, n_cols);
+        var names_filled: usize = 0;
+        defer {
+            for (names[0..names_filled]) |n| allocator.free(n);
+            allocator.free(names);
+        }
+        const kinds = try allocator.alloc(ColKind, n_cols);
+        defer allocator.free(kinds);
+        for (0..n_cols) |c| {
+            const field = libmysql_c.mysql_fetch_field(meta) orelse return error.DatabaseError;
+            names[c] = try allocator.dupe(u8, std.mem.span(field.name));
+            names_filled += 1;
+            kinds[c] = mysqlValueKind(field.type, field.flags);
+        }
+
+        // Result buffers. Every column is fetched as text and decoded
+        // afterwards, so a prepared query produces the same typed values the
+        // text path does.
+        const col_buf_len = 256;
+        const bufs = try scratch.alloc([col_buf_len]u8, n_cols);
+        const binds = try scratch.alloc(libmysql_c.MYSQL_BIND, n_cols);
+        @memset(binds, .{});
+        const lengths = try scratch.alloc(c_ulong, n_cols);
+        const null_flags = try scratch.alloc(libmysql_c.my_bool, n_cols);
+        const err_flags = try scratch.alloc(libmysql_c.my_bool, n_cols);
+        for (0..n_cols) |c| {
+            binds[c].buffer_type = libmysql_c.MYSQL_TYPE_STRING;
+            binds[c].buffer = &bufs[c];
+            binds[c].buffer_length = col_buf_len;
+            binds[c].length = &lengths[c];
+            binds[c].is_null = &null_flags[c];
+            binds[c].@"error" = &err_flags[c];
+        }
+        if (libmysql_c.mysql_stmt_bind_result(stmt, binds.ptr) != 0) return error.DatabaseError;
+
+        var rows_list: std.ArrayList(Row) = .empty;
+        var success = false;
+        defer {
+            if (!success) {
+                for (rows_list.items) |row| {
+                    for (row.columns) |col| allocator.free(col);
+                    allocator.free(row.columns);
+                    for (row.values) |v| {
+                        if (v) |val| switch (val) {
+                            .string => |str| allocator.free(str),
+                            else => {},
+                        };
+                    }
+                    allocator.free(row.values);
+                }
+            }
+            rows_list.deinit(allocator);
+        }
+
+        while (true) {
+            const rc = libmysql_c.mysql_stmt_fetch(stmt);
+            if (rc == libmysql_c.MYSQL_NO_DATA) break;
+            if (rc != 0 and rc != libmysql_c.MYSQL_DATA_TRUNCATED) return error.DatabaseError;
+
+            const columns = try allocator.alloc([]const u8, n_cols);
+            errdefer allocator.free(columns);
+            const values = try allocator.alloc(?Value, n_cols);
+            errdefer allocator.free(values);
+            for (0..n_cols) |c| {
+                columns[c] = try allocator.dupe(u8, names[c]);
+                if (null_flags[c] != 0) {
+                    values[c] = null;
+                    continue;
+                }
+                const full_len: usize = @intCast(lengths[c]);
+                if (full_len <= col_buf_len) {
+                    values[c] = try valueFromText(allocator, bufs[c][0..full_len], kinds[c]);
+                    continue;
+                }
+                // The column did not fit the buffer: ask for it again at the
+                // size the server reported.
+                const big = try scratch.alloc(u8, full_len);
+                var big_bind: libmysql_c.MYSQL_BIND = .{};
+                var big_len: c_ulong = 0;
+                var big_null: libmysql_c.my_bool = 0;
+                var big_err: libmysql_c.my_bool = 0;
+                big_bind.buffer_type = libmysql_c.MYSQL_TYPE_STRING;
+                big_bind.buffer = big.ptr;
+                big_bind.buffer_length = @intCast(full_len);
+                big_bind.length = &big_len;
+                big_bind.is_null = &big_null;
+                big_bind.@"error" = &big_err;
+                if (libmysql_c.mysql_stmt_fetch_column(stmt, &big_bind, @intCast(c), 0) != 0) return error.DatabaseError;
+                values[c] = try valueFromText(allocator, big[0..@min(@as(usize, @intCast(big_len)), full_len)], kinds[c]);
+            }
+            try rows_list.append(allocator, .{ .allocator = allocator, .columns = columns, .values = values });
+        }
+
+        const rows_slice = try allocator.alloc(Row, rows_list.items.len);
+        @memcpy(rows_slice, rows_list.items);
+        success = true;
+        return Rows{ .allocator = allocator, .rows = rows_slice };
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
         const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
+        if (self.handle != null) return self.queryViaStmt(allocator, args);
+
+        // Fallback: the server would not prepare this statement.
         const query = formatQuery(self.allocator, self.sql, args) catch return error.DatabaseError;
         defer self.allocator.free(query);
         if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
@@ -1315,7 +1535,7 @@ pub const MySqlStmt = struct {
                     for (row.values) |v| {
                         if (v) |val| {
                             switch (val) {
-                                .string => |s| allocator.free(s),
+                                .string => |str| allocator.free(str),
                                 else => {},
                             }
                         }
@@ -1350,6 +1570,8 @@ pub const MySqlStmt = struct {
 
     fn execFn(ptr: *anyopaque, args: []const Value) errors.ResultT(ExecResult) {
         const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
+        if (self.handle != null) return self.execViaStmt(args);
+
         const query = formatQuery(self.allocator, self.sql, args) catch return error.DatabaseError;
         defer self.allocator.free(query);
         if (libmysql_c.mysql_real_query(self.mysql, @ptrCast(query.ptr), @intCast(query.len)) != 0) return error.DatabaseError;
@@ -1363,6 +1585,7 @@ pub const MySqlStmt = struct {
 
     fn closeFn(ptr: *anyopaque) void {
         const self = @as(*MySqlStmt, @ptrCast(@alignCast(ptr)));
+        if (self.handle) |stmt| _ = libmysql_c.mysql_stmt_close(stmt);
         self.allocator.free(self.sql);
         self.allocator.destroy(self);
     }
@@ -1378,8 +1601,6 @@ pub const MySqlStmt = struct {
         };
     }
 };
-
-// ==================== Connection Pool ====================
 
 const ConnPool = struct {
     allocator: std.mem.Allocator,
@@ -3478,4 +3699,133 @@ test "postgres live prepared statement with runtime strings" {
     defer freeScanned(allocator, Row2, scanned);
     try std.testing.expectEqualStrings("al042", scanned.name);
     try std.testing.expectEqual(@as(i64, 7), scanned.age);
+}
+
+test "mysql live prepared statements bind parameters and fetch typed columns" {
+    try skipUnlessDb("mysql");
+    const allocator = std.testing.allocator;
+
+    const env = struct {
+        fn get(gpa: std.mem.Allocator, name: []const u8, default: []const u8) ![]const u8 {
+            return std.process.Environ.getAlloc(std.testing.environ, gpa, name) catch |err| switch (err) {
+                error.EnvironmentVariableMissing => default,
+                else => err,
+            };
+        }
+    };
+    const host_default = "127.0.0.1";
+    const host = try env.get(allocator, "MYSQL_HOST", host_default);
+    defer if (host.ptr != host_default.ptr) allocator.free(host);
+    const user_default = "root";
+    const user = try env.get(allocator, "MYSQL_USER", user_default);
+    defer if (user.ptr != user_default.ptr) allocator.free(user);
+    const pass_default = "";
+    const pass = try env.get(allocator, "MYSQL_PASSWORD", pass_default);
+    defer if (pass.ptr != pass_default.ptr) allocator.free(pass);
+    const db_default = "zigzero_test";
+    const db = try env.get(allocator, "MYSQL_DATABASE", db_default);
+    defer if (db.ptr != db_default.ptr) allocator.free(db);
+
+    var client = Client.init(allocator, .{
+        .driver = .mysql,
+        .host = host,
+        .port = 3306,
+        .username = user,
+        .password = pass,
+        .database = db,
+    });
+    defer client.deinit();
+    try client.connect();
+
+    const raw_conn: *MySqlConn = @ptrCast(@alignCast(client.conn.?.ptr));
+
+    // Positive evidence that the statement is really prepared server-side: a
+    // valid statement must yield a statement handle (the text path would leave
+    // it null).
+    const probe = try MySqlStmt.prepare(raw_conn.mysql, allocator, "SELECT 1");
+    defer {
+        if (probe.handle) |h| _ = libmysql_c.mysql_stmt_close(h);
+        allocator.free(probe.sql);
+    }
+    try std.testing.expect(probe.handle != null);
+
+    _ = client.exec("DROP TABLE IF EXISTS zigzero_stmt_live", &.{}) catch {};
+    _ = try client.exec(
+        "CREATE TABLE zigzero_stmt_live (id BIGINT PRIMARY KEY, name TEXT, age BIGINT, score DOUBLE, active TINYINT(1))",
+        &.{},
+    );
+    defer _ = client.exec("DROP TABLE IF EXISTS zigzero_stmt_live", &.{}) catch {};
+
+    var insert = try client.prepare("INSERT INTO zigzero_stmt_live (id, name, age, score, active) VALUES (?, ?, ?, ?, ?)");
+    defer insert.close();
+
+    // Longer than the fixed value buffer, so the fetch has to re-read the
+    // column at the length the server reports.
+    const long_name = try allocator.alloc(u8, 600);
+    defer allocator.free(long_name);
+    @memset(long_name, 'x');
+
+    const first = try insert.exec(&.{
+        .{ .int = 1 }, .{ .string = long_name }, .{ .int = 30 }, .{ .float = 1.5 }, .{ .bool = true },
+    });
+    try std.testing.expectEqual(@as(u64, 1), first.rows_affected);
+
+    // A second execution on the same prepared statement must re-bind cleanly.
+    const second = try insert.exec(&.{
+        .{ .int = 2 }, .{ .string = "bob" }, .{ .int = 41 }, .{ .float = 2.5 }, .{ .bool = false },
+    });
+    try std.testing.expectEqual(@as(u64, 1), second.rows_affected);
+
+    var select = try client.prepare("SELECT id, name, age, score, active FROM zigzero_stmt_live WHERE id = ?");
+    defer select.close();
+
+    const StmtRow = struct {
+        id: i64,
+        name: []const u8,
+        age: i64,
+        score: f64,
+        active: bool,
+    };
+
+    var rows = try select.query(allocator, &.{.{ .int = 1 }});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    const one = try rows.rows[0].scan(allocator, StmtRow);
+    defer freeScanned(allocator, StmtRow, one);
+    try std.testing.expectEqual(@as(i64, 1), one.id);
+    try std.testing.expectEqual(@as(usize, 600), one.name.len);
+    try std.testing.expectEqual(@as(i64, 30), one.age);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), one.score, 1e-9);
+    try std.testing.expect(one.active);
+
+    var rows2 = try select.query(allocator, &.{.{ .int = 2 }});
+    defer rows2.deinit();
+    const two = try rows2.rows[0].scan(allocator, StmtRow);
+    defer freeScanned(allocator, StmtRow, two);
+    try std.testing.expectEqualStrings("bob", two.name);
+    try std.testing.expect(!two.active);
+
+    // The text-protocol fallback. Which statements a server refuses to prepare
+    // varies by version, so the "no handle" state is built directly instead of
+    // relying on a particular server rejecting a particular statement: the
+    // statement must still run, through `formatQuery`'s escaping.
+    var fallback = MySqlStmt{
+        .mysql = raw_conn.mysql,
+        .sql = "INSERT INTO zigzero_stmt_live (id, name, age, score, active) VALUES (?, ?, ?, ?, ?)",
+        .allocator = allocator,
+        .handle = null,
+    };
+    // Not closed: this struct owns nothing, and `.sql` is a static literal.
+    const fallback_stmt = fallback.toStmt();
+    const third = try fallback_stmt.exec(&.{
+        .{ .int = 3 }, .{ .string = "carol" }, .{ .int = 52 }, .{ .float = 3.5 }, .{ .bool = true },
+    });
+    try std.testing.expectEqual(@as(u64, 1), third.rows_affected);
+
+    var rows3 = try select.query(allocator, &.{.{ .int = 3 }});
+    defer rows3.deinit();
+    const three = try rows3.rows[0].scan(allocator, StmtRow);
+    defer freeScanned(allocator, StmtRow, three);
+    try std.testing.expectEqualStrings("carol", three.name);
+    try std.testing.expect(three.active);
 }
