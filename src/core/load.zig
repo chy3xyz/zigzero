@@ -161,8 +161,17 @@ fn measure(reader: *const fn () ?CpuTicks) CpuUsage {
 fn readProcStat() ?CpuTicks {
     var buf: [4096]u8 = undefined;
     const data = compat.cwd().readFile(compat.io(), "/proc/stat", &buf) catch return null;
+    return parseProcStatCpu(data);
+}
 
-    var lines = std.mem.tokenizeScalar(u8, data, '\n');
+/// Parse the aggregate `cpu` line out of `/proc/stat` into cumulative ticks.
+///
+/// Kept separate from the file read so the field layout is testable off Linux:
+/// the line is `cpu user nice system idle iowait irq softirq steal [guest
+/// guest_nice]`, and the ratio must stop at `steal` because guest and guest_nice
+/// are already counted inside user and nice.
+fn parseProcStatCpu(content: []const u8) ?CpuTicks {
+    var lines = std.mem.tokenizeScalar(u8, content, '\n');
     const cpu_line = lines.next() orelse return null;
     var fields = std.mem.tokenizeAny(u8, cpu_line, " \t");
     const label = fields.next() orelse return null;
@@ -179,8 +188,6 @@ fn readProcStat() ?CpuTicks {
     // we know how to read.
     if (count < 5) return null;
 
-    // Stop at `steal`: guest and guest_nice are already included in user and
-    // nice, so counting them again would tilt the ratio towards "busy".
     var total: u64 = 0;
     for (jiffies[0..@min(count, 8)]) |value| total += value;
     return .{ .total = total, .idle = jiffies[3] + jiffies[4] };
@@ -745,4 +752,48 @@ test "cpu measurement survives the cache window and stays bounded" {
         .measured => |usage| try std.testing.expect(usage >= 0 and usage <= cpu_max),
         .unavailable => return error.CpuSignalLostAfterFirstMeasurement,
     }
+}
+
+test "parses a real /proc/stat cpu line" {
+    // Shape of a modern Linux /proc/stat: the aggregate line followed by
+    // per-CPU lines, with user nice system idle iowait irq softirq steal
+    // guest guest_nice.
+    const sample =
+        \\cpu  1234567 890 456789 98765432 12345 67 89 11 22 33
+        \\cpu0 308641 222 114197 24691358 3086 16 22 2 5 8
+        \\intr 12345678 0 0 0
+        \\
+    ;
+
+    const ticks = parseProcStatCpu(sample) orelse return error.TestUnexpectedResult;
+    // user+nice+system+idle+iowait+irq+softirq+steal — guest/guest_nice are
+    // already inside user/nice and must not be counted again.
+    try std.testing.expectEqual(
+        @as(u64, 1234567 + 890 + 456789 + 98765432 + 12345 + 67 + 89 + 11),
+        ticks.total,
+    );
+    try std.testing.expectEqual(@as(u64, 98765432 + 12345), ticks.idle);
+}
+
+test "proc/stat parsing rejects what it cannot understand" {
+    // No aggregate line (xen kernels start with a different label).
+    try std.testing.expect(parseProcStatCpu("cpu0 1 2 3 4 5\n") == null);
+    // Too few fields to separate busy from idle.
+    try std.testing.expect(parseProcStatCpu("cpu 1 2 3 4\n") == null);
+    // A non-numeric field is a format we do not know.
+    try std.testing.expect(parseProcStatCpu("cpu a b c d e\n") == null);
+    try std.testing.expect(parseProcStatCpu("") == null);
+}
+
+test "busy ratio comes from the delta between two samples" {
+    // Half of the elapsed ticks were busy in this window: 1000 total, 500 idle.
+    try std.testing.expectEqual(@as(?i64, 500), busyRatio(.{ .total = 1000, .idle = 900 }, .{ .total = 2000, .idle = 1400 }));
+    // 1000 total, 600 idle -> 400 busy.
+    try std.testing.expectEqual(@as(?i64, 400), busyRatio(.{ .total = 1000, .idle = 900 }, .{ .total = 2000, .idle = 1500 }));
+    // Fully idle window.
+    try std.testing.expectEqual(@as(?i64, 0), busyRatio(.{ .total = 1000, .idle = 900 }, .{ .total = 2000, .idle = 1900 }));
+    // Fully busy window.
+    try std.testing.expectEqual(@as(?i64, 1000), busyRatio(.{ .total = 1000, .idle = 900 }, .{ .total = 1100, .idle = 900 }));
+    // Counters that did not move (Darwin refreshes them in bursts): no ratio.
+    try std.testing.expect(busyRatio(.{ .total = 1000, .idle = 900 }, .{ .total = 1000, .idle = 900 }) == null);
 }

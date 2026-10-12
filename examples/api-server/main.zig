@@ -12,6 +12,7 @@ const discovery = zigzero.discovery;
 const limiter = zigzero.limiter;
 const breaker = zigzero.breaker;
 const http = zigzero.http;
+const static_files = zigzero.static;
 
 pub fn main() !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
@@ -273,6 +274,19 @@ pub fn main() !void {
             }
         }.handle,
         .user_data = &static_discovery,
+    });
+
+    // Static files. The wildcard pattern captures the whole remainder, so one
+    // route serves the whole tree; exact routes registered above still win over
+    // it. root_dir is relative to the process working directory (the repo root
+    // when run the way README describes), and the handler appends the request
+    // path to it.
+    var statics = static_files.Server.init(allocator, "examples/api-server/public");
+    try server.addRoute(.{
+        .method = .GET,
+        .path = "/*file",
+        .handler = statics.handler(),
+        .user_data = &statics,
     });
 
     logger.info("Starting API server on port 8080");

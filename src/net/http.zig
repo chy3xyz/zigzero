@@ -404,21 +404,43 @@ fn pollBounded(fds: []std.posix.pollfd, timeout: std.Io.Timeout) errors.Error!u3
 
 /// Writes all of `bytes`, giving up after `timeout`.
 ///
-/// `operateTimeout` waits for the socket to become writable with the deadline
-/// and then performs one blocking write, so each iteration only has to make
-/// progress rather than fit the whole body into the socket buffer.
+/// `std.Io`'s write helpers poll for writability and then hand the buffer to a
+/// *blocking* `send(2)`. Once the peer stops reading, that syscall blocks until
+/// the kernel buffers drain — for a large body that is unbounded, and the
+/// deadline never gets a chance to fire. Here the socket is put in
+/// non-blocking mode for the duration and `EAGAIN` is retried through our own
+/// `poll` deadline, so every iteration is bounded by `timeout`.
 fn writeAllBounded(stream: compat.net.Stream, bytes: []const u8, timeout: std.Io.Timeout) errors.Error!void {
+    const posix = std.posix;
+    const fd = stream.socket.handle;
+
+    const getfl = posix.system.fcntl(fd, posix.F.GETFL, @as(usize, 0));
+    if (posix.errno(getfl) != .SUCCESS) return error.NetworkError;
+    const original: posix.O = @bitCast(@as(u32, @intCast(getfl)));
+
+    var nonblocking = original;
+    nonblocking.NONBLOCK = true;
+    if (posix.errno(posix.system.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(nonblocking)))) != .SUCCESS) return error.NetworkError;
+
+    // Blocking mode is restored before returning: the read path goes through
+    // std.Io, which expects the syscalls not to fail with EAGAIN.
+    defer _ = posix.system.fcntl(fd, posix.F.SETFL, @as(u32, @bitCast(original)));
+
     var written: usize = 0;
     while (written < bytes.len) {
-        const chunks = [_][]const u8{bytes[written..]};
-        const result = compat.io().operateTimeout(.{ .net_write = .{
-            .socket_handle = stream.socket.handle,
-            .data = &chunks,
-        } }, timeout) catch |err| return mapIoError(err);
-
-        const n = result.net_write catch |err| return mapIoError(err);
-        if (n == 0) return error.NetworkError;
-        written += n;
+        const n = std.c.send(fd, bytes[written..].ptr, bytes.len - written, std.c.MSG.NOSIGNAL);
+        switch (std.c.errno(n)) {
+            .SUCCESS => {
+                if (n == 0) return error.NetworkError;
+                written += @intCast(n);
+            },
+            .INTR => continue,
+            .AGAIN => {
+                var fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+                if (try pollBounded(&fds, timeout) == 0) return error.Timeout;
+            },
+            else => return error.NetworkError,
+        }
     }
 }
 
@@ -685,4 +707,44 @@ test "http client parses a valid response" {
     try std.testing.expectEqualStrings("made it", resp.body);
     try std.testing.expectEqualStrings("text/plain", resp.headers.get("Content-Type").?);
     try std.testing.expectEqualStrings("yes", resp.headers.get("X-Test").?);
+}
+
+/// Accepts a connection and never reads from it: the peer's send buffer fills,
+/// so a large write can only proceed if it is chunked and deadline-checked.
+fn nonReadingServer(server: *compat.net.Server) void {
+    const io = compat.io();
+    const stream = server.accept(io) catch return;
+    defer compat.net.streamClose(stream);
+    // Hold the connection open without consuming anything.
+    compat.sleep(1500 * std.time.ns_per_ms);
+}
+
+test "a large body cannot outlive the write deadline on a stalled peer" {
+    const allocator = std.testing.allocator;
+    const io = compat.io();
+
+    var srv = try startTestServer();
+    defer srv.server.deinit(io);
+
+    const thread = try std.Thread.spawn(.{}, nonReadingServer, .{&srv.server});
+    defer thread.join();
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/upload", .{srv.port});
+    defer allocator.free(url);
+
+    // 4 MiB, far more than the socket buffers involved.
+    const body = try allocator.alloc(u8, 4 * 1024 * 1024);
+    defer allocator.free(body);
+    @memset(body, 'x');
+
+    var client = Client.init(allocator, .{ .timeout_ms = 100, .retries = 1 });
+
+    const started_ms = compat.milliTimestamp();
+    const result = client.post(url, body, null);
+    const elapsed_ms = compat.milliTimestamp() - started_ms;
+
+    // The request must fail (the peer never answers) and must do so within the
+    // deadline-ish bound rather than blocking on the first write syscall.
+    try std.testing.expectError(error.Timeout, result);
+    try std.testing.expect(elapsed_ms < 1500);
 }

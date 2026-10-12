@@ -24,19 +24,18 @@ pub const Server = struct {
     /// Create an API handler for serving static files.
     ///
     /// A handler function has no state of its own, so the route must carry this
-    /// server as its `user_data`:
+    /// server as its `user_data`, and the path should end in a wildcard so the
+    /// whole remainder reaches the handler:
     /// ```zig
     /// var statics = static.Server.init(allocator, "./public");
     /// try server.addRoute(.{
     ///     .method = .GET,
-    ///     .path = "/",              // or "/:filename" for one directory level
+    ///     .path = "/*file",          // or "/static/*file" for a prefix
     ///     .handler = statics.handler(),
     ///     .user_data = &statics,
     /// });
     /// ```
-    /// The router matches exact segments and single-segment parameters only —
-    /// there is no `/*` catch-all — so serving a nested tree means registering
-    /// one parameterised route per depth.
+    /// The captured name is unused: the handler serves `ctx.raw_path`.
     pub fn handler(self: *const Server) api.HandlerFn {
         _ = self;
         return serveStatic;
@@ -150,6 +149,9 @@ test "static server serves a file and refuses traversal" {
     defer compat.cwd().deleteTree(compat.io(), root) catch {};
     try compat.cwd().writeFile(compat.io(), .{ .sub_path = root ++ "/hello.txt", .data = "static body" });
 
+    try compat.cwd().createDirPath(compat.io(), root ++ "/assets/css");
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = root ++ "/assets/css/app.css", .data = "body{}" });
+
     var server = Server.init(allocator, root);
     const handler = server.handler();
 
@@ -174,6 +176,14 @@ test "static server serves a file and refuses traversal" {
     escaped.user_data = &server;
     try handler(&escaped);
     try std.testing.expectEqual(@as(u16, 403), escaped.status_code);
+
+    // A nested file is served through the same handler (the route pattern is
+    // "/*file", so the whole remainder arrives as raw_path).
+    var nested = try api.Context.init(arena.allocator(), .GET, "/assets/css/app.css", logger);
+    nested.user_data = &server;
+    try handler(&nested);
+    try std.testing.expectEqual(@as(u16, 200), nested.status_code);
+    try std.testing.expectEqualStrings("body{}", nested.response_body.items);
 
     // A sibling directory sharing the root's prefix must not pass either.
     var sibling = try api.Context.init(arena.allocator(), .GET, "/../.test-static-evil/hello.txt", logger);

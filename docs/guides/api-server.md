@@ -390,7 +390,7 @@ const static = zigzero.static;
 var files = static.Server.init(allocator, "public");
 try server.addRoute(.{
     .method = .GET,
-    .path = "/static/:filename",
+    .path = "/static/*file",
     .handler = files.handler(),
     .user_data = &files,   // 处理器没有自身状态，服务器实例经路由的 user_data 传入
 });
@@ -398,7 +398,9 @@ try server.addRoute(.{
 
 `static.Server.init(allocator, root_dir)` 的第二个参数是根目录。`handler()` 返回的是一个不捕获任何状态的固定处理函数，路由器注册时不带状态，所以必须用 `.user_data` 把 `files` 交给处理器：处理器内部 `@ptrCast(@alignCast(ctx.user_data.?))` 取回，因此 `files` 要活过服务器。
 
-处理器把 `ctx.raw_path` 原样拼在 `root_dir` 之后，所以上面这条路由收到 `/static/a.css` 时读取的是 `public/static/a.css`——`root_dir` 要按这个规则选。路由按路径段匹配，`:param` 只匹配单个路径段，多级目录要为每级注册路由（如 `/static/:dir/:filename`），或自行包装处理器。
+处理器把 `ctx.raw_path` 原样拼在 `root_dir` 之后，所以上面这条路由收到 `/static/a.css` 时读取的是 `public/static/a.css`——`root_dir` 要按这个规则选。
+
+路由支持尾段通配：`*name` 会捕获该段及其之后的全部路径（分隔符也包含在内），所以 `/*file`、`/static/*file` 都能一次覆盖多级目录。通配必须是模式的最后一段，并且不能与同一层级的 `:param` 共存（两者匹配范围重叠，注册时返回 `error.InvalidRoute`）；精确段优先于 `:param`，`:param` 优先于通配。
 
 ## 启动选项
 

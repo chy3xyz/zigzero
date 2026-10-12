@@ -290,7 +290,7 @@ const static = zigzero.static;
 var files = static.Server.init(allocator, "public");
 try server.addRoute(.{
     .method = .GET,
-    .path = "/:filename",
+    .path = "/*file",
     .handler = files.handler(),
     .user_data = &files,   // 处理器没有自身状态，服务器实例经 user_data 传入
 });
@@ -300,7 +300,7 @@ try server.addRoute(.{
 
 `handler()` 返回一个不捕获任何状态的固定处理函数，因此服务器实例必须通过路由的 `.user_data` 传入，处理器内部用 `@ptrCast(@alignCast(ctx.user_data))` 取回；`files` 要活过服务器。处理器把 `ctx.raw_path` 原样拼在 `root_dir` 之后，所以每条路由的路径要能对应到磁盘上的相对路径。
 
-路由树按路径段匹配，只支持精确段与单段 `:param` / `{param}`，**不支持 `/*` 通配**——`/*` 会被当作字面段，只匹配请求路径 `/*`（`src/server/static.zig` 注释里的 `/*` 只是示意）。多级目录要为每级注册路由（如 `/:dir/:filename`），或自行包装处理器。
+路由树按路径段匹配：精确段、单段 `:param` / `{param}`，以及**尾段通配** `*name`（或裸 `*`，捕获名为 `"*"`）。通配捕获该段及其之后的全部剩余路径（含分隔符），因此 `/*file` 一次覆盖多级目录；它必须是模式的最后一段，且不能与同层的 `:param` 共存——两者范围重叠，注册时返回 `error.InvalidRoute`。匹配优先级：精确段 > `:param` > 通配。不存在的路径返回 404。
 
 ## infra/ — Infrastructure
 

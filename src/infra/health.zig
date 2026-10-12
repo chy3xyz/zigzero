@@ -183,14 +183,21 @@ fn readLinuxRssBytes() anyerror!u64 {
     var buf: [256]u8 = undefined;
     const data = compat.cwd().readFile(compat.io(), "/proc/self/statm", &buf) catch return error.MeasurementFailed;
 
-    var fields = std.mem.tokenizeAny(u8, data, " \t\n");
-    _ = fields.next() orelse return error.MeasurementFailed; // total program size
-    const resident_pages = std.fmt.parseInt(u64, fields.next() orelse return error.MeasurementFailed, 10) catch
-        return error.MeasurementFailed;
+    const resident_pages = parseStatmResidentPages(data) orelse return error.MeasurementFailed;
 
     const page_size = std.c.sysconf(@backingInt(std.c._SC.PAGESIZE));
     if (page_size <= 0) return error.MeasurementFailed;
     return resident_pages * @as(u64, @intCast(page_size));
+}
+
+/// Second field of `/proc/self/statm`: resident pages.
+///
+/// Split out from the file read so the field layout is testable off Linux.
+fn parseStatmResidentPages(content: []const u8) ?u64 {
+    var fields = std.mem.tokenizeAny(u8, content, " \t\n");
+    _ = fields.next() orelse return null; // total program size, in pages
+    const resident = fields.next() orelse return null;
+    return std.fmt.parseInt(u64, resident, 10) catch null;
 }
 
 fn readMacosRssBytes() anyerror!u64 {
@@ -547,4 +554,21 @@ test "registry reports real measurements per check" {
     try std.testing.expectEqual(expected, results.get("disk").?.status);
     try std.testing.expect(results.get("memory").?.message != null);
     try std.testing.expect(results.get("disk").?.message != null);
+}
+
+test "parses a real /proc/self/statm" {
+    // size resident shared text lib data dt
+    const pages = parseStatmResidentPages("1746 352 118 63 0 395 0\n") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 352), pages);
+
+    // A missing resident field or a non-numeric one is not a measurement.
+    try std.testing.expect(parseStatmResidentPages("") == null);
+    try std.testing.expect(parseStatmResidentPages("1746\n") == null);
+    try std.testing.expect(parseStatmResidentPages("1746 resident 118\n") == null);
+}
+
+test "linux rss converts pages to bytes with the real page size" {
+    if (builtin.os.tag != .linux or !builtin.link_libc) return error.SkipZigTest;
+    const rss = try readLinuxRssBytes();
+    try std.testing.expect(rss > 0);
 }

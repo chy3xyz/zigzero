@@ -46,6 +46,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Documentation corrected against the real source**: the guides described a pre-0.17 API surface and, in several places, APIs that never existed (circuit breaker `execute*`, `TokenBucket.init(allocator, .{...})`, `ctx.getRequestId()`, `ctx.remote_addr`, `config.loadFromYamlFile`, redis `Client.init(allocator, .{...})`, JWT claims with `role`/`iss`/`aud`, `limiter.GlobalLimiter`, …). Every sample in `README.md`, `docs/getting-started`, `docs/guides` and `docs/architecture` was checked against the source and the fabricated APIs replaced with the real ones; removed-in-0.17 std symbols (`GeneralPurposeAllocator`, `std.time.timestamp`, `std.Thread.sleep`) and missing `compat.initIo` calls were fixed throughout
 - **README framing**: the "production-ready" claim is replaced with an honest pre-1.0/beta statement naming the placeholder (`data/orm`), the stub (`net/tls`) and the experimental modules
 
+### Added
+- **Router wildcards**: a trailing `*name` (or bare `*`) captures the rest of the path, separators included, so `/*file` covers a whole tree in one route. Precedence is exact segment > `:param` > wildcard; a wildcard must be the last segment and cannot share a node with a `:param` (the registration is rejected with `error.InvalidRoute` because their match sets overlap). `MatchedRoute` gained a `deinit` for its captured parameters
+- `examples/api-server` serves its `public/` directory through the wildcard route, which is also the end-to-end path for the feature
+
+### Fixed (this batch)
+- **`net/api` leaked parameters when a match failed midway**: once a `:param` had been bound, every bail-out path called `params.deinit()` without freeing the keys and values it held
+- **`net/http`'s large-body write could outlive its deadline**: `std.Io`'s write helper polls for writability and then performs a *blocking* `send`, which sits in the kernel until the peer reads — unbounded once the socket buffer fills, so the deadline never fired (a test showed the call returning only when the stalled peer closed the connection). Writes now go through a non-blocking `send` with `EAGAIN` retried under our own `poll` deadline, and the socket's blocking mode is restored afterwards for the read path
+- **`net/tls` claimed to be available**: `isAvailable()` returned true unconditionally while nothing implements a handshake, so a caller gating HTTPS on it would have served plaintext. It now reports false, and the module states that it only loads certificate files
+- **`core/load` / `infra/health` Linux parsing is now tested**: the `/proc/stat` cpu line and `/proc/self/statm` parsing were split out of the file reads into pure functions and covered with real Linux file samples (field layout, guest/guest_nice exclusion, delta arithmetic, malformed input), so the Linux paths are no longer compile-only
+- **Documentation**: the guides said the router has no `/*` catch-all and told readers to register one route per directory level; that is replaced by the real wildcard usage
+
+### Changed
+- **`data/orm` is no longer a placeholder**: `Pool` now owns a real `sqlx.Client`, `Connection.query`/`execute` return real rows and row counts, `Transaction` delegates to sqlx, and `Crud(T).findById/findAll/create/update/delete` build and execute real SQL from the `Model(T)` metadata (driver-appropriate placeholders; `create` fills in the generated key where the driver reports one). `Pool.freeScanned`/`deinitRows` are the matching release helpers. Driver limits are documented in the file: PostgreSQL/MySQL still hand every column back as `.string` from sqlx, so scanning into `i64`/`f64`/`bool` fails there, and PostgreSQL cannot report a generated key
+
 ## [0.2.3] - 2026-10-10
 
 ### Fixed

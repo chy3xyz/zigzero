@@ -528,11 +528,24 @@ fn parseParamName(segment: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Name of a trailing wildcard segment: `*name`, or `*` (bound as "*").
+///
+/// A wildcard consumes the rest of the path, separators included, so it is only
+/// valid as the last segment of a route pattern.
+fn parseWildcardName(segment: []const u8) ?[]const u8 {
+    if (segment.len >= 1 and segment[0] == '*') {
+        return if (segment.len == 1) "*" else segment[1..];
+    }
+    return null;
+}
+
 /// Trie node for the router
 const TrieNode = struct {
     segment: []const u8,
     is_param: bool,
     param_name: ?[]const u8,
+    is_wildcard: bool,
+    wildcard_name: ?[]const u8,
     route: ?Route,
     children: std.ArrayList(*TrieNode),
 
@@ -543,9 +556,14 @@ const TrieNode = struct {
         errdefer allocator.free(node.segment);
         node.is_param = false;
         node.param_name = null;
+        node.is_wildcard = false;
+        node.wildcard_name = null;
         node.route = null;
         node.children = .empty;
-        if (parseParamName(segment)) |name| {
+        if (parseWildcardName(segment)) |name| {
+            node.is_wildcard = true;
+            node.wildcard_name = try allocator.dupe(u8, name);
+        } else if (parseParamName(segment)) |name| {
             node.is_param = true;
             node.param_name = try allocator.dupe(u8, name);
         }
@@ -555,6 +573,7 @@ const TrieNode = struct {
     pub fn deinit(self: *TrieNode, allocator: std.mem.Allocator) void {
         allocator.free(self.segment);
         if (self.param_name) |name| allocator.free(name);
+        if (self.wildcard_name) |name| allocator.free(name);
         if (self.route) |route| allocator.free(route.path);
         for (self.children.items) |child| {
             child.deinit(allocator);
@@ -575,6 +594,22 @@ const TrieNode = struct {
             if (child.is_param) return child;
         }
         return null;
+    }
+
+    pub fn findWildcardChild(self: *const TrieNode) ?*TrieNode {
+        for (self.children.items) |child| {
+            if (child.is_wildcard) return child;
+        }
+        return null;
+    }
+
+    /// The node's wildcard child, created on demand.
+    fn getOrCreateWildcard(self: *TrieNode, allocator: std.mem.Allocator, segment: []const u8) !*TrieNode {
+        if (self.findWildcardChild()) |child| return child;
+        const child = try TrieNode.init(allocator, segment);
+        errdefer child.deinit(allocator);
+        try self.children.append(allocator, child);
+        return child;
     }
 };
 
@@ -607,9 +642,24 @@ const Router = struct {
         while (parts.next()) |part| {
             if (part.len == 0) continue;
 
+            if (parseWildcardName(part) != null) {
+                // A wildcard swallows the rest of the path, so a segment after
+                // it could never be reached — reject the pattern instead of
+                // silently registering something unreachable.
+                while (parts.next()) |rest| {
+                    if (rest.len != 0) return error.InvalidRoute;
+                }
+                // A wildcard and a single-segment parameter at the same node
+                // match overlapping paths with no way to choose between them.
+                if (current.findParamChild() != null) return error.InvalidRoute;
+                current = try current.getOrCreateWildcard(self.allocator, part);
+                break;
+            }
+
             if (current.findChild(part)) |child| {
                 current = child;
             } else {
+                if (parseParamName(part) != null and current.findWildcardChild() != null) return error.InvalidRoute;
                 const child = try TrieNode.init(self.allocator, part);
                 try current.children.append(self.allocator, child);
                 current = child;
@@ -634,14 +684,7 @@ const Router = struct {
         const root = self.roots.get(method) orelse return null;
 
         var params = std.StringHashMap([]const u8).init(self.allocator);
-        errdefer {
-            var iter = params.iterator();
-            while (iter.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.*);
-            }
-            params.deinit();
-        }
+        errdefer freeParams(self.allocator, &params);
 
         var parts = std.mem.splitScalar(u8, path, '/');
         var current = root;
@@ -649,23 +692,45 @@ const Router = struct {
         while (parts.next()) |part| {
             if (part.len == 0) continue;
 
+            // Precedence: literal segment, then a single-segment parameter, then
+            // a wildcard swallowing this segment and everything after it.
             if (current.findChild(part)) |child| {
                 current = child;
-            } else if (current.findParamChild()) |param_child| {
-                const key = self.allocator.dupe(u8, param_child.param_name.?) catch return null;
-                const value = self.allocator.dupe(u8, part) catch {
-                    self.allocator.free(key);
+                continue;
+            }
+
+            if (current.findParamChild()) |param_child| {
+                if (!bindParam(self.allocator, &params, param_child.param_name.?, part)) {
+                    freeParams(self.allocator, &params);
                     return null;
-                };
-                params.put(key, value) catch {
-                    self.allocator.free(key);
-                    self.allocator.free(value);
-                    return null;
-                };
+                }
                 current = param_child;
-            } else {
-                params.deinit();
-                return null;
+                continue;
+            }
+
+            if (current.findWildcardChild()) |wild| {
+                // `part` points into `path`, so its offset gives the remainder.
+                const offset = @intFromPtr(part.ptr) - @intFromPtr(path.ptr);
+                if (!bindParam(self.allocator, &params, wild.wildcard_name.?, path[offset..])) {
+                    freeParams(self.allocator, &params);
+                    return null;
+                }
+                current = wild;
+                break;
+            }
+
+            freeParams(self.allocator, &params);
+            return null;
+        }
+
+        // `/static/*` also matches the bare `/static` — the wildcard captures "".
+        if (current.route == null) {
+            if (current.findWildcardChild()) |wild| {
+                if (!bindParam(self.allocator, &params, wild.wildcard_name.?, "")) {
+                    freeParams(self.allocator, &params);
+                    return null;
+                }
+                current = wild;
             }
         }
 
@@ -676,14 +741,49 @@ const Router = struct {
             };
         }
 
-        params.deinit();
+        freeParams(self.allocator, &params);
         return null;
     }
 };
 
+/// Release the keys and values captured so far and the map itself.
+fn freeParams(allocator: std.mem.Allocator, params: *std.StringHashMap([]const u8)) void {
+    var iter = params.iterator();
+    while (iter.next()) |entry| {
+        allocator.free(entry.key_ptr.*);
+        allocator.free(entry.value_ptr.*);
+    }
+    params.deinit();
+}
+
+/// Duplicate `value` into `params` under `name`; false when allocation fails.
+fn bindParam(allocator: std.mem.Allocator, params: *std.StringHashMap([]const u8), name: []const u8, value: []const u8) bool {
+    const key = allocator.dupe(u8, name) catch return false;
+    const val = allocator.dupe(u8, value) catch {
+        allocator.free(key);
+        return false;
+    };
+    params.put(key, val) catch {
+        allocator.free(key);
+        allocator.free(val);
+        return false;
+    };
+    return true;
+}
+
 const MatchedRoute = struct {
     route: Route,
     params: std.StringHashMap([]const u8),
+
+    /// Release the captured parameter keys and values.
+    pub fn deinit(self: *MatchedRoute, allocator: std.mem.Allocator) void {
+        var iter = self.params.iterator();
+        while (iter.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            allocator.free(entry.value_ptr.*);
+        }
+        self.params.deinit();
+    }
 };
 
 fn getStatusText(status: u16) []const u8 {
@@ -1353,6 +1453,95 @@ test "worker pool queue limits" {
 
     // Queue bounds are verified by WorkerPool.init parameters;
     // actual stream submission requires a valid connection.
+}
+
+test "wildcard route captures the remaining path" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    const noop = struct {
+        fn handle(ctx: *Context) anyerror!void {
+            _ = ctx;
+        }
+    }.handle;
+
+    try router.addRoute(.{ .method = .GET, .path = "/static/*file", .handler = noop });
+
+    // Nested paths are captured whole, separators included.
+    var nested = router.match(.GET, "/static/css/app.css") orelse return error.TestUnexpectedResult;
+    defer nested.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("css/app.css", nested.params.get("file").?);
+
+    var single = router.match(.GET, "/static/logo.png") orelse return error.TestUnexpectedResult;
+    defer single.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("logo.png", single.params.get("file").?);
+
+    // The bare prefix matches too, with an empty capture.
+    var bare = router.match(.GET, "/static") orelse return error.TestUnexpectedResult;
+    defer bare.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("", bare.params.get("file").?);
+
+    // A different prefix must not match.
+    try std.testing.expect(router.match(.GET, "/public/logo.png") == null);
+}
+
+test "literal routes win over the wildcard" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    const noop = struct {
+        fn handle(ctx: *Context) anyerror!void {
+            _ = ctx;
+        }
+    }.handle;
+
+    try router.addRoute(.{ .method = .GET, .path = "/static/*rest", .handler = noop });
+    try router.addRoute(.{ .method = .GET, .path = "/static/health", .handler = noop });
+
+    // An exact segment is preferred, and captures nothing.
+    var exact = router.match(.GET, "/static/health") orelse return error.TestUnexpectedResult;
+    defer exact.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), exact.params.count());
+
+    // Everything else falls to the wildcard.
+    var other = router.match(.GET, "/static/report.json") orelse return error.TestUnexpectedResult;
+    defer other.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("report.json", other.params.get("rest").?);
+}
+
+test "a wildcard and a parameter cannot share a node" {
+    const noop = struct {
+        fn handle(ctx: *Context) anyerror!void {
+            _ = ctx;
+        }
+    }.handle;
+
+    // A wildcard matches the same single segment a parameter would, with no way
+    // to choose between them, so the second registration is rejected.
+    var with_wildcard = Router.init(std.testing.allocator);
+    defer with_wildcard.deinit();
+    try with_wildcard.addRoute(.{ .method = .GET, .path = "/files/*rest", .handler = noop });
+    try std.testing.expectError(error.InvalidRoute, with_wildcard.addRoute(.{ .method = .GET, .path = "/files/:name", .handler = noop }));
+
+    var with_param = Router.init(std.testing.allocator);
+    defer with_param.deinit();
+    try with_param.addRoute(.{ .method = .GET, .path = "/files/:name", .handler = noop });
+    try std.testing.expectError(error.InvalidRoute, with_param.addRoute(.{ .method = .GET, .path = "/files/*rest", .handler = noop }));
+}
+
+test "a wildcard must be the last segment" {
+    var router = Router.init(std.testing.allocator);
+    defer router.deinit();
+
+    try std.testing.expectError(error.InvalidRoute, router.addRoute(.{
+        .method = .GET,
+        .path = "/static/*rest/more",
+        .handler = struct {
+            fn handle(ctx: *Context) anyerror!void {
+                _ = ctx;
+            }
+        }.handle,
+    }));
 }
 
 test "server config defaults" {
