@@ -1110,7 +1110,9 @@ pub const SQLiteStmt = struct {
 
 pub const PostgresStmt = struct {
     conn: ?*libpq_c.PGconn,
-    name: []const u8,
+    /// NUL-terminated: libpq takes the statement name as a C string, and the
+    /// sentinel is part of the type so `free` releases the whole allocation.
+    name: [:0]u8,
     allocator: std.mem.Allocator,
 
     pub fn prepare(conn: ?*libpq_c.PGconn, allocator: std.mem.Allocator, sql: []const u8) !PostgresStmt {
@@ -1133,31 +1135,49 @@ pub const PostgresStmt = struct {
     fn execParamsPrepared(self: *PostgresStmt, args: []const Value) ?*libpq_c.PGresult {
         if (self.conn == null) return null;
         const paramValues = self.allocator.alloc(?[*]const u8, args.len) catch return null;
+        defer self.allocator.free(paramValues);
+        const paramLengths = self.allocator.alloc(c_int, args.len) catch return null;
+        defer self.allocator.free(paramLengths);
+        // int/float args are rendered to text; `owned` tracks those buffers so
+        // they can be freed once libpq has consumed the parameters.
+        const owned = self.allocator.alloc(?[]u8, args.len) catch return null;
+        defer {
+            for (owned) |o| {
+                if (o) |s| self.allocator.free(s);
+            }
+            self.allocator.free(owned);
+        }
+        @memset(owned, null);
+
         for (args, 0..) |arg, i| {
             paramValues[i] = switch (arg) {
                 .null => null,
                 .int => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch {
-                        self.allocator.free(paramValues);
-                        return null;
-                    };
+                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
+                    owned[i] = s;
+                    paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
                 .float => |v| blk: {
-                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch {
-                        self.allocator.free(paramValues);
-                        return null;
-                    };
+                    const s = std.fmt.allocPrint(self.allocator, "{d}", .{v}) catch return null;
+                    owned[i] = s;
+                    paramLengths[i] = @intCast(s.len);
                     break :blk @ptrCast(s.ptr);
                 },
-                .string => |v| @ptrCast(v.ptr),
-                .bool => |v| if (v) @ptrCast("t") else @ptrCast("f"),
+                .string => |v| blk: {
+                    // Strings are not necessarily NUL-terminated, so explicit
+                    // lengths are passed instead of relying on a terminator.
+                    paramLengths[i] = @intCast(v.len);
+                    break :blk @ptrCast(v.ptr);
+                },
+                .bool => |v| blk: {
+                    paramLengths[i] = 1;
+                    break :blk if (v) @ptrCast("t") else @ptrCast("f");
+                },
             };
         }
         // `self.name` is stored NUL-terminated by `prepare`.
-        const res = libpq_c.PQexecPrepared(self.conn, self.name.ptr, @intCast(args.len), @ptrCast(paramValues.ptr), null, null, 0);
-        self.allocator.free(paramValues);
-        return res;
+        return libpq_c.PQexecPrepared(self.conn, self.name.ptr, @intCast(args.len), @ptrCast(paramValues.ptr), @ptrCast(paramLengths.ptr), null, 0);
     }
 
     fn queryFn(ptr: *anyopaque, allocator: std.mem.Allocator, args: []const Value) errors.ResultT(Rows) {
@@ -1197,8 +1217,9 @@ pub const PostgresStmt = struct {
                 if (libpq_c.PQgetisnull(res, @intCast(r), @intCast(c)) == 1) {
                     values[c] = null;
                 } else {
-                    const val = std.mem.span(libpq_c.PQgetvalue(res, @intCast(r), @intCast(c)));
-                    values[c] = .{ .string = allocator.dupe(u8, val) catch return error.DatabaseError };
+                    const text = std.mem.span(libpq_c.PQgetvalue(res, @intCast(r), @intCast(c)));
+                    const kind = pgValueKind(PQftype(res, @intCast(c)));
+                    values[c] = valueFromText(allocator, text, kind) catch return error.DatabaseError;
                 }
             }
             rows_list.append(allocator, .{ .allocator = allocator, .columns = columns, .values = values }) catch return error.DatabaseError;
@@ -1271,10 +1292,13 @@ pub const MySqlStmt = struct {
             for (field_names) |f| allocator.free(f);
             allocator.free(field_names);
         }
+        const field_kinds = allocator.alloc(ColKind, n_cols) catch return error.DatabaseError;
+        defer allocator.free(field_kinds);
         for (0..n_cols) |c| {
             const field = libmysql_c.mysql_fetch_field(res) orelse return error.DatabaseError;
             const name = std.mem.span(field.name);
             field_names[c] = allocator.dupe(u8, name) catch return error.DatabaseError;
+            field_kinds[c] = mysqlValueKind(field.type, field.flags);
         }
         var rows_list: std.ArrayList(Row) = .empty;
         var success = false;
@@ -1307,8 +1331,8 @@ pub const MySqlStmt = struct {
                     values[c] = null;
                 } else {
                     const len = lengths[c];
-                    const val = row_data.?[c].?[0..len];
-                    values[c] = .{ .string = allocator.dupe(u8, val) catch return error.DatabaseError };
+                    const text = row_data.?[c].?[0..len];
+                    values[c] = valueFromText(allocator, text, field_kinds[c]) catch return error.DatabaseError;
                 }
             }
             rows_list.append(allocator, .{ .allocator = allocator, .columns = columns, .values = values }) catch return error.DatabaseError;
@@ -3404,4 +3428,46 @@ test "mysql live typed column scan" {
     try std.testing.expectEqualStrings("9223372036854775808", rows[1].ubig);
 
     _ = try client.exec("DROP TABLE IF EXISTS zigzero_test_types", &.{});
+}
+
+test "postgres live prepared statement with runtime strings" {
+    try skipUnlessDb("postgres");
+    const allocator = std.testing.allocator;
+
+    const conninfo_default = "host=localhost port=5432 dbname=postgres user=cborli";
+    const conninfo = std.process.Environ.getAlloc(std.testing.environ, allocator, "PGconninfo") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => conninfo_default,
+        else => return err,
+    };
+    defer if (conninfo.ptr != conninfo_default.ptr) allocator.free(conninfo);
+
+    var client = Client.init(allocator, .{ .driver = .postgres, .postgres_conninfo = conninfo });
+    defer client.deinit();
+    try client.connect();
+
+    _ = client.exec("DROP TABLE IF EXISTS zigzero_stmt_probe", &.{}) catch {};
+    _ = try client.exec("CREATE TABLE zigzero_stmt_probe (name TEXT PRIMARY KEY, age BIGINT)", &.{});
+    defer _ = client.exec("DROP TABLE IF EXISTS zigzero_stmt_probe", &.{}) catch {};
+
+    var insert = try client.prepare("INSERT INTO zigzero_stmt_probe (name, age) VALUES ($1, $2)");
+    defer insert.close();
+
+    // Both parameters are assembled at runtime, so neither pointer is
+    // NUL-terminated — the case that used to be read past the end.
+    const name = try std.fmt.allocPrint(allocator, "al{d:0>3}", .{@as(u32, 42)});
+    defer allocator.free(name);
+    const affected = try insert.exec(&.{ .{ .string = name }, .{ .int = 7 } });
+    try std.testing.expectEqual(@as(u64, 1), affected.rows_affected);
+
+    var select = try client.prepare("SELECT name, age FROM zigzero_stmt_probe WHERE name = $1");
+    defer select.close();
+
+    const Row2 = struct { name: []const u8, age: i64 };
+    var rows = try select.query(allocator, &.{.{ .string = name }});
+    defer rows.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rows.rows.len);
+    const scanned = try rows.rows[0].scan(allocator, Row2);
+    defer freeScanned(allocator, Row2, scanned);
+    try std.testing.expectEqualStrings("al042", scanned.name);
+    try std.testing.expectEqual(@as(i64, 7), scanned.age);
 }
