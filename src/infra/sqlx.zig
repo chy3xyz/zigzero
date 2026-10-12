@@ -228,9 +228,10 @@ fn valueToType(allocator: std.mem.Allocator, comptime T: type, val: Value) !T {
 /// type. `uint` is `int` for unsigned columns, which are parsed as `u64` first
 /// so a value above `i64` max degrades to `.string` instead of failing.
 ///
-/// `numeric` / `DECIMAL` map to `.float` because `Value` has no exact-decimal
-/// variant; a money column that needs exactness must be cast to text in the
-/// query and scanned into `[]const u8`.
+/// `numeric` / `DECIMAL` map to `.string`: fixed-point values do not survive a
+/// round trip through `f64`, so the exact digits the server sent are kept and a
+/// money column is scanned into `[]const u8` (this mirrors the reference driver,
+/// which decodes `numeric` into its decimal text form for the same reason).
 const ColKind = enum { int, uint, float, boolean, string };
 
 /// Drivers that speak the text protocol return every non-null column as text.
@@ -481,7 +482,9 @@ fn pgValueKind(oid: c_uint) ColKind {
     return switch (oid) {
         pg_oid_bool => .boolean,
         pg_oid_int2, pg_oid_int4, pg_oid_int8 => .int,
-        pg_oid_float4, pg_oid_float8, pg_oid_numeric => .float,
+        pg_oid_float4, pg_oid_float8 => .float,
+        // Exact digits, never an f64 round trip.
+        pg_oid_numeric => .string,
         pg_oid_text, pg_oid_varchar, pg_oid_bpchar => .string,
         else => .string,
     };
@@ -799,9 +802,11 @@ fn mysqlValueKind(field_type: c_int, flags: c_uint) ColKind {
         => if (unsigned) .uint else .int,
         libmysql_c.MYSQL_TYPE_FLOAT,
         libmysql_c.MYSQL_TYPE_DOUBLE,
+        => .float,
+        // Exact digits, never an f64 round trip.
         mysql_type_newdecimal,
         mysql_type_decimal,
-        => .float,
+        => .string,
         libmysql_c.MYSQL_TYPE_STRING,
         libmysql_c.MYSQL_TYPE_VAR_STRING,
         libmysql_c.MYSQL_TYPE_VARCHAR,
@@ -3225,14 +3230,15 @@ test "postgres live typed column scan" {
     );
 
     // id -> int8, hits -> int4, small -> int2, score -> float8, ratio -> float4,
-    // amount -> numeric, active -> bool, name/tag/code -> text, created -> timestamptz.
+    // amount -> numeric (kept as its exact text), active -> bool,
+    // name/tag/code -> text, created -> timestamptz.
     const Typed = struct {
         id: i64,
         hits: i64,
         small: i64,
         score: f64,
         ratio: f64,
-        amount: f64,
+        amount: []const u8,
         active: bool,
         name: []const u8,
         tag: []const u8,
@@ -3269,7 +3275,8 @@ test "postgres live typed column scan" {
     try std.testing.expectEqual(@as(i64, 3), one.small);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), one.score, 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), one.ratio, 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 12.5), one.amount, 0.000001);
+    // NUMERIC(10,2) comes back with the scale the server produced, losslessly.
+    try std.testing.expectEqualStrings("12.50", one.amount);
     try std.testing.expect(one.active);
     try std.testing.expectEqualStrings("Alice", one.name);
     try std.testing.expectEqualStrings("beta", one.tag);
@@ -3291,7 +3298,7 @@ test "postgres live typed column scan" {
     try std.testing.expectEqual(@as(i64, 0), rows[1].hits);
     try std.testing.expectEqual(@as(i64, -5), rows[1].small);
     try std.testing.expectApproxEqAbs(@as(f64, -2.75), rows[1].score, 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.01), rows[1].amount, 0.000001);
+    try std.testing.expectEqualStrings("0.01", rows[1].amount);
     try std.testing.expect(!rows[1].active);
     try std.testing.expectEqualStrings("Bob", rows[1].name);
     try std.testing.expectEqualStrings("gamma", rows[1].tag);
@@ -3362,7 +3369,7 @@ test "mysql live typed column scan" {
         ubig: []const u8,
         score: f64,
         ratio: f64,
-        amount: f64,
+        amount: []const u8,
         active: bool,
         name: []const u8,
         tag: []const u8,
@@ -3401,7 +3408,8 @@ test "mysql live typed column scan" {
     try std.testing.expectEqualStrings("18446744073709551615", one.ubig);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), one.score, 0.000001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), one.ratio, 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 12.5), one.amount, 0.000001);
+    // DECIMAL(10,2) comes back with the scale the server produced, losslessly.
+    try std.testing.expectEqualStrings("12.50", one.amount);
     try std.testing.expect(one.active);
     try std.testing.expectEqualStrings("Alice", one.name);
     try std.testing.expectEqualStrings("beta", one.tag);
@@ -3421,7 +3429,7 @@ test "mysql live typed column scan" {
     try std.testing.expectEqual(@as(i64, 0), rows[1].hits);
     try std.testing.expectEqual(@as(i64, -5), rows[1].small);
     try std.testing.expectApproxEqAbs(@as(f64, -2.75), rows[1].score, 0.000001);
-    try std.testing.expectApproxEqAbs(@as(f64, 0.01), rows[1].amount, 0.000001);
+    try std.testing.expectEqualStrings("0.01", rows[1].amount);
     try std.testing.expect(!rows[1].active);
     try std.testing.expectEqualStrings("Bob", rows[1].name);
     try std.testing.expectEqualStrings("gamma", rows[1].tag);
