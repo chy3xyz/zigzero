@@ -76,7 +76,10 @@ jobs:
       - name: zgctl new + build template project
         run: |
           zig-out/bin/zgctl new smoke-app .tmp-smoke/smoke-app
-          sed -i 's|\.url = ".*",|.path = "../..",|' .tmp-smoke/smoke-app/build.zig.zon          cd .tmp-smoke/smoke-app && zig build
+          sed -i 's|\.url = ".*",|.path = "../..",|' .tmp-smoke/smoke-app/build.zig.zon
+          cd .tmp-smoke/smoke-app && zig build
+
+  test-db:
     name: DB tests (${{ matrix.db }})
     strategy:
       fail-fast: false
