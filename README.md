@@ -56,7 +56,7 @@ zig build
 .{
     .dependencies = .{
         .zigzero = .{
-            .url = "https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz",
+            .url = "https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.4.tar.gz",
             .hash = "<zig will print the expected hash after first fetch>",
         },
     },

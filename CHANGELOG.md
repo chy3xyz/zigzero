@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.4] - 2026-10-12
+
+Security and correctness release. Four security holes are closed: an auth
+bypass through the response cache, unchecked JWT expiry, an out-of-bounds
+crash on a malformed signature, and unescaped MySQL argument interpolation.
+Several subsystems that reported success without measuring anything now do
+real work — the adaptive load shedder, the health probes, the load balancer
+and the HTTP client's timeouts — and the ORM placeholder plus the fake MySQL
+prepared-statement path are replaced with real implementations on top of sqlx.
+
+Behaviour worth knowing before upgrading: `NUMERIC`/`DECIMAL` columns now
+arrive as exact text rather than an `f64` (a money column no longer loses
+digits), MySQL's `prepare()` uses server-side prepared statements, an unset
+integer primary key is generated with `RETURNING` on PostgreSQL, and
+`RouteGroup` supports nesting. The documentation was corrected against the
+source and is now published as a site built by zdoc.
 
 ### Security
 - **`server/middleware` response cache served authenticated responses to anonymous callers**: entries are keyed by path and query alone and are replayed *before* a route's auth middleware runs, so one authorized `GET /admin` made that body public until the TTL expired. Requests carrying `Authorization`, `Proxy-Authorization` or `Cookie` (case-insensitive) are no longer cached, and are never served from cache
@@ -32,27 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`net/http` client timeouts and retries were decorative**: `timeout_ms` and `retries` were never used, so a stalled peer hung the caller forever, and the status line was parsed at a fixed offset. Connect, write and read now share one absolute per-attempt deadline enforced through `std.Io.operateTimeout` (poll, 1 ms granularity), retries run through `infra/retry`'s backoff, and the status line is parsed properly (`error.InvalidStatusLine` on malformed input). `https://` is rejected with `error.HttpsNotSupported` instead of being silently attempted
 - **`net/api` `bindJson` returned dangling slices**: it parsed with `parseFromSlice` and freed the arena in a `defer` before returning, so any `T` with slice fields pointed at freed memory; it now parses into the request arena
 - **Six documented APIs had never compiled** (they were unreachable from any built binary, so the compiler never checked them; each is now called from a test):
-  - **`server/static`**: `Server.handler()` captured a runtime local in an inner function, which Zig rejects — every call site was a compile error. It now reaches its `Server` through the route's `user_data`. Its 0.17 file APIs were stale too (`realPathFile`, `readFileAlloc`, `statFile`), and the traversal guard accepted a sibling directory that merely shared the root's prefix (`<root>-evil`), which is now rejected
-  - **`config`**: `loadYaml` / `loadJson` / `Watcher.hasChanged` passed no `io` to `openFile`/`statFile` and used the removed `readToEndAlloc`; both loaders now also give the caller uniform ownership of every string (`Loader.freeConfig`), so a field absent from the source is no longer a static default that crashes on free
-  - **`net/gateway`**: `registerRoute` did not compile, because `StringHashMap.get` hands back a *copy* of the upstream and `pickEndpoint` needs the map's own value — which also means the round-robin state was being discarded. It uses `getPtr` now, and the per-route `RouteConfig` allocations it leaked are freed by `Gateway.deinit()`
-  - **`infra/redis`**: `hSet` returned `0` from a function declared `!bool`
-  - **`net/api`**: `RouteGroup` had no way to attach state, so grouped handlers could not use `user_data` at all; added `withUserData(?*anyopaque)`
-  - **`examples/chy3`**: a grouped route was registered without `user_data` (its handler unwrapped the null pointer, so the route panicked) and `/api/v1/worlds/stats` handed an `AppContext` handler a bare registry pointer (type confusion). Both fixed and verified against a running server; the two dead helpers in the example are gone
-
-### Added
-- Tests for every fix above (escaping, expiry, wrong-length signature, cache credential isolation, cache eviction hook, close-frame truncation, jitter edge cases, RESP frame bytes, config defaults, recovery, request timeout, CPU sampling, health probes, weighted distribution, consistent-hash remapping, HTTP timeouts and retries)
-
-- **The documentation now builds as a published site**: `docs/` is rendered by [zdoc](https://github.com/chy3xyz/zdoc) — a pinned static binary, no Node and no site config — and deployed to GitHub Pages by `.github/workflows/docs.yml`, which also fails on an unresolved link. Each section (`getting-started/`, `guides/`, `architecture/`, `examples/`) gained an index page: they are useful landing pages, and zdoc resolves a bare `name.md` sibling link only when the directory has an index page — without them 32 links in the guides were unreachable
-
-### Changed
-- **Documentation corrected against the real source**: the guides described a pre-0.17 API surface and, in several places, APIs that never existed (circuit breaker `execute*`, `TokenBucket.init(allocator, .{...})`, `ctx.getRequestId()`, `ctx.remote_addr`, `config.loadFromYamlFile`, redis `Client.init(allocator, .{...})`, JWT claims with `role`/`iss`/`aud`, `limiter.GlobalLimiter`, …). Every sample in `README.md`, `docs/getting-started`, `docs/guides` and `docs/architecture` was checked against the source and the fabricated APIs replaced with the real ones; removed-in-0.17 std symbols (`GeneralPurposeAllocator`, `std.time.timestamp`, `std.Thread.sleep`) and missing `compat.initIo` calls were fixed throughout
-- **README framing**: the "production-ready" claim is replaced with an honest pre-1.0/beta statement naming the placeholder (`data/orm`), the stub (`net/tls`) and the experimental modules
-
-### Added
-- **Router wildcards**: a trailing `*name` (or bare `*`) captures the rest of the path, separators included, so `/*file` covers a whole tree in one route. Precedence is exact segment > `:param` > wildcard; a wildcard must be the last segment and cannot share a node with a `:param` (the registration is rejected with `error.InvalidRoute` because their match sets overlap). `MatchedRoute` gained a `deinit` for its captured parameters
-- `examples/api-server` serves its `public/` directory through the wildcard route, which is also the end-to-end path for the feature
-
-### Fixed (this batch)
 - **`net/api` leaked parameters when a match failed midway**: once a `:param` had been bound, every bail-out path called `params.deinit()` without freeing the keys and values it held
 - **`net/http`'s large-body write could outlive its deadline**: `std.Io`'s write helper polls for writability and then performs a *blocking* `send`, which sits in the kernel until the peer reads — unbounded once the socket buffer fills, so the deadline never fired (a test showed the call returning only when the stalled peer closed the connection). Writes now go through a non-blocking `send` with `EAGAIN` retried under our own `poll` deadline, and the socket's blocking mode is restored afterwards for the read path
 - **`net/tls` claimed to be available**: `isAvailable()` returned true unconditionally while nothing implements a handshake, so a caller gating HTTPS on it would have served plaintext. It now reports false, and the module states that it only loads certificate files
@@ -62,13 +56,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`infra/sqlx` PostgreSQL and MySQL returned every column as `.string`**: `sqlx.valueToType` could therefore not scan into `i64`/`f64`/`bool`, so `queryRow`/`queryRows` — and the ORM on those drivers — failed unless every field was a string. Both drivers now read the column metadata (`PQftype` OIDs; `MYSQL_FIELD.type` plus the unsigned flag) and build the matching `Value`, falling back to `.string` when the text does not parse. The same treatment applies to the prepared-statement paths, and the PostgreSQL statement paths also had two defects of their own: `execParamsPrepared` passed `null` lengths for parameters that are not NUL-terminated, and the prepared-statement name was freed with a length mismatch (the sentinel byte was not accounted for). Verified against live PostgreSQL and MySQL; the PostgreSQL parameter leak (`execParams` never freed the rendered int/float arguments) was fixed in the same pass
 - **`data/orm` ignored a declared primary key**: `getPrimaryKey` only accepted a field literally named `id` and skipped `pub const primary_key` — the very declaration `zgctl model` emits — so a table keyed on anything else failed with `error.NoPrimaryKey`. The declaration now wins, with the `id` convention as the fallback, and `orm.Config` exposes `postgres_conninfo` for the connection-string form
 - **`tools/zgctl` mapped almost every DDL column to `[]const u8`**: the type mapping compared lowercase names against the raw SQL token, so the uppercase DDL everyone writes (`INT`, `VARCHAR(255)`) matched nothing and fell through to a string; `SERIAL`/`BIGSERIAL` were missing from the integer family entirely, so a PostgreSQL primary key became a string. Types are matched case-insensitively now, the family lists cover the common SQL names (`serial`, `int2/int4/int8`, `real`, `money`, `uuid`, `json`, `bytea`, …), and date/time columns are documented as read-back-as-text. A generated model was compiled and run against sqlite (insert → findOne → findAll) to confirm the typed fields round-trip
-
 - **`infra/sqlx` MySQL's "prepared statement" path was not one**: `Client.prepare` returned a handle that rebuilt an interpolated string and ran `mysql_real_query`, so the only thing standing between a caller's data and the server was `formatQuery`'s escaping. Statements are now really prepared server-side (`mysql_stmt_prepare`) with parameters bound as typed `MYSQL_BIND` buffers and result columns bound and fetched through `mysql_stmt_fetch`, decoded by the same column metadata as the text path. A column larger than the fetch buffer is re-read at the length the server reports (`mysql_stmt_fetch_column`), and a statement the server refuses to prepare falls back to the text path. The `mysql_stmt_*` bindings and the `MYSQL_BIND` layout were verified field by field against the installed `mariadb_stmt.h`
 - **`data/orm` `create` can now fill a generated key on PostgreSQL too**: the driver reports no last-insert-id, so an unset integer key is obtained with `RETURNING <pk>`. A caller-supplied key is still never overwritten
 - **`net/api` route groups can nest**: `RouteGroup.group(prefix)` extends the parent prefix and inherits its middleware and `user_data`; the combined prefix is owned by the `Server`
 - **Fixed-point columns stay exact**: `NUMERIC`/`DECIMAL` mapped to `.float`, so a money column silently lost digits; they now map to `.string` (what the reference driver does with `numeric`), preserving the digits and scale the server sent
 
+### Added
+- Tests for every fix above (escaping, expiry, wrong-length signature, cache credential isolation, cache eviction hook, close-frame truncation, jitter edge cases, RESP frame bytes, config defaults, recovery, request timeout, CPU sampling, health probes, weighted distribution, consistent-hash remapping, HTTP timeouts and retries)
+- **The documentation now builds as a published site**: `docs/` is rendered by [zdoc](https://github.com/chy3xyz/zdoc) — a pinned static binary, no Node and no site config — and deployed to GitHub Pages by `.github/workflows/docs.yml`, which also fails on an unresolved link. Each section (`getting-started/`, `guides/`, `architecture/`, `examples/`) gained an index page: they are useful landing pages, and zdoc resolves a bare `name.md` sibling link only when the directory has an index page — without them 32 links in the guides were unreachable
+- **Router wildcards**: a trailing `*name` (or bare `*`) captures the rest of the path, separators included, so `/*file` covers a whole tree in one route. Precedence is exact segment > `:param` > wildcard; a wildcard must be the last segment and cannot share a node with a `:param` (the registration is rejected with `error.InvalidRoute` because their match sets overlap). `MatchedRoute` gained a `deinit` for its captured parameters
+- `examples/api-server` serves its `public/` directory through the wildcard route, which is also the end-to-end path for the feature
+
 ### Changed
+- **Documentation corrected against the real source**: the guides described a pre-0.17 API surface and, in several places, APIs that never existed (circuit breaker `execute*`, `TokenBucket.init(allocator, .{...})`, `ctx.getRequestId()`, `ctx.remote_addr`, `config.loadFromYamlFile`, redis `Client.init(allocator, .{...})`, JWT claims with `role`/`iss`/`aud`, `limiter.GlobalLimiter`, …). Every sample in `README.md`, `docs/getting-started`, `docs/guides` and `docs/architecture` was checked against the source and the fabricated APIs replaced with the real ones; removed-in-0.17 std symbols (`GeneralPurposeAllocator`, `std.time.timestamp`, `std.Thread.sleep`) and missing `compat.initIo` calls were fixed throughout
+- **README framing**: the "production-ready" claim is replaced with an honest pre-1.0/beta statement naming the placeholder (`data/orm`), the stub (`net/tls`) and the experimental modules
 - **`data/orm` is no longer a placeholder**: `Pool` now owns a real `sqlx.Client`, `Connection.query`/`execute` return real rows and row counts, `Transaction` delegates to sqlx, and `Crud(T).findById/findAll/create/update/delete` build and execute real SQL from the `Model(T)` metadata (driver-appropriate placeholders; `create` fills in the generated key where the driver reports one). `Pool.freeScanned`/`deinitRows` are the matching release helpers. Driver limits are documented in the file: PostgreSQL/MySQL still hand every column back as `.string` from sqlx, so scanning into `i64`/`f64`/`bool` fails there, and PostgreSQL cannot report a generated key
 
 ## [0.2.3] - 2026-10-10

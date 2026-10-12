@@ -13,7 +13,7 @@
 
 const std = @import("std");
 
-pub const version = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 3 };
+pub const version = std.SemanticVersion{ .major = 0, .minor = 2, .patch = 4 };
 pub const name = "zigzero";
 pub const compat = @import("compat.zig");
 
@@ -69,7 +69,7 @@ pub const svc = @import("svc.zig");
 test "zigzero version" {
     try std.testing.expectEqual(@as(u32, 0), version.major);
     try std.testing.expectEqual(@as(u32, 2), version.minor);
-    try std.testing.expectEqual(@as(u32, 3), version.patch);
+    try std.testing.expectEqual(@as(u32, 4), version.patch);
 }
 
 comptime {

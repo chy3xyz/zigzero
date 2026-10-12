@@ -148,7 +148,7 @@ DB=mysql zig build test
 
 ```bash
 cd your-project
-zig fetch https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz
+zig fetch https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.4.tar.gz
 ```
 
 Then add to `build.zig.zon`:
@@ -157,7 +157,7 @@ Then add to `build.zig.zon`:
 .{
     .dependencies = .{
         .zigzero = .{
-            .url = "https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz",
+            .url = "https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.4.tar.gz",
             .hash = "1220...",  # zig fetch will fill this in
         },
     },

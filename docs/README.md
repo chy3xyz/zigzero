@@ -115,7 +115,7 @@ pub fn main() !void {
 
 ```bash
 # Add to build.zig.zon
-zig fetch https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz
+zig fetch https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.4.tar.gz
 ```
 
 ```zig
@@ -123,7 +123,7 @@ zig fetch https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz
 .{
     .dependencies = .{
         .zigzero = .{
-            .url = "https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz",
+            .url = "https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.4.tar.gz",
             .hash = "<hash>",
         },
     },
