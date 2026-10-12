@@ -19,13 +19,12 @@ pub const Context = struct {
     key_pem: []const u8,
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Context {
-        const cert_file = try compat.cwd().openFile(config.cert_file, .{});
-        defer cert_file.close();
-        const cert_pem = try cert_file.readToEndAlloc(allocator, 1024 * 1024);
+        const cert_pem = try compat.cwd().readFileAlloc(compat.io(), config.cert_file, allocator, .limited(1024 * 1024));
 
-        const key_file = try compat.cwd().openFile(config.key_file, .{});
-        defer key_file.close();
-        const key_pem = try key_file.readToEndAlloc(allocator, 1024 * 1024);
+        const key_pem = compat.cwd().readFileAlloc(compat.io(), config.key_file, allocator, .limited(1024 * 1024)) catch |err| {
+            allocator.free(cert_pem);
+            return err;
+        };
 
         return .{
             .allocator = allocator,
@@ -53,8 +52,27 @@ pub fn loadCertificates(allocator: std.mem.Allocator, cert_path: []const u8, key
     });
 }
 
-test "tls config" {
-    // This test would need actual cert files
-    // Skip in CI
-    if (true) return error.SkipZigTest;
+test "tls context loads certificate and key files" {
+    const allocator = std.testing.allocator;
+    const dir = ".test-tls";
+    compat.cwd().deleteTree(compat.io(), dir) catch {};
+    try compat.cwd().createDirPath(compat.io(), dir);
+    defer compat.cwd().deleteTree(compat.io(), dir) catch {};
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dir ++ "/cert.pem", .data = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n" });
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dir ++ "/key.pem", .data = "-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n" });
+
+    var ctx = try Context.init(allocator, .{
+        .cert_file = dir ++ "/cert.pem",
+        .key_file = dir ++ "/key.pem",
+    });
+    defer ctx.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, ctx.cert_pem, "BEGIN CERTIFICATE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ctx.key_pem, "BEGIN PRIVATE KEY") != null);
+
+    // A missing key file must not leak the certificate it already read.
+    try std.testing.expectError(error.FileNotFound, Context.init(allocator, .{
+        .cert_file = dir ++ "/cert.pem",
+        .key_file = dir ++ "/missing.pem",
+    }));
 }

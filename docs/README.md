@@ -1,6 +1,6 @@
 # ZigZero Documentation
 
-Welcome to the ZigZero documentation! This is your complete guide to building production-ready microservices with Zig.
+Welcome to the ZigZero documentation! This is your guide to building microservices with Zig on top of ZigZero, a pre-1.0 / beta framework. The HTTP server, middleware, and governance modules are stable; the ORM is a placeholder with no real DB driver yet, and `net/tls` only loads certificates.
 
 ## 📚 Documentation Overview
 
@@ -74,17 +74,24 @@ zigzero/
 ## 🚀 Quick Example
 
 ```zig
+const std = @import("std");
 const zigzero = @import("zigzero");
 const api = zigzero.api;
+const compat = zigzero.compat;
 const log = zigzero.log;
 const middleware = zigzero.middleware;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // The server requires the global Io backend to be initialised first.
+    compat.initIo(allocator);
+    defer compat.deinitIo();
 
     const logger = log.Logger.new(.info, "my-service");
-    var server = api.Server.init(gpa.allocator(), 8080, logger);
+    var server = api.Server.init(allocator, 8080, logger);
     defer server.deinit();
 
     try server.addMiddleware(middleware.requestId());

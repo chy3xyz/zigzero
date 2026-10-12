@@ -200,7 +200,7 @@ pub fn main() !void {
 
     // ---- Domain 3: 世界域 (World Domain) ---------------------------------
     {
-        var g = server.group("/api/v1/worlds");
+        var g = server.group("/api/v1/worlds").withUserData(&app);
         try server.addRoute(.{
             .method = .POST,
             .path = "/api/v1/worlds/create",
@@ -227,7 +227,7 @@ pub fn main() !void {
             .method = .GET,
             .path = "/api/v1/worlds/stats",
             .handler = world.handleWorldStats,
-            .user_data = infra_middleware.metricsUserData(&registry),
+            .user_data = &app,
         });
     }
 

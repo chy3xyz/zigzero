@@ -8,7 +8,7 @@
 
 ## Overview
 
-ZigZero is a high-performance microservice framework written in pure Zig, inspired by [go-zero](https://github.com/zeromicro/go-zero). It provides production-ready building blocks for microservices with zero-cost abstractions where possible.
+ZigZero is a high-performance microservice framework written in pure Zig, inspired by [go-zero](https://github.com/zeromicro/go-zero). It is **pre-1.0 / beta** software: the HTTP server, middleware, and service-governance modules are stable and covered by tests, but some parts are still placeholders — the ORM has no real database driver yet, and `net/tls` only loads certificates. Treat it as a foundation to build on, not a turnkey production stack.
 
 **Key design principles:**
 - **go-zero compatibility** — Familiar API patterns for developers coming from Go
@@ -20,9 +20,9 @@ ZigZero is a high-performance microservice framework written in pure Zig, inspir
 
 | Category | Modules | Description |
 |----------|---------|-------------|
-| **Network** | `api`, `http`, `rpc`, `websocket`, `gateway`, `tls` | HTTP server/client, binary RPC, WebSocket, API gateway, TLS |
+| **Network** | `api`, `http`, `rpc`, `websocket`, `gateway`, `tls` | HTTP server/client, binary RPC, WebSocket, API gateway, TLS 🚧 experimental (certificate loading only) |
 | **Service Governance** | `breaker`, `limiter`, `loadbalancer`, `load` | Circuit breaker, rate limiting, load balancing, adaptive shedding |
-| **Data** | `sqlx`, `redis`, `orm`, `cache` | Unified SQL client, Redis, ORM query builder, LRU cache |
+| **Data** | `sqlx`, `redis`, `orm`, `cache` | Unified SQL client, Redis, ORM 🚧 placeholder (no real DB driver yet), LRU cache |
 | **Infrastructure** | `log`, `config`, `trace`, `metric`, `health` | Structured logging, config loading, tracing, metrics |
 | **Async** | `pool`, `fx`, `mapreduce`, `threading` | Connection pooling, streams, map/reduce, goroutine-style threading |
 | **Reliability** | `retry`, `lock`, `lifecycle`, `mq`, `cron` | Retry, distributed locks, graceful shutdown, message queue, scheduling |
@@ -68,11 +68,17 @@ zig build
 const std = @import("std");
 const zigzero = @import("zigzero");
 const api = zigzero.api;
+const compat = zigzero.compat;
 const log = zigzero.log;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // The server requires the global Io backend to be initialised first.
+    compat.initIo(allocator);
+    defer compat.deinitIo();
 
     const logger = log.Logger.new(.info, "my-service");
     var server = api.Server.init(allocator, 8080, logger);
@@ -83,7 +89,7 @@ pub fn main() !void {
         .path = "/health",
         .handler = struct {
             fn handle(ctx: *api.Context) !void {
-                try ctx.json(200, .{.status = "ok"});
+                try ctx.jsonStruct(200, .{ .status = "ok" });
             }
         }.handle,
     });

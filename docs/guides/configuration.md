@@ -4,87 +4,147 @@ ZigZero 提供灵活的配置系统，支持 YAML、JSON、环境变量和代码
 
 ## 配置加载
 
+加载函数都是泛型的，`T` 由调用方指定；第一个参数是类型，第二个是分配器：
+
+```zig
+pub fn loadYaml(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !T
+pub fn loadJson(comptime T: type, allocator: std.mem.Allocator, path: []const u8) !T
+pub fn loadEnv(comptime T: type, allocator: std.mem.Allocator, prefix: []const u8) !T
+```
+
+也可以用 `config.Loader`：
+
+```zig
+pub const Loader = struct {
+    pub fn init(allocator: std.mem.Allocator) Loader;
+    pub fn loadJson(self: Loader, comptime T: type, path: []const u8) !T;
+    pub fn loadYaml(self: Loader, comptime T: type, path: []const u8) !T;
+    pub fn parseJson(self: Loader, comptime T: type, content: []const u8) !T;
+    pub fn parseYaml(self: Loader, comptime T: type, content: []const u8) !T;
+    pub fn loadEnv(self: Loader, comptime T: type, prefix: []const u8) !T;
+};
+```
+
+> **所有权约定**：按路径加载（`loadYaml` / `loadJson` / `loadEnv`，含 `Loader` 上的同名方法与 `Watcher.reload`）返回的配置里，每个字符串都由 loader 的 allocator 持有，释放时调用 `Loader.freeConfig(T, &cfg)`（例如 `config.Loader.init(alloc).freeConfig(MyConfig, &cfg)`），**不要手工 `free` 单个字段**——它会递归处理嵌套结构体与字符串数组。`parseYaml` / `parseJson` 接收的 `content` 参数仍由调用方自己读取和释放。
+
 ### 从 YAML 文件
 
 ```yaml
 # config.yaml
-server:
-  port: 8080
-  workers: 4
-  read_timeout_ms: 30_000
-  write_timeout_ms: 30_000
+name: my-service
+port: 8080
 
-database:
-  host: localhost
-  port: 5432
-  name: myapp
-  max_connections: 10
+log:
+  service_name: my-service
+  level: info
+  mode: console
 
 redis:
-  address: 127.0.0.1:6379
+  host: 127.0.0.1
+  port: 6379
   db: 0
 
-logging:
-  level: info
-  file: /var/log/myapp.log
+mysql:
+  host: localhost
+  port: 3306
+  database: myapp
+  username: root
+  password: ""
+
+etcd:
+  endpoints:
+    - localhost:2379
+  timeout_sec: 5
 ```
 
 ```zig
+const std = @import("std");
 const zigzero = @import("zigzero");
+const compat = zigzero.compat;
 const config = zigzero.config;
+const api = zigzero.api;
+const log = zigzero.log;
 
 pub fn main() !void {
-    const cfg = try config.loadFromYamlFile("config.yaml");
-    defer cfg.deinit();
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    compat.initIo(allocator);
+    defer compat.deinitIo();
 
-    var server = try api.Server.init(gpa.allocator(), cfg.server.port, logger);
+    const logger = log.Logger.new(.info, "my-service");
+
+    // loadYaml 直接读文件；返回配置里的字符串都由 allocator 持有
+    const cfg = try config.loadYaml(config.Config, allocator, "config.yaml");
+    defer config.Loader.init(allocator).freeConfig(config.Config, &cfg);
+
+    var server = api.Server.init(allocator, cfg.port, logger);
     // ...
 }
 ```
+
+`config.Config` 是框架内置的结构（`name`、`port`、`log`、`redis`、`mysql`、`etcd`）。YAML 解析器是简化子集：支持 `key: value`、按缩进嵌套、`- ` 数组、字符串/数字/布尔/`null`，以及整行 `#` 注释或 ` #` 行尾注释。
 
 ### 从 JSON 文件
 
 ```json
 {
-  "server": { "port": 8080, "workers": 4 },
-  "database": {
-    "host": "localhost",
-    "port": 5432,
-    "name": "myapp"
-  }
+  "host": "127.0.0.1",
+  "port": 6379,
+  "db": 0
 }
 ```
 
 ```zig
-const cfg = try config.loadFromJsonFile("config.json");
+const cfg = try config.loadJson(config.RedisConfig, allocator, "redis.json");
+defer config.Loader.init(allocator).freeConfig(config.RedisConfig, &cfg);
 ```
+
+配置里的字符串字段都由 loader 的 allocator 分配；用 `Loader.freeConfig(T, &cfg)` 统一释放，不要自行 `free` 单个字段。
 
 ### 从环境变量
 
+环境变量用独立的 `loadEnv` 加载，变量名是 `PREFIX_字段名大写`：
+
 ```bash
 export SERVER_PORT=8080
-export DATABASE_HOST=prod-db.example.com
-export DATABASE_PASSWORD=secret
+export SERVER_WORKERS=4
 ```
 
 ```zig
-// config.yaml
-server:
-  port: ${SERVER_PORT:-8080}
-database:
-  host: ${DATABASE_HOST}
-  password: ${DATABASE_PASSWORD}
+const ServerConfig = struct {
+    port: u16 = 8080,
+    workers: u32 = 4,
+};
+
+const cfg = try config.loadEnv(ServerConfig, allocator, "SERVER");
+// 读取 SERVER_PORT / SERVER_WORKERS，未设置的字段保留默认值
 ```
+
+支持的字段类型：整数、浮点、布尔和 `[]const u8`；嵌套结构体在 `loadEnv` 中会编译报错（`Nested structs not supported in env vars`）。
 
 ### 组合配置源
 
-优先级（高到低）：
+框架不做自动合并，优先级由调用方决定。推荐顺序：
 
 ```
-命令行参数 > 环境变量 > YAML/JSON 配置 > 默认值
+命令行参数 > 代码字面量 > 环境变量 > YAML/JSON 配置 > 字段默认值
 ```
+
+YAML 里**不支持** `${VAR}` 插值，请分别加载后再覆盖，例如先 `loadYaml` 再用 `loadEnv` 的结果覆盖需要的字段。
 
 ## 配置结构定义
+
+解析按字段名匹配。支持的类型：
+
+| 类型 | 说明 |
+|------|------|
+| 整数 / 浮点 / 布尔 | 直接转换 |
+| `[]const u8` | 拷贝为分配器持有的字符串 |
+| `?T` | JSON `null` 映射为 `null` |
+| 嵌套 struct | 必须实现 `pub fn fromJson(allocator, json: std.json.Value) !Self` |
+
+字段可以声明默认值；配置文件中缺失的键保留默认值（而不是 `undefined`）。数组字段不在通用解析范围内——需要数组时，在自定义类型的 `fromJson` 里手工处理（参考框架内置的 `EtcdConfig.fromJson`）。
 
 ```zig
 const ServerConfig = struct {
@@ -92,58 +152,56 @@ const ServerConfig = struct {
     workers: u32 = 4,
     read_timeout_ms: u32 = 30_000,
     write_timeout_ms: u32 = 30_000,
-};
 
-const DbConfig = struct {
-    host: []const u8 = "localhost",
-    port: u16 = 5432,
-    name: []const u8,
-    user: []const u8 = "postgres",
-    password: []const u8 = "",
-    max_connections: u32 = 10,
-};
-
-const RedisConfig = struct {
-    address: []const u8 = "127.0.0.1:6379",
-    db: u8 = 0,
-    password: ?[]const u8 = null,
+    // 作为嵌套字段解析时，必须提供 fromJson
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !ServerConfig {
+        _ = allocator;
+        var cfg = ServerConfig{};
+        if (json.object.get("port")) |v| cfg.port = @intCast(v.integer);
+        if (json.object.get("workers")) |v| cfg.workers = @intCast(v.integer);
+        if (json.object.get("read_timeout_ms")) |v| cfg.read_timeout_ms = @intCast(v.integer);
+        if (json.object.get("write_timeout_ms")) |v| cfg.write_timeout_ms = @intCast(v.integer);
+        return cfg;
+    }
 };
 
 const AppConfig = struct {
     server: ServerConfig,
-    database: DbConfig,
-    redis: RedisConfig,
     log_level: []const u8 = "info",
+
+    pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !AppConfig {
+        var cfg = AppConfig{ .server = .{} };
+        if (json.object.get("server")) |v| {
+            cfg.server = try ServerConfig.fromJson(allocator, v);
+        }
+        if (json.object.get("log_level")) |v| {
+            cfg.log_level = try allocator.dupe(u8, v.string);
+        }
+        return cfg;
+    }
 };
 ```
 
 ## 配置验证
 
+加载后手工校验并返回自己的错误：
+
 ```zig
-pub fn loadConfig(path: []const u8) !AppConfig {
-    const raw = try config.loadFromYamlFile(path);
+pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !AppConfig {
+    const cfg = try config.loadYaml(AppConfig, allocator, path);
 
-    const cfg = try std.json.parseFromSlice(
-        AppConfig,
-        raw.allocator,
-        raw.content,
-        .{
-            .ignore_unknown_fields = false,
-            .syntax = .yaml,
-        },
-    );
-
-    // 验证
-    if (cfg.value.server.port < 1024) {
+    if (cfg.server.port < 1024) {
         return error.InvalidPort;
     }
-    if (cfg.value.database.max_connections < 1) {
-        return error.InvalidConnectionLimit;
+    if (cfg.server.workers == 0) {
+        return error.InvalidWorkerCount;
     }
 
-    return cfg.value;
+    return cfg;
 }
 ```
+
+没有内置的校验 / 合并 API（没有 `config.merge`），需要时自行编写。
 
 ## 环境特定配置
 
@@ -151,13 +209,13 @@ pub fn loadConfig(path: []const u8) !AppConfig {
 
 ```bash
 # config.dev.yaml
-database:
+redis:
   host: localhost
 
 # config.prod.yaml
-database:
+redis:
   host: prod-db.internal
-  max_connections: 50
+  pool_size: 50
 ```
 
 ```bash
@@ -168,95 +226,75 @@ database:
 export ZIGZERO_ENV=prod
 ```
 
-### 多环境配置合并
+### 多环境配置
+
+按环境选择文件路径即可，框架不提供跨文件合并：
 
 ```zig
-pub fn loadEnvConfig(env: []const u8) !AppConfig {
-    const base = try config.loadFromYamlFile("config.yaml");
-    const env_override = try config.loadFromYamlFile(
-        try std.fmt.allocPrint(gpa.allocator(), "config.{s}.yaml", .{env}),
-    );
+pub fn configPathForEnv(env: []const u8) []const u8 {
+    return if (std.mem.eql(u8, env, "prod")) "config.prod.yaml" else "config.dev.yaml";
+}
 
-    return try config.merge(base, env_override);
+pub fn loadEnvConfig(allocator: std.mem.Allocator, env: []const u8) !config.Config {
+    const path = configPathForEnv(env);
+    return config.loadYaml(config.Config, allocator, path);
 }
 ```
 
 ## 配置热重载
 
-```zig
-var config_watcher = try config.FileWatcher.init(gpa.allocator(), "config.yaml");
-defer config_watcher.deinit();
+`config.Watcher(T)` 用文件 mtime 轮询检测变化，构造时传分配器、文件路径和轮询间隔（毫秒）：
 
-try config_watcher.onChange(struct {
-    fn reload(new_config: AppConfig) !void {
-        std.debug.print("Config reloaded!\n", .{});
-        try applyNewConfig(new_config);
-    }
-}.reload);
+```zig
+pub fn init(allocator: std.mem.Allocator, file_path: []const u8, interval_ms: u64) !Self
+pub fn deinit(self: *Self) void
+pub fn hasChanged(self: *Self) bool
+pub fn reload(self: *Self) !T
+pub fn watch(self: *Self, callback: *const fn (T) void) !void
+```
+
+没有 `FileWatcher` / `onChange` 这类命名，`interval_ms` 是构造参数而不是通过 `.onChange()` 传入。`init` 会复制 `file_path`，生命周期由 `Watcher` 自己管理（记得 `deinit`）。
+
+轮询式：自己检查变化并按需重载：
+
+```zig
+var watcher = try config.Watcher(AppConfig).init(allocator, "config.yaml", 5000);
+defer watcher.deinit();
+
+if (watcher.hasChanged()) {
+    const cfg = try watcher.reload();
+    defer config.Loader.init(allocator).freeConfig(AppConfig, &cfg);
+    applyNewConfig(cfg);
+}
+```
+
+`reload()` 和 `loadYaml` / `loadJson` 一样，返回配置里每个字符串都由加载器分配；用完必须用 `Loader.freeConfig(T, &cfg)` 释放，不要手工 `free` 单个字段。
+
+`watch(callback)` 是阻塞循环：按 `interval_ms` 轮询，变化时重载并调用回调，通常放到独立线程里跑。回调是普通函数指针 `*const fn (T) void`（不能捕获外层局部变量），它收到的 `cfg` 同样由 watcher 的 allocator 持有：
+
+```zig
+const t = try std.Thread.spawn(.{}, runWatch, .{allocator, &watcher});
+t.detach();
+
+fn runWatch(alloc: std.mem.Allocator, w: *config.Watcher(AppConfig)) void {
+    _ = alloc;
+    w.watch(&onConfigChange) catch |err| std.debug.print("watch failed: {s}\n", .{@errorName(err)});
+}
+
+fn onConfigChange(cfg: AppConfig) void {
+    applyNewConfig(cfg); // cfg 的字符串由 watcher 的 allocator 持有，用完自行 freeConfig
+}
 ```
 
 ## 从代码配置
 
-不使用文件，直接在代码中设置：
+不使用文件，直接构造结构体字面量：
 
 ```zig
-const cfg = AppConfig{
-    .server = .{ .port = 9090, .workers = 2 },
-    .database = .{
-        .host = "localhost",
-        .port = 5432,
-        .name = "testdb",
-        .password = "test",
-    },
-    .redis = .{ .address = "localhost:6379" },
-    .log_level = "debug",
+const cfg = ServerConfig{
+    .port = 9090,
+    .workers = 2,
 };
-```
-
-## 配置示例：完整微服务
-
-```yaml
-# config.yaml
-app:
-  name: user-service
-  env: production
-
-server:
-  port: 8080
-  workers: 8
-
-database:
-  host: ${DB_HOST:-localhost}
-  port: ${DB_PORT:-5432}
-  name: users
-  user: ${DB_USER}
-  password: ${DB_PASSWORD}
-  max_connections: 20
-  ssl: true
-
-redis:
-  address: ${REDIS_ADDR:-localhost:6379}
-  password: ${REDIS_PASSWORD}
-  pool_size: 10
-
-rate_limiting:
-  enabled: true
-  ip_rate: 100
-  ip_burst: 10
-
-circuit_breaker:
-  failure_threshold: 5
-  timeout_ms: 30_000
-
-observability:
-  metrics_enabled: true
-  tracing_enabled: true
-  sample_rate: 0.1
-
-logging:
-  level: ${LOG_LEVEL:-info}
-  format: json
-  output: stdout
 ```
 
 ## 密钥管理
@@ -271,20 +309,20 @@ config.yaml
 
 ```yaml
 # config.yaml.example (不含密钥)
-database:
-  password: ${DB_PASSWORD}
+mysql:
+  password: ""
 redis:
-  password: ${REDIS_PASSWORD}
-jwt:
-  secret: ${JWT_SECRET}
+  password: ""
 ```
 
 ```bash
-# 生产环境变量
-export DB_PASSWORD=actual-secure-password
+# 生产环境变量（变量名 = PREFIX_字段名大写）
+export MYSQL_PASSWORD=actual-secure-password
 export REDIS_PASSWORD=redis-secret
 export JWT_SECRET=your-256-bit-secret
 ```
+
+密钥通过 `config.loadEnv` 读入后覆盖配置字段，或直接作为 `middleware.jwt` 的 secret 参数传入。
 
 ## 下一步
 

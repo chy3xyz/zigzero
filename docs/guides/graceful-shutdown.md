@@ -5,58 +5,129 @@
 ## 核心概念
 
 ```
-SIGTERM/SIGINT  →  停止接收新请求  →  等待处理中请求完成  →  执行关闭钩子  →  退出
+调用 shutdown()（置 running=false） → 停止接收新请求 → run() 退出等待循环 → 逆序执行关闭钩子 → 进程退出
 ```
+
+`lifecycle.Manager` 只提供两部分能力：
+
+1. 一个 `running` 标志和 `run()` 阻塞循环；
+2. 一个钩子列表，在 `run()` 结束时按 LIFO（后注册先执行）顺序调用。
+
+**它不注册任何信号处理器**（源码中只有注释说明这一点）。`SIGTERM` / `SIGINT` 的处理需要应用自己安装，再在处理器里调用 `lc.shutdown()`。
+
+## Manager API
+
+```zig
+pub const Manager = struct {
+    pub fn init(allocator: std.mem.Allocator) Manager;
+    pub fn deinit(self: *Manager) void;
+
+    /// 注册关闭钩子。context 是 *anyopaque，不能传 null。
+    pub fn onShutdown(
+        self: *Manager,
+        name: []const u8,
+        callback: *const fn (*anyopaque) void,
+        context: *anyopaque,
+    ) !void;
+
+    /// 阻塞：轮询 running 标志（每 100ms 一次），退出后执行所有钩子
+    pub fn run(self: *Manager) void;
+
+    /// 请求关闭：仅把 running 置为 false，不执行钩子、不阻塞
+    pub fn shutdown(self: *Manager) void;
+
+    pub fn isRunning(self: *Manager) bool;
+
+    /// 在 interval_ms 内以 10ms 为步长等待，期间检测 running
+    pub fn wait(self: *Manager, interval_ms: u64) void;
+};
+```
+
+没有 `configure(...)`、`getStatus()`、超时配置或信号开关。
 
 ## 基础实现
 
+`api.Server.init` 返回结构体本身（不是 error union），`server.start()` 是阻塞的 accept 循环，因此需要放到独立线程：
+
 ```zig
+const std = @import("std");
 const zigzero = @import("zigzero");
+const compat = zigzero.compat;
+const api = zigzero.api;
+const log = zigzero.log;
 const lifecycle = zigzero.lifecycle;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
+const StopContext = struct {
+    server: *api.Server,
+};
 
-    var lc = lifecycle.Manager.init(gpa.allocator());
+fn stopServer(ctx: *anyopaque) void {
+    const c: *StopContext = @ptrCast(@alignCast(ctx));
+    c.server.stop();
+}
+
+fn serve(server: *api.Server) void {
+    server.start() catch |err| {
+        std.debug.print("server error: {s}\n", .{@errorName(err)});
+    };
+}
+
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+    compat.initIo(allocator);
+    defer compat.deinitIo();
+
+    const logger = log.Logger.new(.info, "my-service");
+
+    var lc = lifecycle.Manager.init(allocator);
     defer lc.deinit();
 
-    var server = try api.Server.init(gpa.allocator(), 8080, logger);
+    var server = api.Server.init(allocator, 8080, logger);
     defer server.deinit();
 
-    // 添加关闭钩子
-    try lc.onShutdown("close-db", struct {
-        fn run(_: *anyopaque) void {
-            std.debug.print("Closing database connections...\n", .{});
-            db.close();
-        }
-    }.run, null);
+    var stop_ctx = StopContext{ .server = &server };
+    try lc.onShutdown("stop-http", stopServer, &stop_ctx);
 
-    try lc.onShutdown("cleanup-tmp", struct {
-        fn run(_: *anyopaque) void {
-            std.debug.print("Cleaning up temp files...\n", .{});
-            cleanupTmp();
-        }
-    }.run, null);
+    // server.start() 阻塞，放入独立线程
+    const server_thread = try std.Thread.spawn(.{}, serve, .{&server});
+    defer server_thread.join();
 
-    try server.start();
-    lc.run();     // 启动信号监听
-    lc.shutdown(); // 阻塞直到所有钩子执行完毕
+    // 在这里由你自己的信号处理器（std.posix.sigaction 等）调用 lc.shutdown()
+    // run() 阻塞到 running=false，然后按 LIFO 执行钩子并返回
+    lc.run();
 }
 ```
 
-## 注册关闭钩子
+如果只是在一段更大的关闭流程里执行钩子，可以不并发，顺序调用即可：
 
-`onShutdown(name, callback, context)`:
+```zig
+lc.shutdown(); // 先置 running=false
+lc.run();      // 立即退出等待循环并执行钩子
+```
+
+## 注册关闭钩子
 
 ```zig
 try lc.onShutdown("resource-name", callback, context);
 ```
 
 参数：
-- `name: []const u8` — 钩子名称，用于日志
-- `callback: fn(*anyopaque) void` — 清理函数
-- `context: ?*anyopaque` — 传递给回调的任意数据
+- `name: []const u8` — 钩子名称（仅用于可读性，框架不打印它）
+- `callback: *const fn (*anyopaque) void` — 清理函数，不能返回错误
+- `context: *anyopaque` — 传给回调的指针；**必须是有效指针，不能是 `null`**
+
+回调忽略 context 时传 `undefined`：
+
+```zig
+try lc.onShutdown("close-db", struct {
+    fn run(_: *anyopaque) void {
+        std.debug.print("Closing database connections...\n", .{});
+        db.close();
+    }
+}.run, undefined);
+```
 
 ### 带上下文的钩子
 
@@ -85,138 +156,120 @@ try lc.onShutdown("close-db-pool", struct {
 
 ### 多个钩子执行顺序
 
-按注册顺序逆序执行（后注册先执行）：
+按注册顺序逆序执行（后注册先执行）。若按 `cleanup-tmp`、`close-db-pool`、`close-server` 的顺序注册，实际执行顺序为：
 
 ```
-1. "cleanup-tmp"
-2. "close-db-pool"
-3. "close-server"
-```
-
-## 信号处理
-
-`lifecycle.Manager` 自动处理：
-
-| 信号 | 行为 |
-|------|------|
-| `SIGTERM` | 优雅关闭（默认） |
-| `SIGINT` | 优雅关闭（Ctrl+C） |
-| `SIGQUIT` | 强制退出 |
-| `SIGKILL` | 强制退出（无法捕获） |
-
-### 自定义信号处理
-
-```zig
-var lc = lifecycle.Manager.init(allocator);
-
-// 启用 SIGHUP 信号处理（重新加载配置）
-try lc.configure(.{ .handle_sighup = true });
-
-try server.start();
-lc.run();
-lc.shutdown();
+1. close-server
+2. close-db-pool
+3. cleanup-tmp
 ```
 
 ## 与 HTTP 服务器集成
 
-### 标准模式
-
-```zig
-var server = try api.Server.init(allocator, 8080, logger);
-defer server.deinit();
-
-try lc.onShutdown("stop-http", struct {
-    fn run(_: *anyopaque) void {
-        server.stop();  // 停止接受新连接
-    }
-}.run, null);
-
-try server.start();
-lc.run();
-lc.shutdown();
-```
-
 ### 等待处理中请求
 
+`compat.sleep` 接收纳秒数（Zig 0.17 移除了 `std.Thread.sleep`）：
+
 ```zig
+var active_requests = std.atomic.Value(u32).init(0);
+
 try lc.onShutdown("drain-requests", struct {
     fn run(_: *anyopaque) void {
         // 等待活跃请求计数归零
         while (active_requests.load(.monotonic) > 0) {
-            std.Thread.sleep(100 * std.time.ns_per_ms);
+            compat.sleep(100 * std.time.ns_per_ms);
         }
     }
-}.run, null);
+}.run, undefined);
 ```
 
-## 典型关闭钩子清单
+### 典型关闭钩子清单
+
+钩子按注册顺序**逆序**执行（LIFO）。因此要让清理按「先停流量 → 再等待 → 最后释放资源」进行，就要按相反顺序注册：
 
 ```zig
-// 1. 停止接受新请求
-try lc.onShutdown("stop-accepting", struct {
-    fn run(_: *anyopaque) void { listener.close(); }
-}.run, null);
-
-// 2. 等待活跃请求完成
-try lc.onShutdown("drain-requests", struct {
-    fn run(_: *anyopaque) void { waitForDrain(); }
-}.run, null);
-
-// 3. 关闭数据库连接
-try lc.onShutdown("close-db", struct {
-    fn run(_: *anyopaque) void { db.close(); }
-}.run, null);
-
-// 4. 关闭 Redis 连接
+// 最后执行 → 最先注册
 try lc.onShutdown("close-redis", struct {
-    fn run(_: *anyopaque) void { redis.quit(); }
-}.run, null);
-
-// 5. 刷新日志
-try lc.onShutdown("flush-logs", struct {
-    fn run(_: *anyopaque) void { logger.flush(); }
-}.run, null);
-
-// 6. 上报健康检查失败
-try lc.onShutdown("update-health", struct {
-    fn run(_: *anyopaque) void {
-        health_registry.setStatus("shutting_down");
+    fn run(_: *anyopaque) void { redis_client.disconnect(); }
+}.run, undefined);
+try lc.onShutdown("close-db", struct {
+    fn run(data: *anyopaque) void {
+        const pool = @as(*DbPool, @ptrCast(@alignCast(data)));
+        pool.close();
     }
-}.run, null);
-
-// 7. 注销服务发现
-try lc.onShutdown("deregister", struct {
+}.run, &db_pool);
+try lc.onShutdown("drain-requests", struct {
     fn run(_: *anyopaque) void {
-        etcd.deregister();
+        while (active_requests.load(.monotonic) > 0) {
+            compat.sleep(100 * std.time.ns_per_ms);
+        }
     }
-}.run, null);
-
-// 8. 持久化内存状态
-try lc.onShutdown("persist-state", struct {
-    fn run(_: *anyopaque) void {
-        state.save("/var/lib/service/state.json");
+}.run, undefined);
+// 最先执行 → 最后注册
+try lc.onShutdown("stop-accepting", struct {
+    fn run(data: *anyopaque) void {
+        const s = @as(*api.Server, @ptrCast(@alignCast(data)));
+        s.stop();
     }
-}.run, null);
+}.run, &server);
 ```
 
-## 关闭超时
+`Logger` 没有 `flush()` 方法；写出到文件时 `FileLogger.write()` 内部已经 `sync`。
 
-防止关闭挂起：
+### lifecycle.Server 包装器
+
+框架还提供一个薄包装：
 
 ```zig
-try lc.configure(.{ .timeout_ms = 30_000 }); // 30 秒超时
-
-lc.run();
-lc.shutdown();
+pub fn Server(comptime T: type) type {
+    pub fn init(server: *T, manager: *Manager) Self;
+    /// 注册一个调用 server.stop() 的钩子
+    pub fn register(self: *Self) !void;
+    /// 先 server.start()，再 manager.run()
+    pub fn start(self: *Self) !void;
+}
 ```
 
-超时后执行强制退出：
+```zig
+var wrapper = lifecycle.Server(api.Server).init(&server, &lc);
+try wrapper.register();
+try wrapper.start();
+```
 
+注意 `start()` 会先调用 `server.start()`（阻塞的 accept 循环），`manager.run()` 只有在服务器停止之后才会被执行；因此这个包装器适合与外部触发（信号/另一个线程）配合使用，本身并不提供信号处理。
+
+## 关于关闭超时
+
+`Manager` 没有超时配置。`run()` 会一直执行钩子直到全部返回；如果某个钩子阻塞，关闭就会挂起。需要超时保护时，自己在独立线程里跑 `lc.run()` 并计时，超时后强制退出：
+
+```zig
+var shutdown_done = std.atomic.Value(bool).init(false);
+
+fn runShutdown(manager: *lifecycle.Manager, done: *std.atomic.Value(bool)) void {
+    manager.run();
+    done.store(true, .release);
+}
+
+const shutdown_thread = try std.Thread.spawn(.{}, runShutdown, .{ &lc, &shutdown_done });
+
+// 等待最多 30 秒
+const deadline = compat.milliTimestamp() + 30_000;
+while (!shutdown_done.load(.acquire) and compat.milliTimestamp() < deadline) {
+    compat.sleep(50 * std.time.ns_per_ms);
+}
+if (!shutdown_done.load(.acquire)) {
+    std.debug.print("shutdown timed out, forcing exit\n", .{});
+    std.process.exit(1);
+}
 ```
-1. 执行所有钩子直到超时
-2. 打印未执行钩子列表
-3. 调用 std.posix._exit(1)
-```
+
+（`std.Thread` 没有 `isRunning()`；用上面的共享原子标志，或直接 `join`。）
+
+## 与 Kubernetes 集成
+
+Kubernetes 发送 `SIGTERM` 并等待 `terminationGracePeriodSeconds`（默认 30s）。由于框架不安装信号处理器，你必须自己安装并调用 `lc.shutdown()`（可用 `std.posix.sigaction`），同时保证钩子在宽限期内完成。
+
+健康检查应在收到信号后立即变为不健康：把健康状态放进一个原子/共享结构，并在同一个信号处理器里更新它。
 
 ## 验证关闭行为
 
@@ -227,32 +280,15 @@ PID=$!
 
 # 发送 SIGTERM
 kill -TERM $PID
-
-# 观察日志
-# 应该看到所有钩子的执行日志
 ```
 
-## 与 Kubernetes 集成
-
-Kubernetes 发送 `SIGTERM` 并等待 `terminationGracePeriodSeconds`（默认 30s）。
-
-```bash
-# 确保关闭在 30 秒内完成
-try lc.configure(.{ .timeout_ms = 25_000 });
-
-# 健康检查应在收到 SIGTERM 后立即返回 unhealthy
-try lc.onShutdown("fail-health", struct {
-    fn run(_: *anyopaque) void {
-        health_registry.setStatus("terminating");
-    }
-}.run, null);
-```
+未安装信号处理器时，`SIGTERM` 会直接终止进程，**关闭钩子不会执行**——这正是需要自己做信号接线的原因。安装后应看到钩子按 LIFO 顺序打印的日志。
 
 ## 调试关闭问题
 
 ```bash
 # 跟踪未完成的关闭钩子
-kill -USR1 $PID  # 如果实现了 USR1 信号处理器
+kill -USR1 $PID  # 仅当你自己实现了 USR1 处理器
 
 # 强制退出（最后手段）
 kill -9 $PID

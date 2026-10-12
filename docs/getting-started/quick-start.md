@@ -37,15 +37,22 @@ zig build
 const std = @import("std");
 const zigzero = @import("zigzero");
 const api = zigzero.api;
+const compat = zigzero.compat;
 const log = zigzero.log;
+const metric = zigzero.metric;
 const middleware = zigzero.middleware;
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // 服务器启动前必须先初始化全局 Io 后端
+    compat.initIo(allocator);
+    defer compat.deinitIo();
 
     const logger = log.Logger.new(.info, "hello-service");
-    var server = api.Server.init(gpa.allocator(), 8080, logger);
+    var server = api.Server.init(allocator, 8080, logger);
     defer server.deinit();
 
     // 全局中间件
@@ -93,7 +100,7 @@ zig build
 输出：
 
 ```
-[2024-04-15 10:00:00] [hello-service] [INFO] Server listening on port 8080
+[1713200000] [hello-service] [INFO] Server listening on port 8080 with 8 workers
 ```
 
 ## 步骤 4: 测试端点
@@ -113,9 +120,9 @@ curl http://localhost:8080/api/users/42
 允许跨域请求：
 
 ```zig
-try server.addMiddleware(try middleware.cors(gpa.allocator(), .{
+try server.addMiddleware(try middleware.cors(allocator, .{
     .max_age = 86400,
-    .allow_origins = &.{ "https://example.com" },
+    .allow_origins = "https://example.com",
 }));
 ```
 
@@ -133,7 +140,7 @@ try server.addRoute(.{
         }
     }.handle,
     .middleware = &.{
-        try middleware.jwt(gpa.allocator(), "your-secret-key"),
+        try middleware.jwt(allocator, "your-secret-key"),
     },
 });
 ```
@@ -157,10 +164,11 @@ try server.addRoute(.{
 添加指标收集和导出：
 
 ```zig
-var registry = metric.Registry.init(gpa.allocator());
+var registry = metric.Registry.init(allocator);
 defer registry.deinit();
 
-const counter = try registry.counter("http_requests_total", "Total HTTP requests");
+// counter() 首次调用创建计数器，后续调用返回同一个实例
+_ = try registry.counter("http_requests_total", "Total HTTP requests");
 
 try server.addMiddleware(middleware.observability(&registry));
 

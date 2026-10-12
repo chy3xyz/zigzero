@@ -28,9 +28,11 @@ examples/chy3/
     │   ├── solution.zig   ← 解决域处理器
     │   └── world.zig      ← 世界域处理器
     └── infra/
-        ├── metrics.zig     ← Prometheus 指标初始化
-        └── middleware.zig  ← 中间件工厂函数
+        ├── middleware.zig ← 中间件工厂函数（唯一被 main.zig 引用的 infra 文件）
+        └── metrics.zig    ← 未使用：文件中定义了 Metrics 结构，但没有任何模块 import 它
 ```
+
+`src/infra/metrics.zig` 目前是死代码：`main.zig` 只是在自己的文件头注释里提到它，实际并未引用。示例中的指标都直接通过 `metric.Registry` 创建，不要把它当作生效的组件。
 
 ## 架构设计原则
 
@@ -53,7 +55,7 @@ pub fn handleMintAsset(ctx: *api.Context) !void {
 ### 2. 分层架构
 
 ```
-infra/     → 基础设施（中间件、指标）
+infra/     → 基础设施（中间件工厂）
     ↓
 domain/    → 业务逻辑（三个领域处理器）
     ↓
@@ -61,6 +63,8 @@ main.zig   → 接线层（路由注册、服务组装）
 ```
 
 ### 3. 状态封装
+
+`AppContext` 的真实定义（`src/context.zig`）：
 
 ```zig
 pub const AppContext = struct {
@@ -78,36 +82,40 @@ pub const AppContext = struct {
     npc_count: u64 = 0,
     quest_count: u64 = 0,
 
+    pub fn init(allocator: std.mem.Allocator, registry: *metric.Registry) AppContext { ... }
+
     // 业务辅助方法
-    pub fn getProblemInsight(self: *AppContext, category: []const u8) []const u8 { ... }
-    pub fn getNarrativeArc(self: *AppContext, genre: []const u8) []const u8 { ... }
-    pub fn getNpcLocation(self: *AppContext, npc_type: []const u8) []const u8 { ... }
-    pub fn getDifficultyLabel(self: *AppContext, difficulty: u8) []const u8 { ... }
+    pub fn getProblemInsight(self: *AppContext, category: []const u8) []const u8
+    pub fn getNarrativeArc(self: *AppContext, genre: []const u8) []const u8
+    pub fn getNpcLocation(self: *AppContext, npc_type: []const u8) []const u8
+    pub fn getNarrativeBranch(self: *AppContext, event_type: []const u8) []const u8
+    pub fn getDifficultyLabel(self: *AppContext, difficulty: u8) []const u8
 };
 ```
 
 ## 中间件栈
 
-展示了 ZigZero 中间件的完整组合：
+中间件由 `src/infra/middleware.zig` 的工厂函数统一创建，启动时组装（`main.zig`）：
 
 ```zig
-// 全局中间件（所有路由）
-try server.addMiddleware(middleware.requestId());
-try server.addMiddleware(middleware.logging());
-try server.addMiddleware(try middleware.cors(allocator, .{ .max_age = 86400 }));
-try server.addMiddleware(middleware.observability(&registry));
-try server.addMiddleware(middleware.loadShedding(&shedder));
-try server.addMiddleware(middleware.rateLimitByIp(&ip_limiter));
+// 全局中间件（所有路由）：requestId → logging → cors → observability → loadShedding → rateLimitByIp
+const global_mws = try infra_middleware.globalMiddleware(allocator, &registry, &ip_limiter, &shedder);
+for (global_mws) |mw| {
+    try server.addMiddleware(mw);
+}
 
-// 路由级中间件（JWT + body size）
+// 路由级中间件工厂返回已 dupe 的切片，可安全交给 addRoute
+const mw_mint = try infra_middleware.mintAssetMiddleware(allocator); // jwt + maxBodySize(10MB)
 try server.addRoute(.{
     .method = .POST,
     .path = "/api/v1/assets/mint",
     .handler = solution.handleMintAsset,
-    .middleware = &.{ jwt_auth, max10m },
+    .middleware = mw_mint,
     .user_data = &app,
 });
 ```
+
+所有 JWT 中间件使用同一个密钥 `"chy3-secret-key"`。
 
 ## API 端点
 
@@ -132,17 +140,19 @@ try server.addRoute(.{
 | 方法 | 路径 | 中间件 | 功能 |
 |------|------|--------|------|
 | POST | `/api/v1/worlds/create` | JWT | 创建叙事世界 |
-| POST | `/api/v1/worlds/:id/npcs` | JWT | 生成 AI NPC |
-| POST | `/api/v1/worlds/:id/events` | — | 触发叙事事件 |
-| POST | `/api/v1/worlds/:id/quests` | JWT | 发布任务 |
+| POST | `/api/v1/worlds/:world_id/npcs` | JWT | 生成 AI NPC |
+| POST | `/api/v1/worlds/:world_id/events` | — | 触发叙事事件 |
+| POST | `/api/v1/worlds/:world_id/quests` | JWT | 发布任务 |
 | GET | `/api/v1/worlds/stats` | — | 世界统计 |
+
+`world_id` 虽然出现在路径里，但世界域的三个处理器都从 JSON body 的 `world_id` 字段取值，路径参数目前不参与业务逻辑。
 
 ### 可观测性
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
-| GET | `/health` | 健康检查 |
-| GET | `/metrics` | Prometheus 指标 |
+| GET | `/health` | 健康检查（返回固定 JSON） |
+| GET | `/metrics` | Prometheus 指标（由 `handleMetrics` 导出注册表） |
 
 ## 运行
 
@@ -158,8 +168,24 @@ chy3 — Creator Metaverse Platform
   世界域 (World)   Metaverse engine   → /api/v1/worlds/*
   Observability                    → /health /metrics
 ============================================================
-[1776254157] [chy3-server] [INFO] Server listening on port 8080
+[1776254157] [chy3-server] [INFO] Server listening on port 8080 with 10 workers
 ```
+
+worker 数量取决于机器的 CPU 核数（`Server.start()` 在 `worker_threads = 0` 时取 CPU 核数）。`lc.run()` 会一直阻塞，而本示例没有安装信号处理器，用 Ctrl-C 结束进程。
+
+## 获取 Token
+
+chy3 **没有登录端点**，所以不能像某些示例那样 `POST /api/v1/auth/login` 换 token（该路径会 404）。JWT 中间件校验的密钥是硬编码的 `"chy3-secret-key"`，用同一个密钥通过 `middleware.generateToken` 签发即可：
+
+```zig
+const token = try middleware.generateToken(ctx.allocator, .{
+    .sub = "admin",
+    .username = "admin",
+    .exp = compat.timestamp() + 3600,
+}, "chy3-secret-key");
+```
+
+把它作为 `Authorization: Bearer <token>` 发出，`jwt()` 中间件就会放行。下面的示例用 `$TOKEN` 代表这样一个已签发的临时 token。
 
 ## 测试端点
 
@@ -172,21 +198,40 @@ curl -X POST http://localhost:8080/api/v1/problems/submit \
   -H "Content-Type: application/json" \
   -d '{"creator_id":"alice","category":"monetization","description":"hard to monetize","severity":5}'
 
-# 生成 JWT 并铸造资产
-TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"username":"admin","password":"admin"}' | jq -r .token)
-
+# 铸造资产（需 JWT）
 curl -X POST http://localhost:8080/api/v1/assets/mint \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"creator_id":"alice","asset_type":"narrative","metadata":"story_ch1"}'
 
-# 创建元宇宙世界
+# 订阅创作者（需 JWT）
+curl -X POST http://localhost:8080/api/v1/subscriptions/subscribe \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"subscriber_id":"bob","creator_id":"alice","tier":"founder"}'
+
+# 创建元宇宙世界（需 JWT）
 curl -X POST http://localhost:8080/api/v1/worlds/create \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"creator_id":"alice","name":"IronRealms","genre":"fantasy"}'
+
+# 生成 NPC（需 JWT，body 里带 world_id）
+curl -X POST http://localhost:8080/api/v1/worlds/world_IronRealms_1/npcs \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"world_id":"world_IronRealms_1","npc_type":"merchant","personality":"greedy"}'
+
+# 触发叙事事件（无需 JWT）
+curl -X POST http://localhost:8080/api/v1/worlds/world_IronRealms_1/events \
+  -H "Content-Type: application/json" \
+  -d '{"world_id":"world_IronRealms_1","event_type":"war","magnitude":8}'
+
+# 发布任务（需 JWT）
+curl -X POST http://localhost:8080/api/v1/worlds/world_IronRealms_1/quests \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"world_id":"world_IronRealms_1","quest_name":"Retrieve the Ember Blade","reward_amount":500,"difficulty":7}'
 
 # 查看 Prometheus 指标
 curl http://localhost:8080/metrics
@@ -212,13 +257,21 @@ curl http://localhost:8080/metrics
 | `load.newAdaptiveShedder()` | 负载 shedder |
 | `lifecycle.Manager` | 优雅关闭 |
 | `log.Logger` | 结构化日志 |
-| `mq.Queue` | 消息总线 |
+
+chy3 不使用消息队列，也没有引入 `mq.Queue`。
+
+## 已知问题（运行本示例时会遇到）
+
+- `POST /api/v1/worlds/:world_id/events` 是在分组上用 `g.post(...)` 注册的，没有 `.user_data`，而处理器 `handleTriggerEvent` 会解引用 `ctx.user_data.?`——调用该端点会 panic 并终止整个进程。
+- `GET /api/v1/worlds/stats` 注册的 `.user_data` 是 `metricsUserData(&registry)`（`*metric.Registry`），处理器却把它当成 `*AppContext` 使用，返回的统计是错乱的整数。
+- `ctx.bindJson` 返回的结构体里，字符串字段指向 `bindJson` 内部临时解析 arena 的内存，该 arena 在函数返回前就被释放，因此响应中会看到被复用的垃圾字节（例如 `name`、`genre`、`category` 字段错位）。这三个问题都出在示例/框架实现里，本文档如实记录，未作代码修改。
 
 ## 扩展方向
 
 - **数据持久化** — 使用 `sqlx` 将状态存入 PostgreSQL
 - **Redis 缓存** — 使用 `redis` 缓存市场数据
 - **WebSocket 推送** — 使用 `websocket` 实时推送 NPC 对话
+- **消息总线** — 使用 `mq.Queue` 解耦领域事件（示例中尚未使用）
 - **服务发现** — 使用 `discovery` + `etcd` 实现多实例部署
 - **分布式锁** — 使用 `lock` 保护世界状态
 - **Cron 任务** — 使用 `cron` 定时结算版权费

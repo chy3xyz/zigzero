@@ -57,24 +57,28 @@ pub const UserListResp = struct {
 //! 用户 CRUD 处理器
 
 const std = @import("std");
+const zigzero = @import("zigzero");
 const api = zigzero.api;
+const compat = zigzero.compat;
 const types = @import("types.zig");
 
 // 模拟数据库
 var users_db = std.StringHashMap(types.User).init(std.heap.page_allocator);
 
 pub fn handleListUsers(ctx: *api.Context) !void {
-    var list = std.ArrayList(types.User).init(ctx.allocator);
-    defer list.deinit();
+    // 0.17 的 ArrayList 是非托管的：用 .empty 初始化，每次调用显式传入 allocator
+    var list: std.ArrayList(types.User) = .empty;
+    defer list.deinit(ctx.allocator);
 
     var it = users_db.valueIterator();
     while (it.next()) |user| {
-        try list.append(user.*);
+        try list.append(ctx.allocator, user.*);
     }
 
+    const total = list.items.len;
     try ctx.jsonStruct(200, .{
-        .users = try list.toOwnedSlice(),
-        .total = @as(u32, @intCast(list.items.len)),
+        .users = try list.toOwnedSlice(ctx.allocator),
+        .total = @as(u32, @intCast(total)),
     });
 }
 
@@ -91,15 +95,15 @@ pub fn handleGetUser(ctx: *api.Context) !void {
 pub fn handleCreateUser(ctx: *api.Context) !void {
     const req = try ctx.bindJson(types.CreateUserReq);
 
+    const now = compat.timestamp();
     const user = types.User{
-        .id = std.fmt.allocPrint(ctx.allocator, "{d}", .{std.time.timestamp()}) catch "0",
+        .id = try std.fmt.allocPrint(ctx.allocator, "{d}", .{now}),
         .name = req.name,
         .email = req.email,
-        .created_at = std.time.timestamp(),
+        .created_at = now,
     };
-    errdefer ctx.allocator.free(user.id);
 
-    try users_db.put(ctx.allocator.dupe(u8, user.id), user);
+    try users_db.put(try ctx.allocator.dupe(u8, user.id), user);
 
     try ctx.jsonStruct(201, user);
 }
@@ -141,13 +145,15 @@ const std = @import("std");
 const zigzero = @import("zigzero");
 const api = zigzero.api;
 
-pub fn globalMiddleware(allocator: std.mem.Allocator) ![]api.Middleware {
-    const mws = [_]zigzero.middleware.Middleware{
+pub fn globalMiddleware(allocator: std.mem.Allocator) ![]const api.Middleware {
+    const mws = [_]api.Middleware{
         zigzero.middleware.requestId(),
         zigzero.middleware.logging(),
         try zigzero.middleware.cors(allocator, .{ .max_age = 86400 }),
     };
-    return &mws;
+    // mws 是栈上的局部数组；复制到堆上再返回，避免悬垂指针。
+    // 调用方负责释放返回的切片。
+    return try allocator.dupe(api.Middleware, &mws);
 }
 ```
 
@@ -159,6 +165,7 @@ pub fn globalMiddleware(allocator: std.mem.Allocator) ![]api.Middleware {
 const std = @import("std");
 const zigzero = @import("zigzero");
 const api = zigzero.api;
+const compat = zigzero.compat;
 const log = zigzero.log;
 const middleware = zigzero.middleware;
 const metric = zigzero.metric;
@@ -169,9 +176,13 @@ const handlers = @import("handlers.zig");
 const mw_factory = @import("middleware.zig");
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // 服务器启动前必须先初始化全局 Io 后端
+    compat.initIo(allocator);
+    defer compat.deinitIo();
 
     // 指标注册表
     var registry = metric.Registry.init(allocator);
@@ -182,11 +193,14 @@ pub fn main() !void {
     var lc = lifecycle.Manager.init(allocator);
     defer lc.deinit();
 
+    // onShutdown 的 context 是非可选的 *anyopaque；这里传一个占位变量，
+    // 回调本身不使用它。
+    var shutdown_ctx: u8 = 0;
     try lc.onShutdown("cleanup", struct {
         fn run(_: *anyopaque) void {
             std.debug.print("Shutting down gracefully...\n", .{});
         }
-    }.run, null);
+    }.run, &shutdown_ctx);
 
     // HTTP 服务器
     const logger = log.Logger.new(.info, "user-service");
@@ -281,18 +295,20 @@ try server.addMiddleware(middleware.rateLimitByIp(&ip_limiter));
 ```zig
 const breaker = zigzero.breaker;
 
+// CircuitBreaker 按值创建、不持有资源，所以没有 deinit；用
+// allow / recordSuccess / recordFailure 显式包裹外部调用。
 var cb = breaker.CircuitBreaker.new();
-defer cb.deinit();
 
-pub fn callExternalService() !void {
-    const result = try cb.execute(struct {
-        fn run() ![]const u8 {
-            // 外部 API 调用
-            return try httpGet("https://api.external.com/data");
-        }
-    }.run);
-    defer std.heap.page_allocator.free(result);
-    // 处理结果...
+pub fn callExternalService() ![]const u8 {
+    if (!cb.allow()) return error.CircuitOpen;
+
+    const result = httpGet("https://api.external.com/data") catch |err| {
+        cb.recordFailure();
+        return err;
+    };
+
+    cb.recordSuccess();
+    return result;
 }
 ```
 

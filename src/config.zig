@@ -43,20 +43,19 @@ pub const LogConfig = struct {
     compress: bool = true,
 
     pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !LogConfig {
-        var cfg = LogConfig{};
+        var cfg: LogConfig = .{
+            .service_name = try stringField(allocator, json, "service_name", (LogConfig{}).service_name),
+            .level = try stringField(allocator, json, "level", (LogConfig{}).level),
+            .mode = try stringField(allocator, json, "mode", (LogConfig{}).mode),
+        };
+        errdefer {
+            allocator.free(cfg.service_name);
+            allocator.free(cfg.level);
+            allocator.free(cfg.mode);
+        }
 
-        if (json.object.get("service_name")) |v| {
-            cfg.service_name = try allocator.dupe(u8, v.string);
-        }
-        if (json.object.get("level")) |v| {
-            cfg.level = try allocator.dupe(u8, v.string);
-        }
-        if (json.object.get("mode")) |v| {
-            cfg.mode = try allocator.dupe(u8, v.string);
-        }
         if (json.object.get("path")) |v| {
-            const path = try allocator.dupe(u8, v.string);
-            cfg.path = path;
+            cfg.path = try allocator.dupe(u8, v.string);
         }
         if (json.object.get("max_size")) |v| {
             cfg.max_size = @intCast(v.integer);
@@ -93,17 +92,16 @@ pub const RedisConfig = struct {
     write_timeout_ms: u32 = 3000,
 
     pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !RedisConfig {
-        var cfg = RedisConfig{};
+        var cfg: RedisConfig = .{
+            .host = try stringField(allocator, json, "host", (RedisConfig{}).host),
+        };
+        errdefer allocator.free(cfg.host);
 
-        if (json.object.get("host")) |v| {
-            cfg.host = try allocator.dupe(u8, v.string);
-        }
         if (json.object.get("port")) |v| {
             cfg.port = @intCast(v.integer);
         }
         if (json.object.get("password")) |v| {
-            const pwd = try allocator.dupe(u8, v.string);
-            cfg.password = pwd;
+            cfg.password = try allocator.dupe(u8, v.string);
         }
         if (json.object.get("db")) |v| {
             cfg.db = @intCast(v.integer);
@@ -144,13 +142,20 @@ pub const MysqlConfig = struct {
     conn_max_idle_time_sec: u32 = 900,
 
     pub fn fromJson(allocator: std.mem.Allocator, json: std.json.Value) !MysqlConfig {
-        var cfg = MysqlConfig{};
+        var cfg: MysqlConfig = .{
+            .host = try stringField(allocator, json, "host", (MysqlConfig{}).host),
+            .database = try stringField(allocator, json, "database", (MysqlConfig{}).database),
+            .username = try stringField(allocator, json, "username", (MysqlConfig{}).username),
+            .password = try stringField(allocator, json, "password", (MysqlConfig{}).password),
+        };
+        errdefer {
+            allocator.free(cfg.host);
+            allocator.free(cfg.database);
+            allocator.free(cfg.username);
+            allocator.free(cfg.password);
+        }
 
-        if (json.object.get("host")) |v| cfg.host = try allocator.dupe(u8, v.string);
         if (json.object.get("port")) |v| cfg.port = @intCast(v.integer);
-        if (json.object.get("database")) |v| cfg.database = try allocator.dupe(u8, v.string);
-        if (json.object.get("username")) |v| cfg.username = try allocator.dupe(u8, v.string);
-        if (json.object.get("password")) |v| cfg.password = try allocator.dupe(u8, v.string);
         if (json.object.get("max_open_conns")) |v| cfg.max_open_conns = @intCast(v.integer);
         if (json.object.get("max_idle_conns")) |v| cfg.max_idle_conns = @intCast(v.integer);
         if (json.object.get("max_lifetime_sec")) |v| cfg.max_lifetime_sec = @intCast(v.integer);
@@ -176,18 +181,18 @@ pub const EtcdConfig = struct {
 
         if (json.object.get("endpoints")) |v| {
             const arr = v.array;
-            cfg.endpoints = try allocator.alloc([]const u8, arr.items.len);
+            const endpoints = try allocator.alloc([]const u8, arr.items.len);
+            errdefer allocator.free(endpoints);
             for (arr.items, 0..) |item, i| {
-                cfg.endpoints[i] = try allocator.dupe(u8, item.string);
+                endpoints[i] = try allocator.dupe(u8, item.string);
             }
+            cfg.endpoints = endpoints;
         }
         if (json.object.get("username")) |v| {
-            const uname = try allocator.dupe(u8, v.string);
-            cfg.username = uname;
+            cfg.username = try allocator.dupe(u8, v.string);
         }
         if (json.object.get("password")) |v| {
-            const pwd = try allocator.dupe(u8, v.string);
-            cfg.password = pwd;
+            cfg.password = try allocator.dupe(u8, v.string);
         }
         if (json.object.get("timeout_sec")) |v| cfg.timeout_sec = @intCast(v.integer);
 
@@ -214,10 +219,7 @@ pub const Loader = struct {
 
     /// Load configuration from JSON file
     pub fn loadJson(self: Loader, comptime T: type, path: []const u8) !T {
-        const file = try compat.cwd().openFile(path, .{});
-        defer file.close();
-
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        const content = try compat.cwd().readFileAlloc(compat.io(), path, self.allocator, .limited(1024 * 1024));
         defer self.allocator.free(content);
 
         return self.parseJson(T, content);
@@ -225,10 +227,7 @@ pub const Loader = struct {
 
     /// Load configuration from YAML file (simplified YAML subset)
     pub fn loadYaml(self: Loader, comptime T: type, path: []const u8) !T {
-        const file = try compat.cwd().openFile(path, .{});
-        defer file.close();
-
-        const content = try file.readToEndAlloc(self.allocator, 1024 * 1024);
+        const content = try compat.cwd().readFileAlloc(compat.io(), path, self.allocator, .limited(1024 * 1024));
         defer self.allocator.free(content);
 
         return self.parseYaml(T, content);
@@ -250,13 +249,60 @@ pub const Loader = struct {
         const json = parsed.value;
 
         const s_info = @typeInfo(T).@"struct";
-        inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
+        const field_count = s_info.field_names.len;
+        var provided: [field_count]bool = @splat(false);
+
+        inline for (s_info.field_names, s_info.field_types, 0..) |field_name, FieldType, i| {
             if (json.object.get(field_name)) |value| {
                 @field(cfg, field_name) = try parseField(self.allocator, FieldType, value);
+                provided[i] = true;
             }
         }
 
+        try ownSliceDefaults(self.allocator, T, &cfg, &provided);
         return cfg;
+    }
+
+    /// Free every string field of a config returned by `loadJson`, `loadYaml`
+    /// or `loadEnv`, including nested config structs and string arrays.
+    ///
+    /// All strings in a loaded config are owned by the loader's allocator, so
+    /// this is the counterpart to those loaders — callers must not free the
+    /// fields by hand.
+    pub fn freeConfig(self: Loader, comptime T: type, cfg: *const T) void {
+        freeConfigFields(T, cfg, self.allocator);
+    }
+
+    fn freeConfigFields(comptime T: type, cfg: *const T, allocator: std.mem.Allocator) void {
+        const info = @typeInfo(T).@"struct";
+        inline for (info.field_names, info.field_types) |name, FieldType| {
+            switch (@typeInfo(FieldType)) {
+                .pointer => |p| {
+                    // A zero-length slice may be a static default (`&.{}`), so it
+                    // is skipped — freeing it is a no-op anyway.
+                    const slice = @field(cfg.*, name);
+                    if (p.size == .slice and slice.len > 0) {
+                        if (p.child == u8) {
+                            allocator.free(slice);
+                        } else if (@typeInfo(p.child) == .pointer and @typeInfo(p.child).pointer.child == u8) {
+                            for (slice) |item| {
+                                if (item.len > 0) allocator.free(item);
+                            }
+                            allocator.free(slice);
+                        }
+                    }
+                },
+                .optional => |o| {
+                    if (@typeInfo(o.child) == .pointer) {
+                        if (@field(cfg.*, name)) |value| {
+                            if (value.len > 0) allocator.free(value);
+                        }
+                    }
+                },
+                .@"struct" => freeConfigFields(FieldType, &@field(cfg.*, name), allocator),
+                else => {},
+            }
+        }
     }
 
     fn parseField(allocator: std.mem.Allocator, comptime T: type, value: std.json.Value) !T {
@@ -280,7 +326,10 @@ pub const Loader = struct {
         var buf: [256]u8 = undefined;
 
         const s_info = @typeInfo(T).@"struct";
-        inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
+        const field_count = s_info.field_names.len;
+        var provided: [field_count]bool = @splat(false);
+
+        inline for (s_info.field_names, s_info.field_types, 0..) |field_name, FieldType, i| {
             const upper_name = std.ascii.upperString(&buf, field_name);
             const env_name = try std.fmt.allocPrint(self.allocator, "{s}_{s}", .{ prefix, upper_name });
             defer self.allocator.free(env_name);
@@ -290,9 +339,11 @@ pub const Loader = struct {
             if (std.c.getenv(c_env_name.ptr)) |c_value| {
                 const value = std.mem.span(c_value);
                 @field(cfg, field_name) = try parseEnvValue(self.allocator, FieldType, value);
+                provided[i] = true;
             }
         }
 
+        try ownSliceDefaults(self.allocator, T, &cfg, &provided);
         return cfg;
     }
 
@@ -327,6 +378,37 @@ fn defaultConfig(comptime T: type) T {
         }
     }
     return cfg;
+}
+
+/// Give the caller uniform ownership of every string field.
+///
+/// A field the source did not provide keeps its declared default, which is a
+/// comptime literal — freeing it would be invalid, and mixed ownership is a
+/// trap for callers. Copy those defaults so every string in a returned config
+/// is allocated from the loader's allocator and can be freed the same way.
+fn ownSliceDefaults(allocator: std.mem.Allocator, comptime T: type, cfg: *T, provided: []const bool) !void {
+    const info = @typeInfo(T).@"struct";
+    inline for (info.field_names, info.field_types, 0..) |name, FieldType, i| {
+        if (!provided[i] and @typeInfo(FieldType) == .pointer) {
+            const p = @typeInfo(FieldType).pointer;
+            if (p.size == .slice and p.child == u8) {
+                @field(cfg.*, name) = try allocator.dupe(u8, @field(cfg.*, name));
+            }
+        }
+    }
+}
+
+/// Owned copy of a string field: the JSON value when the key is present, the
+/// struct's declared default otherwise.
+///
+/// Returning an owned copy either way is what lets `Loader.freeConfig` release
+/// every string in a loaded config — a default left in place would be a comptime
+/// literal, and freeing that is invalid.
+fn stringField(allocator: std.mem.Allocator, json: std.json.Value, key: []const u8, default: []const u8) ![]const u8 {
+    if (json.object.get(key)) |v| {
+        if (v == .string) return allocator.dupe(u8, v.string);
+    }
+    return allocator.dupe(u8, default);
 }
 
 /// Convert a simplified YAML subset to JSON string.
@@ -510,7 +592,7 @@ pub fn Watcher(comptime T: type) type {
     return struct {
         allocator: std.mem.Allocator,
         file_path: []const u8,
-        last_modified: i128,
+        last_modified: i96,
         interval_ms: u64,
         is_yaml: bool,
 
@@ -532,8 +614,8 @@ pub fn Watcher(comptime T: type) type {
 
         /// Check if the config file has changed since last check
         pub fn hasChanged(self: *Self) bool {
-            const stat = compat.cwd().statFile(self.file_path) catch return false;
-            const mtime = stat.mtime;
+            const stat = compat.cwd().statFile(compat.io(), self.file_path, .{}) catch return false;
+            const mtime = stat.mtime.nanoseconds;
             if (mtime > self.last_modified) {
                 self.last_modified = mtime;
                 return true;
@@ -590,17 +672,9 @@ test "config yaml parsing" {
     ;
 
     const allocator = std.testing.allocator;
-    const cfg = try Loader.init(allocator).parseYaml(Config, yaml_content);
-    defer {
-        allocator.free(cfg.name);
-        allocator.free(cfg.log.level);
-        allocator.free(cfg.log.service_name);
-        allocator.free(cfg.redis.host);
-        allocator.free(cfg.mysql.host);
-        allocator.free(cfg.mysql.database);
-        for (cfg.etcd.endpoints) |ep| allocator.free(ep);
-        allocator.free(cfg.etcd.endpoints);
-    }
+    const loader = Loader.init(allocator);
+    const cfg = try loader.parseYaml(Config, yaml_content);
+    defer loader.freeConfig(Config, &cfg);
 
     try std.testing.expectEqualStrings("test-service", cfg.name);
     try std.testing.expectEqual(@as(u16, 8080), cfg.port);
@@ -617,7 +691,9 @@ test "config env parsing" {
     // than staying undefined.
     _ = setenv("ZIGZERO_TEST_PORT", "9000", 1);
 
-    const cfg = try Loader.init(allocator).loadEnv(RedisConfig, "ZIGZERO_TEST");
+    const loader = Loader.init(allocator);
+    const cfg = try loader.loadEnv(RedisConfig, "ZIGZERO_TEST");
+    defer loader.freeConfig(RedisConfig, &cfg);
     try std.testing.expectEqual(@as(u16, 9000), cfg.port);
     try std.testing.expectEqualStrings("localhost", cfg.host);
     try std.testing.expectEqual(@as(u32, 0), cfg.db);
@@ -626,8 +702,9 @@ test "config env parsing" {
 
 test "missing json keys keep declared defaults" {
     const allocator = std.testing.allocator;
-    const cfg = try Loader.init(allocator).parseJson(RedisConfig, "{\"host\":\"cache.internal\"}");
-    defer allocator.free(cfg.host);
+    const loader = Loader.init(allocator);
+    const cfg = try loader.parseJson(RedisConfig, "{\"host\":\"cache.internal\"}");
+    defer loader.freeConfig(RedisConfig, &cfg);
 
     try std.testing.expectEqualStrings("cache.internal", cfg.host);
     // Absent from the JSON: these used to be `undefined` after parsing.
@@ -638,6 +715,50 @@ test "missing json keys keep declared defaults" {
 
 test "config module" {
     try std.testing.expect(true);
+}
+
+test "loadJson and loadYaml read real files" {
+    const allocator = std.testing.allocator;
+    const dir_path = ".test-config-load";
+    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dir_path ++ "/c.json", .data = "{\"host\":\"json-host\",\"port\":7001}" });
+    const loader = Loader.init(allocator);
+    const from_json = try loader.loadJson(RedisConfig, dir_path ++ "/c.json");
+    defer loader.freeConfig(RedisConfig, &from_json);
+    try std.testing.expectEqualStrings("json-host", from_json.host);
+    try std.testing.expectEqual(@as(u16, 7001), from_json.port);
+
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = dir_path ++ "/c.yaml", .data = "host: yaml-host\nport: 7002\n" });
+    const from_yaml = try loader.loadYaml(RedisConfig, dir_path ++ "/c.yaml");
+    defer loader.freeConfig(RedisConfig, &from_yaml);
+    try std.testing.expectEqualStrings("yaml-host", from_yaml.host);
+    try std.testing.expectEqual(@as(u16, 7002), from_yaml.port);
+}
+
+test "watcher reports a change when the file is rewritten" {
+    const allocator = std.testing.allocator;
+    const dir_path = ".test-config-watch";
+    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+
+    const file_path = dir_path ++ "/c.json";
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = file_path, .data = "{\"port\":7003}" });
+
+    var watcher = try Watcher(RedisConfig).init(allocator, file_path, 10);
+    defer watcher.deinit();
+
+    // First check establishes the baseline, the second sees the rewrite.
+    _ = watcher.hasChanged();
+    try compat.cwd().writeFile(compat.io(), .{ .sub_path = file_path, .data = "{\"port\":7004}" });
+    try std.testing.expect(watcher.hasChanged());
+
+    const reloaded = try watcher.reload();
+    defer Loader.init(allocator).freeConfig(RedisConfig, &reloaded);
+    try std.testing.expectEqual(@as(u16, 7004), reloaded.port);
 }
 
 test "redis config defaults" {

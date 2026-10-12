@@ -90,21 +90,24 @@ zig build
 ### 自定义构建
 
 ```bash
-# Release build
-zig build -Drelease-safe
+# Release build with runtime safety checks
+zig build -Doptimize=safe
 
 # Debug build (faster compile, slower runtime)
-zig build -Ddebug
+zig build -Doptimize=debug
 
 # Release with unsafe optimizations (fastest, no runtime checks)
-zig build -Drelease-fast
+zig build -Doptimize=fast
+
+# Smallest binary
+zig build -Doptimize=small
 ```
 
 ## Install the CLI Tool
 
 ```bash
 zig build
-./zig-out/bin/zgctl --version
+./zig-out/bin/zgctl --help
 ```
 
 ## 数据库初始化 (for testing)

@@ -10,7 +10,6 @@ const middleware = zigzero.middleware;
 const metric = zigzero.metric;
 const limiter = zigzero.limiter;
 const load = zigzero.load;
-const health = zigzero.health;
 
 /// Global middleware applied to every request.
 /// Caller must deallocate the returned slice.
@@ -74,14 +73,4 @@ pub fn subscribeMiddleware(allocator: std.mem.Allocator) ![]const api.Middleware
 pub fn problemSubmitMiddleware(allocator: std.mem.Allocator) ![]const api.Middleware {
     const mws = [_]api.Middleware{try middleware.maxBodySize(allocator, 1024 * 64)};
     return try allocator.dupe(api.Middleware, &mws);
-}
-
-/// Health check user data — pointer to health registry.
-pub fn healthUserData(registry: *health.Registry) *health.Registry {
-    return registry;
-}
-
-/// Prometheus metrics user data — pointer to metric registry.
-pub fn metricsUserData(registry: *metric.Registry) *metric.Registry {
-    return registry;
 }

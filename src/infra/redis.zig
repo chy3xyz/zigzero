@@ -389,7 +389,7 @@ pub const Redis = struct {
             const response = buf[0..n];
 
             if (response.len > 1 and response[0] == ':') {
-                const val = std.fmt.parseInt(i32, response[1..], 10) catch return 0;
+                const val = std.fmt.parseInt(i32, response[1..], 10) catch return error.RedisError;
                 return val == 1;
             }
         }

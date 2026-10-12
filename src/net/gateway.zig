@@ -61,6 +61,9 @@ pub const Gateway = struct {
     allocator: std.mem.Allocator,
     client: http.Client,
     upstreams: std.StringHashMap(Upstream),
+    /// Per-route configuration handed to the registered handlers; owned here
+    /// because a route stores only a pointer to it.
+    route_configs: std.ArrayList(*RouteConfig),
 
     const Self = @This();
 
@@ -69,10 +72,19 @@ pub const Gateway = struct {
             .allocator = allocator,
             .client = http.Client.init(allocator, client_config),
             .upstreams = std.StringHashMap(Upstream).init(allocator),
+            .route_configs = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        for (self.route_configs.items) |config| {
+            self.allocator.free(config.upstream);
+            if (config.upstream_path) |up| self.allocator.free(up);
+            if (config.strip_prefix) |sp| self.allocator.free(sp);
+            self.allocator.destroy(config);
+        }
+        self.route_configs.deinit(self.allocator);
+
         var iter = self.upstreams.iterator();
         while (iter.next()) |entry| {
             entry.value_ptr.deinit();
@@ -100,6 +112,7 @@ pub const Gateway = struct {
             .upstream_path = if (route.upstream_path) |up| try self.allocator.dupe(u8, up) else null,
             .strip_prefix = if (route.strip_prefix) |sp| try self.allocator.dupe(u8, sp) else null,
         };
+        try self.route_configs.append(self.allocator, config);
 
         try server.addRoute(.{
             .method = route.method,
@@ -112,7 +125,9 @@ pub const Gateway = struct {
 
     /// Build the target upstream URL from the incoming request context
     fn buildTargetUrl(self: *Self, ctx: *api.Context, config: *RouteConfig) ![]const u8 {
-        const upstream = self.upstreams.get(config.upstream) orelse return error.NotFound;
+        // getPtr, not get: the map holds Upstreams by value, and the balancer's
+        // round-robin state must be the one in the map, not a copy of it.
+        const upstream = self.upstreams.getPtr(config.upstream) orelse return error.NotFound;
         const endpoint = upstream.pickEndpoint() orelse return error.ServiceUnavailable;
 
         var raw = ctx.raw_path;
@@ -169,7 +184,7 @@ pub const Gateway = struct {
 
         var resp = self.client.request(method, target_url, if (body.len > 0) body else null, headers) catch |err| {
             try ctx.json(503, try errors.toJson(ctx.allocator, .{
-                .code = @intFromEnum(errors.Code.ServiceUnavailable),
+                .code = @backingInt(errors.Code.ServiceUnavailable),
                 .message = @errorName(err),
             }));
             return;
@@ -219,4 +234,50 @@ test "gateway init" {
 
     try gateway.addUpstream("users", &.{ "http://localhost:8081", "http://localhost:8082" });
     try std.testing.expect(gateway.upstreams.contains("users"));
+}
+
+test "gateway route lookup builds a target url and rotates endpoints" {
+    const allocator = std.testing.allocator;
+    var gateway = Gateway.init(allocator, .{});
+    defer gateway.deinit();
+    try gateway.addUpstream("users", &.{ "http://localhost:8081", "http://localhost:8082" });
+
+    const user = @import("../infra/log.zig").Logger.new(.off, "test");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    var ctx = try api.Context.init(arena.allocator(), .GET, "/api/users/42?verbose=1", user);
+    defer ctx.deinit();
+
+    var config = RouteConfig{
+        .gateway = &gateway,
+        .upstream = "users",
+        .upstream_path = null,
+        .strip_prefix = "/api",
+    };
+
+    // buildTargetUrl returns an allocation owned by the caller.
+    const first = try gateway.buildTargetUrl(&ctx, &config);
+    defer gateway.allocator.free(first);
+    const second = try gateway.buildTargetUrl(&ctx, &config);
+    defer gateway.allocator.free(second);
+
+    // The path is rewritten and the query string survives...
+    try std.testing.expect(std.mem.startsWith(u8, first, "http://localhost:808"));
+    try std.testing.expect(std.mem.endsWith(u8, first, "/users/42?verbose=1"));
+    // ...and the balancer rotates, which only works if the map's own Upstream is
+    // used rather than a copy of it.
+    try std.testing.expect(!std.mem.eql(u8, first, second));
+}
+
+test "gateway registerRoute wires a proxying route" {
+    const allocator = std.testing.allocator;
+    var gateway = Gateway.init(allocator, .{});
+    defer gateway.deinit();
+    try gateway.addUpstream("users", &.{"http://localhost:8081"});
+
+    var server = api.Server.init(allocator, 0, @import("../infra/log.zig").Logger.new(.off, "test"));
+    defer server.deinit();
+
+    try gateway.registerRoute(&server, .{ .method = .GET, .path = "/users", .upstream = "users" });
 }

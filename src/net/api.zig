@@ -226,11 +226,13 @@ pub const Context = struct {
     }
 
     /// Parse JSON body into type T
+    ///
+    /// The value is parsed into the request arena (`self.allocator`), which the
+    /// server tears down when the request ends — `parseFromSlice` would free its
+    /// own arena before returning and leave every slice inside T dangling.
     pub fn bindJson(self: *const Context, comptime T: type) !T {
         if (self.body == null) return error.NoBody;
-        var parsed = std.json.parseFromSlice(T, self.allocator, self.body.?, .{ .allocate = .alloc_always }) catch return error.InvalidJson;
-        defer parsed.deinit();
-        return parsed.value;
+        return std.json.parseFromSliceLeaky(T, self.allocator, self.body.?, .{ .allocate = .alloc_always }) catch return error.InvalidJson;
     }
 
     /// Parse JSON body into type T and validate against comptime rules.
@@ -726,6 +728,9 @@ pub const RouteGroup = struct {
     prefix: []const u8,
     middleware: []const Middleware,
     server: *Server,
+    /// Attached to every route this group registers, so grouped handlers can
+    /// reach their state the same way `Server.addRoute` handlers do.
+    user_data: ?*anyopaque = null,
 
     pub fn init(server: *Server, prefix: []const u8) RouteGroup {
         return .{
@@ -738,6 +743,12 @@ pub const RouteGroup = struct {
     pub fn withMiddleware(self: RouteGroup, mws: []const Middleware) RouteGroup {
         var group = self;
         group.middleware = mws;
+        return group;
+    }
+
+    pub fn withUserData(self: RouteGroup, data: ?*anyopaque) RouteGroup {
+        var group = self;
+        group.user_data = data;
         return group;
     }
 
@@ -789,6 +800,7 @@ pub const RouteGroup = struct {
             .path = fp,
             .handler = handler,
             .middleware = mws,
+            .user_data = self.user_data,
         });
     }
 };
@@ -1350,4 +1362,20 @@ test "server config defaults" {
     try std.testing.expectEqual(@as(u32, 30000), cfg.request_timeout_ms);
     try std.testing.expectEqual(@as(u32, 0), cfg.worker_threads);
     try std.testing.expectEqual(@as(usize, 1024), cfg.max_queue_size);
+}
+
+test "bindJson keeps slice fields alive" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var ctx = try Context.init(arena.allocator(), .POST, "/users", log.Logger.new(.off, "test"));
+    defer ctx.deinit();
+    ctx.body = "{\"name\":\"zigzero\",\"age\":3}";
+
+    const User = struct { name: []const u8, age: u32 };
+    const user = try ctx.bindJson(User);
+
+    // Used to read freed memory: the parse arena was torn down on return.
+    try std.testing.expectEqualStrings("zigzero", user.name);
+    try std.testing.expectEqual(@as(u32, 3), user.age);
 }
