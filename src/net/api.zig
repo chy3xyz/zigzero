@@ -841,15 +841,28 @@ pub const RouteGroup = struct {
     }
 
     pub fn withMiddleware(self: RouteGroup, mws: []const Middleware) RouteGroup {
-        var group = self;
-        group.middleware = mws;
-        return group;
+        var result = self;
+        result.middleware = mws;
+        return result;
+    }
+
+    /// Create a sub-group whose prefix extends this one's. Middleware and user
+    /// data are inherited; the combined prefix is owned by the server and
+    /// released with it.
+    pub fn group(self: RouteGroup, prefix: []const u8) !RouteGroup {
+        const combined = try self.fullPath(prefix);
+        errdefer self.server.allocator.free(combined);
+        try self.server.group_prefixes.append(self.server.allocator, combined);
+
+        var child = self;
+        child.prefix = combined;
+        return child;
     }
 
     pub fn withUserData(self: RouteGroup, data: ?*anyopaque) RouteGroup {
-        var group = self;
-        group.user_data = data;
-        return group;
+        var result = self;
+        result.user_data = data;
+        return result;
     }
 
     fn fullPath(self: *const RouteGroup, path: []const u8) ![]u8 {
@@ -1005,6 +1018,9 @@ pub const Server = struct {
     port: u16,
     router: Router,
     global_middleware: std.ArrayList(Middleware),
+    /// Prefixes created by nesting route groups; owned here because a group's
+    /// prefix has to outlive the call that created it and nothing else frees it.
+    group_prefixes: std.ArrayList([]u8),
     name: []const u8,
     running: std.atomic.Value(bool),
     server_socket: ?compat.net.Server = null,
@@ -1023,6 +1039,7 @@ pub const Server = struct {
             .port = config.port,
             .router = Router.init(allocator),
             .global_middleware = std.ArrayList(Middleware).empty,
+            .group_prefixes = .empty,
             .name = "zigzero-api",
             .running = std.atomic.Value(bool).init(false),
             .server_socket = null,
@@ -1041,6 +1058,8 @@ pub const Server = struct {
         }
         self.router.deinit();
         self.global_middleware.deinit(self.allocator);
+        for (self.group_prefixes.items) |prefix| self.allocator.free(prefix);
+        self.group_prefixes.deinit(self.allocator);
         if (self.server_socket) |*ss| {
             ss.deinit(compat.io());
         }
@@ -1414,6 +1433,34 @@ test "parse req binding" {
     const req = try ctx.parseReq(Req, .{ .id = .path, .page = .query });
     try std.testing.expectEqual(@as(u32, 42), req.id);
     try std.testing.expectEqual(@as(u32, 3), req.page);
+}
+
+test "nested route groups extend the prefix and inherit state" {
+    const allocator = std.testing.allocator;
+    var server = Server.init(allocator, 8080, @import("../infra/log.zig").Logger.new(.off, "test"));
+    defer server.deinit();
+
+    var marker: u32 = 7;
+    var outer = server.group("/api/v1").withUserData(&marker);
+    outer = try outer.group("/users");
+
+    // The child's prefix is the concatenation of both.
+    try std.testing.expectEqualStrings("/api/v1/users", outer.prefix);
+    // State and the server pointer are inherited.
+    try std.testing.expectEqual(@as(?*anyopaque, &marker), outer.user_data);
+    try std.testing.expect(outer.server == &server);
+
+    try outer.get("/:id", struct {
+        fn handle(ctx: *Context) anyerror!void {
+            try ctx.text(200, "ok");
+        }
+    }.handle);
+
+    // The registered route carries the full path.
+    var matched = server.router.match(.GET, "/api/v1/users/42") orelse return error.TestUnexpectedResult;
+    defer matched.deinit(allocator);
+    try std.testing.expectEqualStrings("/api/v1/users/:id", matched.route.path);
+    try std.testing.expectEqualStrings("42", matched.params.get("id").?);
 }
 
 test "route group" {

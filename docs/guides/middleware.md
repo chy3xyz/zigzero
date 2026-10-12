@@ -319,14 +319,17 @@ try server.addMiddleware(.{
 
 ## 路由分组与中间件继承
 
-`RouteGroup` 只提供 `withMiddleware`、`withUserData` 和 `get/post/put/delete/patch/handle`，没有 `group()`，因此**分组不能嵌套，也不会把中间件继承给子分组**。需要多段前缀时，直接在完整前缀上分组：
+`RouteGroup` 提供 `group()`（嵌套子分组，继承中间件与 `user_data`）、`withMiddleware`、`withUserData` 和 `get/post/put/delete/patch/handle`。子分组用自己的 `withMiddleware` 设置中间件：
 
 ```zig
-// 直接以完整前缀建组，而不是嵌套组
 var v1 = server.group("/api/v1");
 var v1_authed = v1.withMiddleware(&.{auth_mw});
 try v1_authed.get("/resource", h3);   // /api/v1/resource 带 auth_mw
 try v1.get("/public", h1);            // /api/v1/public 不带中间件
+
+// 嵌套：子分组继承父分组的中间件与 user_data
+var admin = v1.group("/admin") catch return error.OutOfMemory;
+try admin.get("/stats", h4);          // /api/v1/admin/stats 带 auth_mw
 ```
 
 `withUserData(data)` 则给分组注册的每条路由的 `.user_data` 统一绑定共享状态（处理器从 `ctx.user_data` 取回），用法与 `withMiddleware` 一致，同样返回新的 `RouteGroup`。

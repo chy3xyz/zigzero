@@ -41,9 +41,10 @@
 //! primary_key` when declared (this is what `zgctl model` emits), otherwise from
 //! a field named `id`; a type with neither fails with `error.NoPrimaryKey`.
 //!
-//! * `create` can fill a generated primary key only where sqlx reports
-//!   `ExecResult.last_insert_id` — sqlite and mysql do, postgres does not (sqlx
-//!   exposes no `RETURNING`). On postgres the caller must supply the key.
+//! * `create` fills in a generated primary key on every driver: sqlite and
+//!   mysql report it as `ExecResult.last_insert_id`, and on postgres `create`
+//!   asks for it with `RETURNING <pk>`, since the protocol carries no such
+//!   value. A key the caller supplied is never overwritten.
 
 const std = @import("std");
 const sqlx = @import("../infra/sqlx.zig");
@@ -506,12 +507,16 @@ pub fn Crud(comptime T: type) type {
             var used: usize = 0;
 
             try appendSqlFmt(&buf, allocator, "INSERT INTO {s} (", .{table});
+            // Whether the primary key was left out so the database generates it.
+            var pk_omitted = false;
             inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
                 if (!isUnsetGeneratedKey(FieldType, field_name, pk, entity)) {
                     if (used > 0) try buf.appendSlice(allocator, ", ");
                     try buf.appendSlice(allocator, field_name);
                     values[used] = toValue(@field(entity, field_name));
                     used += 1;
+                } else {
+                    pk_omitted = true;
                 }
             }
             try buf.appendSlice(allocator, ") VALUES (");
@@ -522,6 +527,33 @@ pub fn Crud(comptime T: type) type {
             try buf.appendSlice(allocator, ")");
 
             if (used == 0) return error.NoInsertableFields;
+
+            // sqlite and mysql report the generated key as last-insert-id.
+            // PostgreSQL's protocol carries no such value, so the statement asks
+            // for it back instead — this is the only driver that needs it.
+            const needs_returning = pk_omitted and pool.config.driver == .postgres;
+            if (needs_returning) try appendSqlFmt(&buf, allocator, " RETURNING {s}", .{pk});
+
+            if (needs_returning) {
+                var rows = try pool.client.query(buf.items, values[0..used]);
+                defer rows.deinit();
+                if (rows.rows.len == 0) return error.NotFound;
+                const returned = rows.rows[0].get(pk) orelse return error.DatabaseError;
+                var out = entity;
+                inline for (s_info.field_names, s_info.field_types) |field_name, FieldType| {
+                    if (comptime isInteger(FieldType)) {
+                        if (std.mem.eql(u8, field_name, pk)) {
+                            @field(out, field_name) = switch (returned) {
+                                .int => |v| @intCast(v),
+                                .string => |s| std.fmt.parseInt(FieldType, s, 10) catch return error.DatabaseError,
+                                else => return error.DatabaseError,
+                            };
+                        }
+                    }
+                }
+                return out;
+            }
+
             const result = try pool.client.exec(buf.items, values[0..used]);
 
             var out = entity;
@@ -777,4 +809,65 @@ test "orm transaction commit and rollback" {
     try std.testing.expectError(error.TransactionNotActive, tx2.rollback());
 
     try std.testing.expect((try Crud(OrmTestUser).findById(&pool, 2)) == null);
+}
+
+/// Skips unless `DB` names this driver, mirroring the sqlx live tests.
+fn skipUnlessDb(comptime db: []const u8) !void {
+    const db_env = std.process.Environ.getAlloc(std.testing.environ, std.testing.allocator, "DB") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return error.SkipZigTest,
+        else => return err,
+    };
+    defer std.testing.allocator.free(db_env);
+    if (!std.mem.eql(u8, db_env, db)) return error.SkipZigTest;
+}
+
+test "postgres create fills the generated primary key with RETURNING" {
+    try skipUnlessDb("postgres");
+    const allocator = std.testing.allocator;
+
+    const conninfo_default = "host=localhost port=5432 dbname=postgres user=cborli";
+    const conninfo = std.process.Environ.getAlloc(std.testing.environ, allocator, "PGconninfo") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => conninfo_default,
+        else => return err,
+    };
+    defer if (conninfo.ptr != conninfo_default.ptr) allocator.free(conninfo);
+
+    var pool = Pool.init(allocator, .{
+        .driver = .postgres,
+        .postgres_conninfo = conninfo,
+        .max_connections = 2,
+    });
+    defer pool.deinit();
+    try pool.connect();
+
+    _ = pool.client.exec("DROP TABLE IF EXISTS orm_pg_serial", &.{}) catch {};
+    _ = try pool.client.exec(
+        "CREATE TABLE orm_pg_serial (id BIGSERIAL PRIMARY KEY, name TEXT, score DOUBLE PRECISION, active BOOLEAN)",
+        &.{},
+    );
+    defer _ = pool.client.exec("DROP TABLE IF EXISTS orm_pg_serial", &.{}) catch {};
+
+    const PgRow = struct {
+        pub const table_name = "orm_pg_serial";
+        pub const primary_key = "id";
+        id: i64,
+        name: []const u8,
+        score: f64,
+        active: bool,
+    };
+
+    // An unset integer key is omitted from the INSERT and read back through
+    // RETURNING — postgres reports no last-insert-id.
+    const created = try Crud(PgRow).create(&pool, .{ .id = 0, .name = "alice", .score = 1.5, .active = true });
+    try std.testing.expect(created.id > 0);
+
+    const found = (try Crud(PgRow).findById(&pool, created.id)) orelse return error.NotFound;
+    defer pool.freeScanned(PgRow, found);
+    try std.testing.expectEqualStrings("alice", found.name);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), found.score, 1e-9);
+    try std.testing.expect(found.active);
+
+    // A caller-supplied key is never overwritten.
+    const explicit = try Crud(PgRow).create(&pool, .{ .id = 999, .name = "bob", .score = 2.0, .active = false });
+    try std.testing.expectEqual(@as(i64, 999), explicit.id);
 }

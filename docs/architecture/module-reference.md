@@ -43,7 +43,7 @@ try server.start();
 |------|------|
 | `Server` | HTTP 服务器 |
 | `ServerConfig` | 端口 / body 上限 / 超时 / worker pool 配置 |
-| `RouteGroup` | 路由分组（仅从前缀构造，不可嵌套） |
+| `RouteGroup` | 路由分组（`group()` 可嵌套，继承中间件与 `user_data`） |
 | `Context` | 请求上下文 |
 | `Method` | HTTP 方法枚举 |
 | `Route` | 路由定义 |

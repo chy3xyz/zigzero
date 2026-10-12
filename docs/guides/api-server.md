@@ -101,7 +101,9 @@ fn handleGetUserPost(ctx: *api.Context) !void {
 }
 ```
 
-`RouteGroup` 没有 `group()` 方法：**路由分组只能从 `server.group()` 创建**，不支持嵌套。`withMiddleware` 也不会把中间件传给其他分组——需要哪一组生效就显式设置在哪一组上。
+`RouteGroup.group(prefix)` 可以继续建子分组：子分组的前缀是父前缀与参数的拼接（`server.group("/api/v1").group("/users")` → `/api/v1/users`），并继承父分组的中间件与 `user_data`。子分组的前缀由 `Server` 持有，随服务器一起释放。
+
+`withMiddleware` / `withUserData` 返回的是**新的分组值**，不会影响其它分组；需要在哪一组生效就显式设置在哪一组上。
 
 分组注册的每条路由都携带 `user_data`，用 `withUserData(data: ?*anyopaque)` 一次性给整组处理器注入共享状态（它返回新的 `RouteGroup`，同样不修改原分组）：
 
