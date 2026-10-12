@@ -40,3 +40,8 @@ coverage/
 *.a
 *.so
 *.dylib
+
+# zdoc's documentation mode refreshes its theme here on every run from the
+# repository root; the content is a copy of the built-in theme — see
+# .github/workflows/docs.yml.
+.zdoc-theme/

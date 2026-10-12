@@ -1,0 +1,90 @@
+name: docs
+
+# The site builds straight from this repository's own `docs/`, so a
+# documentation edit is an ordinary commit — there is no separate tree to keep
+# in sync.
+#
+# Builder: `zdoc` (https://github.com/chy3xyz/zdoc) in documentation mode — one
+# pinned static binary, no Node, no npm lockfile, no site config. `zdoc docs`
+# derives the sidebar from the directory tree and emits per-page tables of
+# contents itself. It reports links it cannot resolve as warnings while still
+# generating the site; this job fails on them, because a link that does not
+# resolve is a page a reader cannot reach.
+#
+# The one link that intentionally leaves `docs/` (the LICENSE URL) points at the
+# repository HTTP URL rather than `../LICENSE`, so the check stays clean without
+# an exemption list.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  # Pinned zdoc release; bump together with the SHA256 line below (the upstream
+  # SHA256SUMS asset is the source of truth for the hash).
+  ZDOC_VERSION: v0.16.1
+  ZDOC_SHA256: 17aaf2e38e9c49a2b719c9fddc1385c610abdd14be5e9653fa751af86d82e7f1
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zdoc (${{ env.ZDOC_VERSION }})
+        run: |
+          curl -sSfL -o zdoc.tar.xz \
+            "https://github.com/chy3xyz/zdoc/releases/download/${ZDOC_VERSION}/x86_64-linux-musl.tar.xz"
+          echo "${ZDOC_SHA256}  zdoc.tar.xz" | sha256sum -c -
+          tar -xJf zdoc.tar.xz
+          ./zdoc version
+
+      - name: Build documentation site
+        run: |
+          set -o pipefail
+          ./zdoc docs docs \
+            --title ZigZero \
+            --url-prefix zigzero \
+            --output site-dist 2>&1 | tee zdoc.log
+          # An unresolved link is a warning rather than an error, so fail here.
+          if grep -q "warning:" zdoc.log; then
+            echo "::error::zdoc reported warnings; see the log above"
+            exit 1
+          fi
+
+      # Only the push to the default branch publishes; a pull request just
+      # proves the docs still build.
+      - if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site-dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -132,4 +132,4 @@ zig fetch https://github.com/chy3xyz/zigzero/archive/refs/tags/v0.2.3.tar.gz
 
 ## 📄 License
 
-MIT — see [LICENSE](../LICENSE)
+MIT — see the [LICENSE](https://github.com/chy3xyz/zigzero/blob/main/LICENSE) file in the repository.

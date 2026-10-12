@@ -294,7 +294,13 @@ post /users/login LoginReq LoginResp login
 
 ## Documentation
 
-Comprehensive documentation is available in the [docs/](docs/README.md) directory:
+The documentation is published as a site at **<https://chy3xyz.github.io/zigzero/>**
+and lives in the [docs/](docs/README.md) directory — every page you read there is a
+Markdown file in this repository, so a docs fix is an ordinary commit. The site is
+built by [zdoc](https://github.com/chy3xyz/zdoc) in CI (`.github/workflows/docs.yml`),
+which also fails the build on an unresolved link.
+
+The same pages, in reading order:
 
 - [Getting Started](docs/getting-started/installation.md) — Installation and setup
 - [Quick Start](docs/getting-started/quick-start.md) — 5-minute tour
